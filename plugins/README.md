@@ -114,7 +114,7 @@ Use `zing.host` inside `start(signal)`, after the Agent has been bound. A Channe
 
 ## Provider
 
-The Blueprint names a model ID; an enabled provider supplies its model catalog and key:
+The Blueprint names a model ID; an enabled provider supplies its model catalog and key. The ID is required and Zing has no built-in default model. Set `model` in `agent.yaml`; a `MODEL` environment variable overrides it for one station:
 
 ```ts
 import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
@@ -130,6 +130,21 @@ export default function xai(zing: ZingPluginAPI) {
 ```
 
 When several providers can serve the same model ID, select one with `station.yaml`, `PROVIDER`, or `--provider`. Otherwise leave it unset and let the Station resolve the unique match.
+
+The model ID must be in an enabled provider's catalog; otherwise startup fails and lists the available IDs. Zing does not guess metadata for an unlisted ID, because the context window and output limit drive history trimming. To use a model the catalog does not list yet, add it in the provider plugin with its real limits:
+
+```ts
+const base = xaiProvider();
+const template = base.getModels().find((model) => model.id === "grok-4.5");
+if (!template) throw new Error("grok-4.5 template missing");
+const grok5 = { ...template, id: "grok-5", name: "Grok 5", contextWindow: 1_000_000, maxTokens: 128_000 };
+
+zing.registerProvider({
+  pluginId: "xai",
+  provider: { ...base, getModels: () => [...base.getModels(), grok5] },
+  getApiKey: () => zing.env.XAI_API_KEY?.trim() || undefined,
+});
+```
 
 ## Observing conversations
 

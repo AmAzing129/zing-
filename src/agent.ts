@@ -36,7 +36,6 @@ import {
 import type { Station } from "./station";
 import { encodeMessages, type TranscriptEvent } from "./transcript";
 
-export const DEFAULT_MODEL = "grok-4.6";
 export const DEFAULT_SYSTEM =
   "You are a helpful, concise assistant. Reply in the user's language.";
 export const DEFAULT_AGENT_LIMITS: AgentLimits = {
@@ -83,8 +82,11 @@ export function createAgent(
   capsule?: Capsule,
   options?: CreateAgentOptions,
 ): Agent {
+  if (blueprint.model === undefined) {
+    throw new Error(`Blueprint ${blueprint.name} has no model. Set model in agent.yaml or MODEL=<id>.`);
+  }
   const resolved = capsule ?? createMemoryCapsule({ blueprintName: blueprint.name });
-  const model = station.resolveModel(blueprint.model ?? DEFAULT_MODEL);
+  const model = station.resolveModel(blueprint.model);
   const system = blueprint.system ?? DEFAULT_SYSTEM;
   const limits = resolveAgentLimits(blueprint.limits, options?.limits);
   const conversations = new Map<string, Conversation>();

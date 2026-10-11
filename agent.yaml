@@ -2,7 +2,7 @@
 name: zing
 description: Personal assistant that can search the public web and remember useful facts.
 
-# Model id only. A station provider plugin must serve this id.
+# Required model id only. A station provider plugin must serve this id.
 model: grok-4.6
 
 system: |

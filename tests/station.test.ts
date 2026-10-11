@@ -16,12 +16,13 @@ test("createStation resolves a model id without naming the provider", () => {
   assert.equal(station.resolveModel("grok-4.6").provider, "xai");
 });
 
-test("createStation falls back to a provider template when the id is unknown", () => {
-  const xai = fauxProvider({ provider: "xai", models: [{ id: "grok-4.6" }] });
+test("createStation rejects a model id outside the provider catalogs", () => {
+  const xai = fauxProvider({ provider: "xai", models: [{ id: "grok-4.6" }, { id: "grok-4.5" }] });
+  const other = fauxProvider({ provider: "other", models: [{ id: "other-1" }] });
   const station = createStation({ providers: [wrap(xai, "xai")] });
-  const resolved = station.resolveModel("custom-id");
-  assert.equal(resolved.id, "custom-id");
-  assert.equal(resolved.provider, "xai");
+  assert.throws(() => station.resolveModel("grok-4.66"), /^Error: Unknown model: grok-4\.66\. Available: xai \(grok-4\.6, grok-4\.5\)$/);
+  const preferred = createStation({ providers: [wrap(xai, "xai"), wrap(other, "other")], provider: "other" });
+  assert.throws(() => preferred.resolveModel("grok-4.6"), /^Error: Unknown model: grok-4\.6 on provider other\. Available: other \(other-1\)$/);
 });
 
 test("createStation picks the provider that owns the model id", () => {

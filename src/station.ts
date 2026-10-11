@@ -40,11 +40,13 @@ export function createStation(options: CreateStationOptions): Station {
   };
 }
 
+type ModelCatalog = {
+  getModel: (provider: string, id: string) => Model<Api> | undefined;
+  getModels: (provider?: string) => readonly Model<Api>[];
+};
+
 export function resolveModel(
-  models: {
-    getModel: (provider: string, id: string) => Model<Api> | undefined;
-    getModels: (provider?: string) => readonly Model<Api>[];
-  },
+  models: ModelCatalog,
   providers: readonly ModelProvider[],
   id: string,
   preferred?: string,
@@ -58,7 +60,11 @@ export function resolveModel(
     if (!entry) {
       throw new Error(`Unknown provider: ${preferred}. ${describeProviders(providers)}`);
     }
-    return modelOnProvider(models, entry, id);
+    const model = models.getModel(entry.provider.id, id);
+    if (!model) {
+      throw new Error(`Unknown model: ${id} on provider ${entry.pluginId}. ${describeCatalog(models, [entry])}`);
+    }
+    return model;
   }
 
   const matches: Model<Api>[] = [];
@@ -81,31 +87,15 @@ export function resolveModel(
     );
   }
 
-  const onlyProvider = providers.length === 1 ? providers[0] : undefined;
-  if (onlyProvider) {
-    return modelOnProvider(models, onlyProvider, id);
-  }
-
-  throw new Error(`Unknown model: ${id}. ${describeProviders(providers)}`);
+  throw new Error(`Unknown model: ${id}. ${describeCatalog(models, providers)}`);
 }
 
-function modelOnProvider(
-  models: {
-    getModel: (provider: string, id: string) => Model<Api> | undefined;
-    getModels: (provider?: string) => readonly Model<Api>[];
-  },
-  entry: ModelProvider,
-  id: string,
-): Model<Api> {
-  const exact = models.getModel(entry.provider.id, id);
-  if (exact) {
-    return exact;
-  }
-  const template = models.getModels(entry.provider.id)[0];
-  if (!template) {
-    throw new Error(`Provider ${entry.pluginId} has no models`);
-  }
-  return { ...template, id, name: id };
+function describeCatalog(models: ModelCatalog, providers: readonly ModelProvider[]): string {
+  const entries = providers.map((entry) => {
+    const ids = models.getModels(entry.provider.id).map((model) => model.id);
+    return `${entry.pluginId} (${ids.length > 0 ? ids.join(", ") : "no models"})`;
+  });
+  return `Available: ${entries.join("; ")}`;
 }
 
 function describeProviders(providers: readonly ModelProvider[]): string {
