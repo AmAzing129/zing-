@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { createInitialSystemMessage, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { estimateTextTokens } from "@earendil-works/pi-ai/utils/estimate";
 
 import { CONTEXT_OMISSION_TEXT, estimateMessageList, fitMessages } from "../src/context";
 
@@ -26,7 +27,7 @@ test("context pruning keeps recent complete turns and never mutates the transcri
     fauxAssistantMessage("recent answer", { timestamp: 6 }),
   ];
   const recent = messages.slice(4);
-  const budget = estimateMessageList(recent) + Math.ceil(CONTEXT_OMISSION_TEXT.length / 4);
+  const budget = estimateMessageList(recent) + estimateTextTokens(CONTEXT_OMISSION_TEXT);
 
   const fitted = fitMessages(messages, budget);
 
@@ -44,4 +45,27 @@ test("context pruning leaves an already fitting transcript unchanged", () => {
   ];
 
   assert.equal(fitMessages(messages, estimateMessageList(messages)), messages);
+});
+
+test("context pruning keeps the leading system message outside the message budget", () => {
+  const system = createInitialSystemMessage("Be brief.", [
+    { name: "lookup", description: "Look something up", parameters: { type: "object", properties: {} } },
+  ]);
+  assert.ok(system);
+  const recent: AgentMessage[] = [
+    { role: "user", content: "recent question", timestamp: 3 },
+    fauxAssistantMessage("recent answer", { timestamp: 4 }),
+  ];
+  const messages: AgentMessage[] = [
+    system,
+    { role: "user", content: `old question ${"x".repeat(200)}`, timestamp: 1 },
+    fauxAssistantMessage("old answer", { timestamp: 2 }),
+    ...recent,
+  ];
+
+  const fitted = fitMessages(messages, estimateMessageList(recent) + estimateTextTokens(CONTEXT_OMISSION_TEXT));
+
+  assert.equal(fitted[0], system);
+  assert.equal(fitted[1]?.role === "user" ? fitted[1].content : undefined, CONTEXT_OMISSION_TEXT);
+  assert.deepEqual(fitted.slice(2), recent);
 });

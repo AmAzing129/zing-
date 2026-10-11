@@ -10,6 +10,7 @@ import {
   fauxAssistantMessage,
   fauxProvider,
   fauxToolCall,
+  getCurrentSystemPrompt,
   Type,
   type Context,
 } from "@earendil-works/pi-ai";
@@ -424,7 +425,16 @@ test("a disk capsule keeps identity and history after the process is recreated",
   faux.setResponses([fauxAssistantMessage("still me")]);
   assert.equal(second.agentId, first.agentId);
   assert.equal((await second.handleMessage({ conversationId: "telegram:1", text: "again" })).text, "still me");
-  assert.ok((await secondCapsule.loadConversation("telegram:1")).length >= 2);
+  const history = await secondCapsule.loadConversation("telegram:1");
+  assert.deepEqual(
+    history.map((message) => [message.role, contentText(message.content, "")]),
+    [
+      ["user", "hi"],
+      ["assistant", "remembered"],
+      ["user", "again"],
+      ["assistant", "still me"],
+    ],
+  );
 });
 
 test("reset is kept in the capsule and a new process starts after it", async () => {
@@ -469,9 +479,12 @@ test("long threads prune only the model context and keep the full transcript", a
   };
   const agent = createAgent(station, blueprint);
   const seen: string[][] = [];
+  const systems: string[] = [];
   faux.setResponses(
     Array.from({ length: 10 }, (_, index) => (context: Context) => {
-      seen.push(context.messages.map((message) => contentText(message.content, "")));
+      const first = context.messages[0];
+      systems.push(first?.role === "system" ? getCurrentSystemPrompt(context.messages) ?? "" : "");
+      seen.push(context.messages.filter((message) => message.role !== "system").map((message) => contentText(message.content, "")));
       return fauxAssistantMessage(`answer-${index}`);
     }),
   );
@@ -484,6 +497,7 @@ test("long threads prune only the model context and keep the full transcript", a
   }
 
   const finalContext = seen.at(-1) ?? [];
+  assert.deepEqual(new Set(systems), new Set(["Be brief."]), "every request keeps the system prompt");
   assert.equal(finalContext[0], CONTEXT_OMISSION_TEXT);
   assert.ok(!finalContext.some((text) => text.startsWith("turn-0 ")));
   assert.ok(finalContext.some((text) => text.startsWith("turn-9 ")));

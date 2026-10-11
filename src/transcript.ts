@@ -1,14 +1,23 @@
 import { join } from "node:path";
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, ImageContent, StopReason, TextContent, ThinkingContent, ToolCall } from "@earendil-works/pi-ai";
+import type {
+  AssistantMessage,
+  ImageContent,
+  JsonObject,
+  JsonValue,
+  StopReason,
+  TextContent,
+  ThinkingContent,
+  ToolCall,
+} from "@earendil-works/pi-ai";
 
 export const TRANSCRIPT_VERSION = 1;
 
 export type StoredText = { type: "text"; text: string };
 export type StoredImage = { type: "image"; data: string; mimeType: string };
 export type StoredThinking = { type: "thinking"; thinking: string };
-export type StoredToolCall = { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> };
+export type StoredToolCall = { type: "toolCall"; id: string; name: string; arguments: JsonObject };
 
 export type TranscriptEvent =
   | {
@@ -34,7 +43,7 @@ export type TranscriptEvent =
       toolName: string;
       isError: boolean;
       content: Array<StoredText | StoredImage>;
-      details?: unknown;
+      details?: JsonValue;
     }
   | {
       v: typeof TRANSCRIPT_VERSION;
@@ -297,7 +306,7 @@ function parseEvent(raw: unknown, source: string): TranscriptEvent {
       toolName: requiredString(record.toolName, `${source}: toolName`),
       isError: Boolean(record.isError),
       content: parseToolContent(record.content, source),
-      details: record.details,
+      details: record.details as JsonValue | undefined,
     };
   }
   throw new Error(`${source}: unknown event type ${String(type)}`);
@@ -336,7 +345,8 @@ function parseAssistantContent(raw: unknown, source: string): Array<StoredText |
         type: "toolCall",
         id: requiredString(block.id, `${source}: toolCall id`),
         name: requiredString(block.name, `${source}: toolCall name`),
-        arguments: block.arguments as Record<string, unknown>,
+        // Parsed from JSON, so the mapping holds only JSON values.
+        arguments: block.arguments as JsonObject,
       });
       continue;
     }
