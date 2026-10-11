@@ -1,5 +1,6 @@
-import { estimateTokens, type AgentMessage, type AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import type { Api, Model, UserMessage } from "@earendil-works/pi-ai";
+import { estimateMessageTokens, estimateTextTokens } from "@earendil-works/pi-ai/utils/estimate";
 
 export const CONTEXT_OMISSION_TEXT =
   "Earlier complete conversation turns were omitted to fit the model context window.";
@@ -30,25 +31,26 @@ export function createContextWindowPolicy(
     MIN_SAFETY_MARGIN_TOKENS,
     Math.min(MAX_SAFETY_MARGIN_TOKENS, Math.floor(contextWindow * 0.05)),
   );
-  const fixedTokens = estimateChars(system.length + safeJsonLength(tools)) + outputReserve + safetyMargin;
+  const fixedTokens = estimateTextTokens(system) + estimateTextTokens(safeJson(tools)) + outputReserve + safetyMargin;
   const messageBudget = Math.max(0, contextWindow - fixedTokens);
   const omission = omissionMessage();
-  const omissionTokens = estimateTokens(omission);
+  const omissionTokens = estimateMessageTokens(omission);
 
   return {
     messageBudget,
     fit: (messages) => fitMessages(messages, messageBudget, omission, omissionTokens),
     currentTurnFits(messages) {
-      const start = lastUserIndex(messages);
+      const conversation = withoutSystemPrefix(messages);
+      const start = lastUserIndex(conversation);
       if (start < 0) {
-        return estimateMessageList(messages) <= messageBudget;
+        return estimateMessageList(conversation) <= messageBudget;
       }
       const markerTokens = start > 0 ? omissionTokens : 0;
-      return markerTokens + estimateMessageList(messages.slice(start)) <= messageBudget;
+      return markerTokens + estimateMessageList(conversation.slice(start)) <= messageBudget;
     },
     userInputFits(text, hasHistory) {
       const message: UserMessage = { role: "user", content: text, timestamp: 0 };
-      return estimateTokens(message) + (hasHistory ? omissionTokens : 0) <= messageBudget;
+      return estimateMessageTokens(message) + (hasHistory ? omissionTokens : 0) <= messageBudget;
     },
   };
 }
@@ -57,27 +59,29 @@ export function fitMessages(
   messages: AgentMessage[],
   budget: number,
   omission = omissionMessage(),
-  omissionTokens = estimateTokens(omission),
+  omissionTokens = estimateMessageTokens(omission),
 ): AgentMessage[] {
-  if (estimateMessageList(messages) <= budget) {
+  // The leading system message carries the prompt and tool declarations; the budget already excludes it.
+  const conversation = withoutSystemPrefix(messages);
+  if (estimateMessageList(conversation) <= budget) {
     return messages;
   }
 
-  const starts = userTurnStarts(messages);
+  const starts = userTurnStarts(conversation);
   const currentStart = starts.at(-1);
   if (currentStart === undefined) {
     return messages;
   }
 
   let keptStart = currentStart;
-  let used = omissionTokens + estimateMessageList(messages.slice(currentStart));
+  let used = omissionTokens + estimateMessageList(conversation.slice(currentStart));
   for (let index = starts.length - 2; index >= 0; index -= 1) {
     const start = starts[index];
     if (start === undefined) {
       continue;
     }
     const end = keptStart;
-    const turnTokens = estimateMessageList(messages.slice(start, end));
+    const turnTokens = estimateMessageList(conversation.slice(start, end));
     if (used + turnTokens > budget) {
       break;
     }
@@ -88,15 +92,24 @@ export function fitMessages(
   if (keptStart === 0) {
     return messages;
   }
-  return [omission, ...messages.slice(keptStart)];
+  const system = messages.slice(0, messages.length - conversation.length);
+  return [...system, omission, ...conversation.slice(keptStart)];
 }
 
 export function estimateMessageList(messages: readonly AgentMessage[]): number {
   let total = 0;
   for (const message of messages) {
-    total += estimateTokens(message);
+    total += estimateMessageTokens(message);
   }
   return total;
+}
+
+function withoutSystemPrefix(messages: AgentMessage[]): AgentMessage[] {
+  const start = messages.findIndex((message) => message.role !== "system");
+  if (start < 0) {
+    return [];
+  }
+  return start === 0 ? messages : messages.slice(start);
 }
 
 function userTurnStarts(messages: readonly AgentMessage[]): number[] {
@@ -122,14 +135,10 @@ function omissionMessage(): UserMessage {
   return { role: "user", content: CONTEXT_OMISSION_TEXT, timestamp: 0 };
 }
 
-function estimateChars(chars: number): number {
-  return Math.ceil(chars / 4);
-}
-
-function safeJsonLength(value: unknown): number {
+function safeJson(value: unknown): string {
   try {
-    return JSON.stringify(value)?.length ?? 0;
+    return JSON.stringify(value) ?? "";
   } catch {
-    return 0;
+    return "";
   }
 }

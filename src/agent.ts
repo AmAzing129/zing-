@@ -359,7 +359,6 @@ class Conversation {
     this.capsule = options.capsule;
     this.conversationId = options.conversationId;
     this.limits = options.limits;
-    this.persisted = options.messages.length;
     const model = options.station.resolveModel(options.modelId);
     const tools = options.tools.map((tool) =>
       createAgentTool(tool, {
@@ -397,14 +396,15 @@ class Conversation {
         budget.toolCalls += 1;
         return undefined;
       },
-      shouldStopAfterTurn: ({ message, context }) => {
+      finishTurn: ({ message, context }) => {
         const budget = this.activeBudget;
-        if (!budget) {
-          return false;
+        // Error and aborted responses end the run regardless; they do not count as model turns.
+        if (!budget || message.stopReason === "error" || message.stopReason === "aborted") {
+          return undefined;
         }
         budget.modelTurns += 1;
         if (budget.failure) {
-          return true;
+          return { action: "end" };
         }
         const continues = message.content.some((block) => block.type === "toolCall");
         if (continues && budget.modelTurns >= this.limits.maxModelTurns) {
@@ -412,18 +412,20 @@ class Conversation {
             "model-turns",
             `Turn exceeded the ${this.limits.maxModelTurns} model-turn limit`,
           );
-          return true;
+          return { action: "end" };
         }
         if (continues && !this.context.currentTurnFits(context.messages)) {
           budget.failure = new TurnBudgetExceededError(
             "context",
             `Current turn exceeded its ${this.context.messageBudget}-token context budget`,
           );
-          return true;
+          return { action: "end" };
         }
-        return false;
+        return undefined;
       },
     });
+    // pi-agent-core prepends the system prompt as a system message; the capsule stores only what follows it.
+    this.persisted = this.inner.state.messages.length;
   }
 
   abort(failure?: TurnBudgetExceededError): void {
@@ -447,7 +449,7 @@ class Conversation {
 
     let runError: unknown;
     try {
-      if (!this.context.userInputFits(message, this.inner.state.messages.length > 0)) {
+      if (!this.context.userInputFits(message, this.inner.state.messages.some((entry) => entry.role !== "system"))) {
         throw new TurnBudgetExceededError(
           "context",
           `User input exceeded its ${this.context.messageBudget}-token context budget`,
