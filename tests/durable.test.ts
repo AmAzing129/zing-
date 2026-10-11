@@ -520,9 +520,11 @@ test("durable: a restarted station resumes the interrupted turn and answers its 
     },
     fauxAssistantMessage("recovered answer"),
   ]);
+  const observed: ConversationEvent[] = [];
   const after = await createDurableAgent(second.station, blueprintFor(second.model.id), capsule, {
     storage: await openNodeSqliteStorage(file),
     tools: [finishing],
+    listeners: [(event) => { observed.push(event); }],
   });
   assert.equal(after.agentId, before.agentId);
 
@@ -538,11 +540,102 @@ test("durable: a restarted station resumes the interrupted turn and answers its 
   assert.match(toolResults[0] ?? "", /interrupted/);
   assert.deepEqual(senders, ["alice", "alice"], "a recovered run keeps its sender's trust");
   assert.equal(second.faux.state.callCount, 2);
+  const transcript = (await after.readThread("telegram:1")).entries;
   assert.deepEqual(
-    (await after.readThread("telegram:1")).entries.map((entry) => entry.type),
+    transcript.map((entry) => entry.type),
     ["user", "assistant", "toolResult", "assistant", "toolResult", "assistant"],
   );
+  await after.drainObservers();
+  assert.deepEqual(
+    observed.map((event) => event.type === "turn" && [event.status, event.senderId, event.entries]),
+    [["completed", "alice", transcript]],
+    "the recovered turn is observed once, not again for its redelivery",
+  );
   await after.close();
+});
+
+test("durable: a recovered turn is observed and touches its thread without any redelivery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-observe-"));
+  const file = join(dir, "durable.sqlite");
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const started = deferred();
+  const hanging: Tool = { ...webSearch, execute: async (_input, { signal }) => (started.resolve(), waitForAbort(signal)) };
+  const first = createTestStation();
+  const before = await createDurableAgent(first.station, blueprintFor(first.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [hanging],
+  });
+  first.faux.setResponses([fauxAssistantMessage("quiet")]);
+  await before.handleMessage({ conversationId: "chat:quiet", text: "hi" });
+  first.faux.setResponses([fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "x" })], { stopReason: "toolUse" })]);
+  const interrupted = before.handleMessage({ conversationId: "chat:busy", text: "remember this", senderId: "bob" });
+  await started.promise;
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await before.close();
+  await assert.rejects(interrupted);
+
+  const second = createTestStation();
+  const turnObserved = deferred();
+  const observed: ConversationEvent[] = [];
+  second.faux.setResponses([fauxAssistantMessage("finished after restart")]);
+  const after = await createDurableAgent(second.station, blueprintFor(second.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [webSearch],
+    listeners: [(event) => { observed.push(event); turnObserved.resolve(); }],
+  });
+  await turnObserved.promise;
+  const event = observed[0];
+  assert.equal(event?.type, "turn");
+  assert.equal(event?.type === "turn" ? event.status : undefined, "completed");
+  assert.equal(event?.type === "turn" ? event.senderId : undefined, "bob");
+  assert.deepEqual(
+    event?.type === "turn" ? event.entries.map((entry) => entry.type) : [],
+    ["user", "assistant", "toolResult", "assistant"],
+  );
+  await after.drainObservers();
+  assert.equal((await after.listThreads()).data[0]?.threadId, "chat:busy", "the recovered thread is the most recent");
+  await after.close();
+});
+
+test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
+  const events: ConversationEvent[] = [];
+  const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });
+  faux.setResponses([fauxAssistantMessage("original"), fauxAssistantMessage("later")]);
+
+  assert.equal((await agent.handleMessage({ conversationId: "chat:dedupe", text: "one", requestId: "r1" })).text, "original");
+  assert.equal((await agent.handleMessage({ conversationId: "chat:dedupe", text: "two", requestId: "r2" })).text, "later");
+  const retried = agent.startTurn({ threadId: "chat:dedupe", text: "one", senderId: "mallory", requestId: "r1" });
+  const statuses: string[] = [];
+  retried.subscribe((event) => statuses.push(event.type));
+  assert.equal((await retried.completed).text, "original");
+  await agent.drainObservers();
+
+  assert.equal(faux.state.callCount, 2);
+  assert.deepEqual(statuses, ["turn/started", "turn/completed"]);
+  assert.deepEqual(
+    events.map((event) => event.type === "turn" && event.entries.map((entry) => entry.type)),
+    [["user", "assistant"], ["user", "assistant"]],
+  );
+  assert.equal((await agent.readThread("chat:dedupe")).entries.length, 4);
+  await agent.close();
+});
+
+test("durable: any opaque thread ID survives a restart, including __proto__", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-ids-"));
+  const file = join(dir, "durable.sqlite");
+  const { faux, model, station } = createTestStation();
+  const blueprint = blueprintFor(model.id, []);
+  const first = await createDurableAgent(station, blueprint, undefined, { storage: await openNodeSqliteStorage(file) });
+  faux.setResponses([fauxAssistantMessage("a"), fauxAssistantMessage("b")]);
+  await first.handleMessage({ conversationId: "__proto__", text: "hi" });
+  await first.handleMessage({ conversationId: "constructor", text: "hi" });
+  await first.close();
+
+  const second = await createDurableAgent(station, blueprint, undefined, { storage: await openNodeSqliteStorage(file) });
+  assert.deepEqual((await second.listThreads()).data.map((thread) => thread.threadId).sort(), ["__proto__", "constructor"]);
+  assert.deepEqual((await second.readThread("__proto__")).entries.map((entry) => entry.type), ["user", "assistant"]);
+  assert.deepEqual(await second.openThread("__proto__"), { threadId: "__proto__", created: false });
+  await second.close();
 });
 
 test("durable: threads from a file capsule continue with their live history", async () => {

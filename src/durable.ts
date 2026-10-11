@@ -29,6 +29,7 @@ import {
   type ConversationId,
   type EntryRecord,
   type Storage,
+  type SubmissionId,
   type SubmissionRecord,
   type ToolRegistration,
   type Tx,
@@ -77,7 +78,8 @@ const ENTRY_PAGE_SIZE = 256;
 const ABORT_GRACE_MS = 5_000;
 
 type ThreadRecord = { conversationId: number; updatedAt: number };
-type ThreadsState = { threads: { [threadId: string]: ThreadRecord } };
+/** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
+type ThreadsState = { threads: { [key: string]: ThreadRecord } };
 type TurnState = { senderId?: string };
 
 /** Zing thread IDs, which the runtime treats as opaque, mapped to durable conversations. */
@@ -87,6 +89,16 @@ const ThreadsDoc = defineDoc<ThreadsState>({
   scope: "session",
   initial: () => ({ threads: {} }),
 });
+
+const THREAD_KEY_PREFIX = "t:";
+
+function threadKey(threadId: string): string {
+  return `${THREAD_KEY_PREFIX}${threadId}`;
+}
+
+function threadIdOf(key: string): string | undefined {
+  return key.startsWith(THREAD_KEY_PREFIX) ? key.slice(THREAD_KEY_PREFIX.length) : undefined;
+}
 
 /** The sender of the conversation's latest turn, so tools recovered after a restart keep its trust level. */
 const TurnDoc = defineDoc<TurnState>({
@@ -285,7 +297,9 @@ export async function createDurableAgent(
   );
 
   const persisted = await harness.snapshot(ThreadsDoc, CONTEXT);
-  for (const [threadId, record] of Object.entries(persisted?.threads ?? {})) {
+  for (const [key, record] of Object.entries(persisted?.threads ?? {})) {
+    const threadId = threadIdOf(key);
+    if (threadId === undefined) continue;
     threads.set(threadId, record.conversationId as ConversationId);
     threadOf.set(record.conversationId, threadId);
   }
@@ -306,7 +320,7 @@ export async function createDurableAgent(
         ownership: { kind: "ownerless" },
         agent: { model: modelRef },
         init: async (tx, id) => {
-          (await tx.doc(ThreadsDoc)).threads[threadId] = { conversationId: id, updatedAt };
+          (await tx.doc(ThreadsDoc)).threads[threadKey(threadId)] = { conversationId: id, updatedAt };
           if (imported.length > 0) {
             await importMessages(tx, id, [baseline(), ...(imported as Message[])]);
           }
@@ -343,7 +357,7 @@ export async function createDurableAgent(
 
   const touch = async (threadId: string): Promise<void> => {
     await open().commit(async (tx) => {
-      const record = (await tx.doc(ThreadsDoc)).threads[threadId];
+      const record = (await tx.doc(ThreadsDoc)).threads[threadKey(threadId)];
       if (record) record.updatedAt = Date.now();
     }, CONTEXT);
   };
@@ -354,7 +368,6 @@ export async function createDurableAgent(
       await createConversation(legacy.conversationId, legacy.updatedAt);
     }
   }
-  harness.resume();
 
   const enqueue = <T>(threadId: string, run: () => Promise<T>): Promise<T> => {
     const previous = pending.get(threadId) ?? Promise.resolve();
@@ -369,6 +382,54 @@ export async function createDurableAgent(
     });
     return result;
   };
+
+  /**
+   * Report a turn the previous process left unfinished once it settles: observers see it like any other turn, under
+   * the sender it ran for. Queued on its thread, so a new turn there starts after it.
+   */
+  const observeRecovered = (threadId: string, conversationId: ConversationId, submissionId: SubmissionId): void => {
+    void enqueue(threadId, async () => {
+      try {
+        const submission = await open().submission(submissionId, CONTEXT);
+        if (!submission) return;
+        const record = await submission.wait(CONTEXT);
+        const conversation = await findConversation(threadId);
+        if (!conversation) return;
+        const entries = await readTurnEntries(conversation, record);
+        const budget = budgets.get(conversationId);
+        const status =
+          record.status === "done"
+            ? "completed"
+            : record.reason === "aborted" && !budget?.failure
+              ? "canceled"
+              : "failed";
+        if (entries.length > 0) {
+          observers.notify({
+            type: "turn",
+            conversationId: threadId,
+            senderId: (await open().snapshot(TurnDoc, conversationId, CONTEXT))?.senderId,
+            capsule: capsuleRef,
+            status,
+            entries,
+          });
+        }
+        await touch(threadId);
+      } catch (error) {
+        if (!closed) console.warn(`recovered turn of ${threadId} could not be observed`, error);
+      } finally {
+        const budget = budgets.get(conversationId);
+        if (budget && !active.has(threadId)) releaseBudget(conversationId, budget);
+      }
+    });
+  };
+
+  for (const record of (await harness.inspect(CONTEXT)).submissions) {
+    const threadId = threadOf.get(record.conversationId);
+    if (threadId !== undefined && record.type === "input") {
+      observeRecovered(threadId, record.conversationId, record.id);
+    }
+  }
+  harness.resume();
 
   const startTurn = (input: TurnInput): TurnHandle => {
     ensureOpen();
@@ -405,6 +466,17 @@ export async function createDurableAgent(
         // A run the previous process left unfinished completes before this one starts.
         await conversation.waitForIdle(CONTEXT);
         if (closed || cancelRequested) throw new TurnCanceledError();
+
+        // A repeated request ID is answered from the original turn; its entries were already observed then.
+        const original =
+          input.requestId === undefined ? undefined : await settledRequest(open(), conversation.id, input.requestId);
+        if (original) {
+          controller.emit({ type: "turn/started", threadId, turnId });
+          const result = await outcome(conversation, original);
+          controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
+          controller.resolve(result);
+          return;
+        }
 
         const view = await conversation.context(CONTEXT);
         if (!policy.userInputFits(input.text, view.messages.some((message) => message.role !== "system"))) {
@@ -462,7 +534,7 @@ export async function createDurableAgent(
           await waitAtMost(caughtUp, EVENT_DRAIN_TIMEOUT_MS);
         }
 
-        entries = record.entry === undefined ? [] : await readEntriesFrom(conversation, record.entry);
+        entries = await readTurnEntries(conversation, record);
         await touch(threadId);
 
         if (current.canceled) throw new TurnCanceledError();
@@ -584,10 +656,10 @@ export async function createDurableAgent(
     },
     async listThreads(options?: ListThreadsOptions) {
       const snapshot = await open().snapshot(ThreadsDoc, CONTEXT);
-      const all = Object.entries(snapshot?.threads ?? {}).map(([threadId, record]) => ({
-        threadId,
-        updatedAt: record.updatedAt,
-      }));
+      const all = Object.entries(snapshot?.threads ?? {}).flatMap(([key, record]) => {
+        const threadId = threadIdOf(key);
+        return threadId === undefined ? [] : [{ threadId, updatedAt: record.updatedAt }];
+      });
       all.sort((left, right) => right.updatedAt - left.updatedAt || left.threadId.localeCompare(right.threadId));
       const offset = decodeCursor(options?.cursor);
       const limit = normalizeLimit(options?.limit);
@@ -696,12 +768,24 @@ async function importMessages(tx: Tx, id: ConversationId, messages: readonly Mes
   }
 }
 
-async function readEntriesFrom(conversation: Conversation, first: EntryRecord["id"]): Promise<ThreadEntry[]> {
+async function settledRequest(
+  harness: Harness,
+  id: ConversationId,
+  requestId: string,
+): Promise<SubmissionRecord | undefined> {
+  const record = await harness.commit((tx) => tx.submissionByRequest(id, requestId), CONTEXT);
+  return record && isSettled(record) ? record : undefined;
+}
+
+/** The entries one settled input added: its user entry through its answer, or through the end when unanswered. */
+async function readTurnEntries(conversation: Conversation, record: SubmissionRecord): Promise<ThreadEntry[]> {
+  if (record.entry === undefined) return [];
+  const last = record.status === "done" && record.type === "input" ? record.answer : undefined;
   const records: EntryRecord[] = [];
   let cursor: Parameters<Conversation["entries"]>[2];
   do {
     const page = await conversation.entries(
-      { minEntryId: first, order: "ascending" },
+      { minEntryId: record.entry, ...(last === undefined ? {} : { maxEntryId: last }), order: "ascending" },
       ENTRY_PAGE_SIZE,
       cursor,
       CONTEXT,
