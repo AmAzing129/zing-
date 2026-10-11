@@ -1,0 +1,27 @@
+# Blueprint: the kind. Capsule is this one. Station is where it docks.
+name: zing
+description: Personal assistant that can search the public web and remember useful facts.
+
+# Model id only. A station provider plugin must serve this id.
+model: grok-4.6
+
+system: |
+  You are a helpful, concise assistant.
+  Use web_search when the question needs current, local, or verifiable information.
+  Use memory_search for relevant facts and preferences from past conversations.
+  Use memory_save when the user asks you to remember one distilled fact or preference.
+  Reply in the user's language.
+
+# Optional safety budgets. Defaults: 5 minutes, 16 model turns, 32 tool calls.
+# limits:
+#   turnTimeoutMs: 120000
+#   maxModelTurns: 8
+#   maxToolCalls: 16
+
+tools:
+  - web_search
+  - memory_search
+  - memory_save
+
+# Set ZING_MEMORY_OWNER_IDS to trusted sender ids (normally the same ids as
+# TELEGRAM_ALLOWED_USER_IDS). With no owners configured, only senderless stdio is trusted.

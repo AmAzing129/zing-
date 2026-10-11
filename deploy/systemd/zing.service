@@ -1,0 +1,33 @@
+[Unit]
+Description=Zing agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=zing
+Group=zing
+WorkingDirectory=/opt/zing
+EnvironmentFile=/etc/zing/zing.env
+Environment=ZING_HOME=/var/lib/zing
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env npm start
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=90s
+KillSignal=SIGTERM
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/zing
+
+[Install]
+WantedBy=multi-user.target

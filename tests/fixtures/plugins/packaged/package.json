@@ -1,0 +1,8 @@
+{
+  "name": "zing-fixture-packaged",
+  "private": true,
+  "type": "module",
+  "zing": {
+    "plugin": "./plugin.ts"
+  }
+}

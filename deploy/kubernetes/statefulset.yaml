@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zing
+spec:
+  serviceName: zing
+  replicas: 1
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app: zing
+  template:
+    metadata:
+      labels:
+        app: zing
+    spec:
+      terminationGracePeriodSeconds: 90
+      containers:
+        - name: zing
+          image: REPLACE_WITH_ZING_IMAGE
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: ZING_HOME
+              value: /zing
+          envFrom:
+            - secretRef:
+                name: zing-env
+          volumeMounts:
+            - name: zing-data
+              mountPath: /zing
+  volumeClaimTemplates:
+    - metadata:
+        name: zing-data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

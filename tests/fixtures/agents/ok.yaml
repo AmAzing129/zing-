@@ -1,0 +1,7 @@
+name: researcher
+description: Looks things up.
+model: grok-4.6
+system: |
+  Be brief.
+tools:
+  - web_search

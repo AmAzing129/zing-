@@ -1,0 +1,26 @@
+name: zing
+
+services:
+  zing:
+    build: .
+    image: zing:local
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 65s
+    env_file:
+      - .env
+    environment:
+      ZING_HOME: /zing
+    volumes:
+      - zing-data:/zing
+      - ./agent.yaml:/app/agent.yaml:ro
+      - ./station.yaml:/app/station.yaml:ro
+      - ./plugins:/app/plugins:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  zing-data:

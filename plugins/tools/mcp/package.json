@@ -1,0 +1,12 @@
+{
+  "name": "zing-tool-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "zing": {
+    "plugin": "./index.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
+  }
+}

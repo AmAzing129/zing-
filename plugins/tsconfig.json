@@ -1,0 +1,10 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": "..",
+    "paths": {
+      "zing": ["./src/plugin/api.ts"]
+    }
+  },
+  "include": ["./**/*.ts"]
+}
