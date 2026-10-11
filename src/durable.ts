@@ -80,7 +80,11 @@ const ABORT_GRACE_MS = 5_000;
 type ThreadRecord = { conversationId: number; updatedAt: number };
 /** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
 type ThreadsState = { threads: { [key: string]: ThreadRecord } };
-type TurnState = { senderId?: string };
+/**
+ * The conversation's latest turn: who sent it, the request ID it was submitted under, and whether observers have
+ * handled it. A turn whose observers did not finish before a crash is observed again on the next start.
+ */
+type TurnState = { senderId?: string; requestId?: string; observed?: boolean };
 
 /** Zing thread IDs, which the runtime treats as opaque, mapped to durable conversations. */
 const ThreadsDoc = defineDoc<ThreadsState>({
@@ -100,7 +104,7 @@ function threadIdOf(key: string): string | undefined {
   return key.startsWith(THREAD_KEY_PREFIX) ? key.slice(THREAD_KEY_PREFIX.length) : undefined;
 }
 
-/** The sender of the conversation's latest turn, so tools recovered after a restart keep its trust level. */
+/** The latest turn of each conversation, so recovered tools keep its sender's trust and observers see it once. */
 const TurnDoc = defineDoc<TurnState>({
   kind: "zing.turn",
   version: 1,
@@ -159,6 +163,9 @@ export async function createDurableAgent(
   const creating = new Map<string, Promise<Conversation>>();
   const pending = new Map<string, Promise<void>>();
   const active = new Map<string, ActiveTurn>();
+  /** Threads whose turn the previous process left unfinished or unobserved. */
+  const recovering = new Set<string>();
+  const marking = new Set<Promise<void>>();
   const budgets = new Map<number, TurnBudget>();
   let harness: Harness | undefined;
   let closed = false;
@@ -383,11 +390,29 @@ export async function createDurableAgent(
     return result;
   };
 
+  /** Record that observers handled the conversation's latest turn, unless a newer turn has replaced it since. */
+  const markObserved = (id: ConversationId, requestId: string, handled: Promise<void>): void => {
+    const marked = handled
+      .then(() =>
+        open().commit(async (tx) => {
+          const turn = await tx.doc(TurnDoc, id);
+          if (turn.requestId === requestId) turn.observed = true;
+        }, CONTEXT),
+      )
+      .catch((error: unknown) => {
+        // Left unobserved: the next start reports the turn again.
+        if (!closed) console.warn("durable turn observation was not recorded", error);
+      });
+    marking.add(marked);
+    void marked.finally(() => marking.delete(marked));
+  };
+
   /**
-   * Report a turn the previous process left unfinished once it settles: observers see it like any other turn, under
-   * the sender it ran for. Queued on its thread, so a new turn there starts after it.
+   * Report a turn the previous process did not finish observing, once it settles: observers see it like any other
+   * turn, under the sender it ran for. Queued on its thread, so a new turn there starts after it.
    */
-  const observeRecovered = (threadId: string, conversationId: ConversationId, submissionId: SubmissionId): void => {
+  const observeRecovered = (threadId: string, id: ConversationId, submissionId: SubmissionId): void => {
+    recovering.add(threadId);
     void enqueue(threadId, async () => {
       try {
         const submission = await open().submission(submissionId, CONTEXT);
@@ -396,38 +421,51 @@ export async function createDurableAgent(
         const conversation = await findConversation(threadId);
         if (!conversation) return;
         const entries = await readTurnEntries(conversation, record);
-        const budget = budgets.get(conversationId);
+        const budget = budgets.get(id);
         const status =
           record.status === "done"
             ? "completed"
             : record.reason === "aborted" && !budget?.failure
               ? "canceled"
               : "failed";
-        if (entries.length > 0) {
-          observers.notify({
-            type: "turn",
-            conversationId: threadId,
-            senderId: (await open().snapshot(TurnDoc, conversationId, CONTEXT))?.senderId,
-            capsule: capsuleRef,
-            status,
-            entries,
-          });
-        }
+        const turn = await open().snapshot(TurnDoc, id, CONTEXT);
+        const own = record.requestId !== undefined && turn?.requestId === record.requestId;
+        const handled =
+          entries.length === 0
+            ? Promise.resolve()
+            : observers.notify({
+                type: "turn",
+                conversationId: threadId,
+                senderId: own ? turn?.senderId : undefined,
+                capsule: capsuleRef,
+                status,
+                entries,
+              });
         await touch(threadId);
+        if (own && record.requestId !== undefined) markObserved(id, record.requestId, handled);
       } catch (error) {
         if (!closed) console.warn(`recovered turn of ${threadId} could not be observed`, error);
       } finally {
-        const budget = budgets.get(conversationId);
-        if (budget && !active.has(threadId)) releaseBudget(conversationId, budget);
+        recovering.delete(threadId);
+        const budget = budgets.get(id);
+        if (budget && !active.has(threadId)) releaseBudget(id, budget);
       }
     });
   };
 
+  const unsettled = new Map<number, SubmissionId[]>();
   for (const record of (await harness.inspect(CONTEXT)).submissions) {
-    const threadId = threadOf.get(record.conversationId);
-    if (threadId !== undefined && record.type === "input") {
-      observeRecovered(threadId, record.conversationId, record.id);
+    if (record.type === "input") unsettled.set(record.conversationId, [...(unsettled.get(record.conversationId) ?? []), record.id]);
+  }
+  for (const [threadId, id] of threads) {
+    const recovered = unsettled.get(id) ?? [];
+    const turn = await harness.snapshot(TurnDoc, id, CONTEXT);
+    if (turn?.requestId !== undefined && turn.observed === false) {
+      // Settled before the crash, but its observers never finished.
+      const record = await requestRecord(harness, id, turn.requestId);
+      if (record && !recovered.includes(record.id)) recovered.push(record.id);
     }
+    for (const submissionId of recovered) observeRecovered(threadId, id, submissionId);
   }
   harness.resume();
 
@@ -449,16 +487,22 @@ export async function createDurableAgent(
       let turn: ActiveTurn | undefined;
       let stream: Awaited<ReturnType<typeof watchEvents>> | undefined;
       let entries: ThreadEntry[] = [];
+      // Every turn is submitted under a request ID, so a restart can find it to observe it.
+      const requestId = input.requestId ?? `zing:${turnId}`;
+      let prepared: Conversation | undefined;
       const notifyTurn = (status: "completed" | "failed" | "canceled"): void => {
-        if (entries.length === 0) return;
-        observers.notify({
-          type: "turn",
-          conversationId: threadId,
-          senderId: input.senderId,
-          capsule: capsuleRef,
-          status,
-          entries,
-        });
+        const handled =
+          entries.length === 0
+            ? Promise.resolve()
+            : observers.notify({
+                type: "turn",
+                conversationId: threadId,
+                senderId: input.senderId,
+                capsule: capsuleRef,
+                status,
+                entries,
+              });
+        if (prepared) markObserved(prepared.id, requestId, handled);
       };
       try {
         if (closed || cancelRequested) throw new TurnCanceledError();
@@ -467,10 +511,10 @@ export async function createDurableAgent(
         await conversation.waitForIdle(CONTEXT);
         if (closed || cancelRequested) throw new TurnCanceledError();
 
-        // A repeated request ID is answered from the original turn; its entries were already observed then.
-        const original =
-          input.requestId === undefined ? undefined : await settledRequest(open(), conversation.id, input.requestId);
-        if (original) {
+        // A repeated request ID is answered from the original turn, which observers have already seen: in its own
+        // process, or, if that one died first, through the recovery queued ahead of this turn.
+        const original = input.requestId === undefined ? undefined : await requestRecord(open(), conversation.id, input.requestId);
+        if (original && isSettled(original)) {
           controller.emit({ type: "turn/started", threadId, turnId });
           const result = await outcome(conversation, original);
           controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
@@ -485,7 +529,8 @@ export async function createDurableAgent(
             `User input exceeded its ${policy.messageBudget}-token context budget`,
           );
         }
-        await prepareConversation(conversation, modelRef, input.senderId);
+        await prepareConversation(conversation, modelRef, input.senderId, requestId);
+        prepared = conversation;
 
         turn = { turnId, threadId, conversation, modelTurns: 0, toolCalls: 0, canceled: false };
         const current = turn;
@@ -519,11 +564,7 @@ export async function createDurableAgent(
         controller.emit({ type: "turn/started", threadId, turnId });
         if (cancelRequested) throw new TurnCanceledError();
         const submission = await conversation.submit(
-          {
-            type: "input",
-            content: input.text,
-            ...(input.requestId === undefined ? {} : { requestId: input.requestId }),
-          },
+          { type: "input", content: input.text, requestId },
           CONTEXT,
         );
         target = submission.id;
@@ -559,7 +600,8 @@ export async function createDurableAgent(
         const failed = shuttingDown
           ? new RuntimeError("RUNTIME_CLOSED", "Agent shut down; the turn resumes when the station restarts")
           : (turn?.failure ?? toError(error));
-        notifyTurn("failed");
+        // A turn cut off by shutdown is observed when the next start finishes it.
+        if (!shuttingDown) notifyTurn("failed");
         controller.emit({
           type: "turn/completed",
           threadId,
@@ -609,6 +651,9 @@ export async function createDurableAgent(
       for (const budget of budgets.values()) {
         if (budget.deadline) clearTimeout(budget.deadline);
       }
+      // Record finished observations while storage is still open.
+      await observers.drain();
+      await Promise.all([...marking]);
       const current = harness;
       harness = undefined;
       await current?.close(CONTEXT);
@@ -650,7 +695,7 @@ export async function createDurableAgent(
       const view = await conversation.context(CONTEXT);
       return {
         threadId: normalized,
-        status: active.has(normalized) ? "active" : "idle",
+        status: active.has(normalized) || recovering.has(normalized) ? "active" : "idle",
         entries: toThreadEntries(view.entries),
       };
     },
@@ -738,6 +783,7 @@ async function prepareConversation(
   conversation: Conversation,
   model: { provider: string; modelId: string },
   senderId: string | undefined,
+  requestId: string,
 ): Promise<void> {
   const agent = await conversation.agent(CONTEXT);
   await conversation.commit(async (tx) => {
@@ -747,6 +793,8 @@ async function prepareConversation(
     } else {
       turn.senderId = senderId;
     }
+    turn.requestId = requestId;
+    turn.observed = false;
   }, CONTEXT);
   // The blueprint decides the model; conversations created under another one follow it.
   if (agent.model?.provider !== model.provider || agent.model.modelId !== model.modelId) {
@@ -768,13 +816,8 @@ async function importMessages(tx: Tx, id: ConversationId, messages: readonly Mes
   }
 }
 
-async function settledRequest(
-  harness: Harness,
-  id: ConversationId,
-  requestId: string,
-): Promise<SubmissionRecord | undefined> {
-  const record = await harness.commit((tx) => tx.submissionByRequest(id, requestId), CONTEXT);
-  return record && isSettled(record) ? record : undefined;
+function requestRecord(harness: Harness, id: ConversationId, requestId: string): Promise<SubmissionRecord | undefined> {
+  return harness.commit((tx) => tx.submissionByRequest(id, requestId), CONTEXT);
 }
 
 /** The entries one settled input added: its user entry through its answer, or through the end when unanswered. */

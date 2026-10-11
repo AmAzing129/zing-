@@ -576,14 +576,26 @@ test("durable: a recovered turn is observed and touches its thread without any r
 
   const second = createTestStation();
   const turnObserved = deferred();
+  const modelCalled = deferred();
+  const answer = deferred();
   const observed: ConversationEvent[] = [];
-  second.faux.setResponses([fauxAssistantMessage("finished after restart")]);
+  second.faux.setResponses([
+    async () => {
+      modelCalled.resolve();
+      await answer.promise;
+      return fauxAssistantMessage("finished after restart");
+    },
+  ]);
   const after = await createDurableAgent(second.station, blueprintFor(second.model.id), capsule, {
     storage: await openNodeSqliteStorage(file),
     tools: [webSearch],
     listeners: [(event) => { observed.push(event); turnObserved.resolve(); }],
   });
+  await modelCalled.promise;
+  assert.equal((await after.readThread("chat:busy")).status, "active", "recovering work is reported as active");
+  answer.resolve();
   await turnObserved.promise;
+  assert.equal((await after.readThread("chat:busy")).status, "idle");
   const event = observed[0];
   assert.equal(event?.type, "turn");
   assert.equal(event?.type === "turn" ? event.status : undefined, "completed");
@@ -595,6 +607,65 @@ test("durable: a recovered turn is observed and touches its thread without any r
   await after.drainObservers();
   assert.equal((await after.listThreads()).data[0]?.threadId, "chat:busy", "the recovered thread is the most recent");
   await after.close();
+});
+
+test("durable: a settled turn whose observers never finished is observed after a restart", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-unobserved-"));
+  const file = join(dir, "durable.sqlite");
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const observerStarted = deferred();
+  const releaseObserver = deferred();
+  const first = createTestStation();
+  // The first process answers, then dies while its observer is still running: it is never closed.
+  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id, []), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    observerTimeoutMs: 60_000,
+    listeners: [async () => { observerStarted.resolve(); await releaseObserver.promise; }],
+  });
+  first.faux.setResponses([fauxAssistantMessage("remember: tea, not coffee")]);
+  assert.equal(
+    (await crashed.handleMessage({ conversationId: "telegram:1", text: "I prefer tea", senderId: "alice", requestId: "update:1" })).text,
+    "remember: tea, not coffee",
+  );
+  await observerStarted.promise;
+
+  const second = createTestStation();
+  const observed: ConversationEvent[] = [];
+  const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id, []), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    listeners: [(event) => { observed.push(event); }],
+  });
+  // The channel redelivers the update too; it is answered from the original turn and not observed twice.
+  assert.equal(
+    (await restarted.handleMessage({ conversationId: "telegram:1", text: "I prefer tea", senderId: "alice", requestId: "update:1" })).text,
+    "remember: tea, not coffee",
+  );
+  await restarted.drainObservers();
+  assert.equal(second.faux.state.callCount, 0);
+  assert.deepEqual(
+    observed.map((event) => event.type === "turn" && [event.status, event.senderId, event.entries.map((entry) => entry.type)]),
+    [["completed", "alice", ["user", "assistant"]]],
+  );
+  await restarted.close();
+
+  // Once recorded, a later start does not observe it again.
+  const third = createTestStation();
+  const later: ConversationEvent[] = [];
+  const again = await createDurableAgent(third.station, blueprintFor(third.model.id, []), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    listeners: [(event) => { later.push(event); }],
+  });
+  third.faux.setResponses([fauxAssistantMessage("next answer")]);
+  // Queued behind any recovery of this thread, so a second observation would arrive first.
+  await again.handleMessage({ conversationId: "telegram:1", text: "next" });
+  await again.drainObservers();
+  assert.deepEqual(
+    later.map((event) => event.type === "turn" && event.entries.map((entry) => entry.type === "user" && entry.content)),
+    [["next", false]],
+  );
+  await again.close();
+  releaseObserver.resolve();
+  await crashed.close().catch(() => undefined);
 });
 
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {

@@ -658,7 +658,8 @@ function createRuntimeEventCollector(
 }
 
 export type ObserverQueue = {
-  notify: (event: ConversationEvent) => void;
+  /** Settles once every listener has handled, failed, or timed out on this event; it never rejects. */
+  notify: (event: ConversationEvent) => Promise<void>;
   drain: () => Promise<void>;
 };
 
@@ -670,14 +671,17 @@ export function createObserverQueue(
 
   return {
     notify(event) {
+      const handled: Promise<void>[] = [];
       for (const listener of listeners) {
         const previous = tails.get(listener) ?? Promise.resolve();
         const tail = previous.then(() => runConversationListener(listener, event, timeoutMs));
         tails.set(listener, tail);
+        handled.push(tail);
         void tail.finally(() => {
           if (tails.get(listener) === tail) tails.delete(listener);
         });
       }
+      return Promise.all(handled).then(() => undefined);
     },
     async drain() {
       while (tails.size > 0) {
