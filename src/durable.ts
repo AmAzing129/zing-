@@ -178,7 +178,7 @@ export async function createDurableAgent(
   const pending = new Map<string, Promise<void>>();
   const active = new Map<string, ActiveTurn>();
   /** Threads whose turn the previous process left unfinished or unobserved. */
-  const recovering = new Set<string>();
+  const recovering = new Map<string, number>();
   const marking = new Set<Promise<void>>();
   const budgets = new Map<number, TurnBudget>();
   let harness: Harness | undefined;
@@ -448,7 +448,7 @@ export async function createDurableAgent(
    * turn, under the sender it ran for. Queued on its thread, so a new turn there starts after it.
    */
   const observeRecovered = (threadId: string, id: ConversationId, submissionId: SubmissionId): void => {
-    recovering.add(threadId);
+    recovering.set(threadId, (recovering.get(threadId) ?? 0) + 1);
     void enqueue(threadId, async () => {
       try {
         const submission = await open().submission(submissionId, CONTEXT);
@@ -478,7 +478,9 @@ export async function createDurableAgent(
       } catch (error) {
         if (!closed) console.warn(`recovered turn of ${threadId} could not be observed`, error);
       } finally {
-        recovering.delete(threadId);
+        const remaining = (recovering.get(threadId) ?? 1) - 1;
+        if (remaining > 0) recovering.set(threadId, remaining);
+        else recovering.delete(threadId);
         const budget = budgets.get(id);
         if (budget && !active.has(threadId)) releaseBudget(id, budget);
       }
@@ -892,20 +894,26 @@ function requestRecord(harness: Harness, id: ConversationId, requestId: string):
   return harness.commit((tx) => tx.submissionByRequest(id, requestId), CONTEXT);
 }
 
-/** The entries one settled input added: its user entry through its answer, or through the end when unanswered. */
+/**
+ * The entries one settled input added: its user entry through its answer, or, when unanswered, up to the next user
+ * entry. Zing submits one input at a time per thread, so the next user entry starts the next turn.
+ */
 async function readTurnEntries(conversation: Conversation, record: SubmissionRecord): Promise<ThreadEntry[]> {
   if (record.entry === undefined) return [];
   const last = record.status === "done" && record.type === "input" ? record.answer : undefined;
   const records: EntryRecord[] = [];
   let cursor: Parameters<Conversation["entries"]>[2];
-  do {
+  scan: do {
     const page = await conversation.entries(
       { minEntryId: record.entry, ...(last === undefined ? {} : { maxEntryId: last }), order: "ascending" },
       ENTRY_PAGE_SIZE,
       cursor,
       CONTEXT,
     );
-    records.push(...page.items);
+    for (const entry of page.items) {
+      if (entry.id !== record.entry && UserEntry.is(entry)) break scan;
+      records.push(entry);
+    }
     cursor = page.next;
   } while (cursor !== undefined);
   return toThreadEntries(records);
