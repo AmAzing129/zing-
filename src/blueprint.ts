@@ -64,8 +64,9 @@ export function defaultBlueprint(options: { model?: string } = {}): Blueprint {
   return { name: "zing", model: options.model, tools: [] };
 }
 
-export function withBlueprintModel(blueprint: Blueprint, fallback?: string): Blueprint {
-  return blueprint.model !== undefined || fallback === undefined ? blueprint : { ...blueprint, model: fallback };
+/** A station-level MODEL override replaces the Blueprint's model id. */
+export function withModelOverride(blueprint: Blueprint, override?: string): Blueprint {
+  return override === undefined ? blueprint : { ...blueprint, model: override };
 }
 
 export function resolveBlueprintTools(blueprint: Blueprint, registry: PluginRegistry) {

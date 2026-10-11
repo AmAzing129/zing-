@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { defaultBlueprint, findBlueprint, loadBlueprint, parseBlueprint, resolveBlueprintTools, withBlueprintModel } from "../src/blueprint";
+import { defaultBlueprint, findBlueprint, loadBlueprint, parseBlueprint, resolveBlueprintTools, withModelOverride } from "../src/blueprint";
 import { createPluginRegistry } from "../src/plugin/index";
 
 const fixtures = fileURLToPath(new URL("./fixtures/agents", import.meta.url));
@@ -87,10 +87,12 @@ test("findBlueprint prefers explicit, then cwd, then home", async () => {
   assert.equal(await findBlueprint({ cwd: join(root, "empty"), home: join(root, "empty-home") }), undefined);
 });
 
-test("defaultBlueprint has no tools and withBlueprintModel uses fallback only", () => {
+test("defaultBlueprint has no tools and withModelOverride replaces the model", () => {
   assert.deepEqual(defaultBlueprint().tools, []);
-  assert.equal(withBlueprintModel(defaultBlueprint(), "env-model").model, "env-model");
-  assert.equal(withBlueprintModel(defaultBlueprint({ model: "blueprint-model" }), "env-model").model, "blueprint-model");
+  assert.equal(withModelOverride(defaultBlueprint(), "env-model").model, "env-model");
+  assert.equal(withModelOverride(defaultBlueprint({ model: "blueprint-model" }), "env-model").model, "env-model");
+  const blueprint = defaultBlueprint({ model: "blueprint-model" });
+  assert.strictEqual(withModelOverride(blueprint, undefined), blueprint);
 });
 
 test("resolveBlueprintTools exposes exact listed tools and reports missing names", () => {

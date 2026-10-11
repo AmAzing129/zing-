@@ -87,6 +87,18 @@ test("an agent can run with no tools", async () => {
 });
 
 
+test("an agent requires an explicit model id", () => {
+  const { station } = createTestHarness();
+  let resolved = false;
+  const watched: Station = { ...station, resolveModel: (id) => ((resolved = true), station.resolveModel(id)) };
+  assert.throws(
+    () => createAgent(watched, { name: "modelless", tools: [] }),
+    /Blueprint modelless has no model\. Set model in agent\.yaml or MODEL=<id>\./,
+  );
+  assert.equal(resolved, false);
+});
+
+
 test("generic tools execute and persist structured details", async () => {
   const { faux, model, station } = createTestHarness();
   const seen: Record<string, unknown>[] = [];

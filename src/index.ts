@@ -4,7 +4,7 @@ import {
   defaultBlueprint,
   findBlueprint,
   loadBlueprint,
-  withBlueprintModel,
+  withModelOverride,
 } from "./blueprint";
 import { openFileCapsule } from "./capsule";
 import { registerStdioChannel } from "./channels/stdio";
@@ -58,7 +58,7 @@ async function main(): Promise<void> {
 
   try {
     const blueprintPath = await findBlueprint({ explicit: cli.blueprint, home });
-    const blueprint = withBlueprintModel(
+    const blueprint = withModelOverride(
       blueprintPath ? await loadBlueprint(blueprintPath) : defaultBlueprint(),
       config.model,
     );
