@@ -41,6 +41,8 @@ export default function telegram(zing: ZingPluginAPI) {
             conversationId: conversation,
             text: ctx.message.text,
             senderId: ctx.from?.id !== undefined ? String(ctx.from.id) : undefined,
+            // Telegram redelivers an update the bot never confirmed, for example after a crash mid-turn.
+            requestId: `update:${ctx.update.update_id}`,
           });
           for (const chunk of splitMessage(result.text || "(empty response)")) {
             await ctx.reply(chunk);

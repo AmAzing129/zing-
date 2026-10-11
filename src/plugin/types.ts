@@ -18,6 +18,8 @@ export type IncomingMessage = {
   conversationId: string;
   text: string;
   senderId?: string;
+  /** Stable per-message key, such as a platform update ID, so a redelivered message is answered once. */
+  requestId?: string;
 };
 
 export type ConversationHost = {

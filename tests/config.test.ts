@@ -49,6 +49,14 @@ test("loadConfig does not require a channel, provider, or secrets", () => {
   assert.equal(config.provider, undefined);
   assert.equal(config.capsulePath, undefined);
   assert.deepEqual(config.pluginPaths, []);
+  assert.equal(config.runtime, "legacy");
+});
+
+test("ZING_RUNTIME overrides the station runtime", () => {
+  assert.equal(loadConfig({}, { station: { plugins: [], runtime: "durable" } }).runtime, "durable");
+  assert.equal(loadConfig({ ZING_RUNTIME: "legacy" }, { station: { plugins: [], runtime: "durable" } }).runtime, "legacy");
+  assert.equal(loadConfig({ ZING_RUNTIME: " durable " }).runtime, "durable");
+  assert.throws(() => loadConfig({ ZING_RUNTIME: "other" }), /ZING_RUNTIME must be one of legacy, durable/);
 });
 
 test("loadConfig accepts CLI overrides", () => {

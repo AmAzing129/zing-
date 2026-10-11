@@ -128,11 +128,15 @@ export function createMemoryCapsule(
   };
 }
 
-export async function openFileCapsule(options: OpenCapsuleOptions): Promise<Capsule> {
+/** The directory openFileCapsule uses for these options. */
+export function resolveCapsulePath(options: OpenCapsuleOptions): string {
   const cwd = options.cwd ?? process.cwd();
-  const home = options.home ?? zingHome(options.env);
   const explicit = options.path?.trim();
-  const path = explicit ? resolve(cwd, explicit) : defaultCapsulePath(options.blueprint.name, home);
+  return explicit ? resolve(cwd, explicit) : defaultCapsulePath(options.blueprint.name, options.home ?? zingHome(options.env));
+}
+
+export async function openFileCapsule(options: OpenCapsuleOptions): Promise<Capsule> {
+  const path = resolveCapsulePath(options);
 
   await mkdir(path, { recursive: true });
   const state = createFileState(path);

@@ -86,6 +86,17 @@ limits:
 
 A turn that exceeds a limit ends as `failed`, but its completed transcript remains durable. Plugin tools receive an `AbortSignal` through `ToolContext`; Zing stops waiting once a turn is canceled or out of budget, even if a plugin does not cooperate.
 
+### Durable runtime (experimental)
+
+By default the capsule keeps each thread as a JSONL transcript, written when a turn ends. A crash mid-turn loses that turn. Set `runtime: durable` in `station.yaml` (or `ZING_RUNTIME=durable`) to run the capsule on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable) instead:
+
+- Every user message, model response, and tool result is committed to `durable.sqlite` in the capsule before it is shown.
+- A restarted station resumes the turns it left unfinished. An interrupted tool call is not run again; the model receives an `interrupted` result and continues.
+- A redelivered message with the same request ID (Telegram uses the update ID) is answered once, from the original turn.
+- Threads, turns, events, limits, plugins, and the App Server protocol behave as before. Existing JSONL threads are imported, from their last reset, the first time the durable runtime opens the capsule; the JSONL files stay untouched, so switching back to `legacy` does not see later turns.
+
+A graceful stop leaves running turns pending instead of canceling them; they resume on the next start. pi-durable is marked experimental upstream, so Zing pins its exact version.
+
 ## Deployment environments
 
 The same Zing runtime can be deployed independently on a VPS, a Mac mini, or a single-replica container platform. The current supported contract is intentionally narrow: one resident Node.js 22 process, one writer for each Capsule, and a persistent POSIX filesystem mounted at `ZING_HOME`. Each deployment can keep its own agent and Capsule without changing application code.

@@ -29,6 +29,12 @@ test("station config resolves ordered plugin paths relative to its own file", as
   });
 });
 
+test("station config selects the agent runtime", () => {
+  assert.equal(parseStationConfig({ plugins: [], runtime: "durable" }).runtime, "durable");
+  assert.equal(parseStationConfig({ plugins: [] }).runtime, undefined);
+  assert.throws(() => parseStationConfig({ plugins: [], runtime: "fast" }), /runtime must be one of legacy, durable/);
+});
+
 test("station config rejects unknown fields, invalid lists, and duplicate resolved paths", () => {
   assert.throws(() => parseStationConfig({ plugins: [], model: "grok" }), /unknown station field model/);
   assert.throws(() => parseStationConfig({ plugins: "./one" }), /plugins must be a list/);

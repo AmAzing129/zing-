@@ -6,7 +6,9 @@ import {
   loadBlueprint,
   withModelOverride,
 } from "./blueprint";
-import { openFileCapsule } from "./capsule";
+import { join } from "node:path";
+
+import { openFileCapsule, resolveCapsulePath } from "./capsule";
 import { registerStdioChannel } from "./channels/stdio";
 import { parseCli, usage } from "./cli";
 import { loadConfig } from "./config";
@@ -17,6 +19,7 @@ import { runStdioAppServer } from "./protocol/index";
 import { defaultStationConfig, findStationConfig, loadStationConfig } from "./station-config";
 
 const SHUTDOWN_TIMEOUT_MS = 60_000;
+const DURABLE_STORAGE_FILE = "durable.sqlite";
 
 async function main(): Promise<void> {
   const cli = parseCli(process.argv.slice(2));
@@ -62,9 +65,18 @@ async function main(): Promise<void> {
       blueprintPath ? await loadBlueprint(blueprintPath) : defaultBlueprint(),
       config.model,
     );
+    const capsuleOptions = { blueprint, path: config.capsulePath, home };
     host = await createZingHost({
       blueprint,
-      capsuleFactory: (candidate) => openFileCapsule({ blueprint: candidate, path: config.capsulePath, home }),
+      capsuleFactory: (candidate) => openFileCapsule({ ...capsuleOptions, blueprint: candidate }),
+      durableStorage:
+        config.runtime === "durable"
+          ? async () => {
+              // Loaded only when selected: node:sqlite is still experimental in Node 22.
+              const { openNodeSqliteStorage } = await import("@earendil-works/pi-durable/storage/sqlite/node");
+              return openNodeSqliteStorage(join(resolveCapsulePath(capsuleOptions), DURABLE_STORAGE_FILE));
+            }
+          : undefined,
       pluginPaths: config.pluginPaths,
       provider: config.provider,
       env: process.env,
@@ -78,7 +90,7 @@ async function main(): Promise<void> {
     }
 
     if (cli.mode === "app-server") {
-      console.error(`Agent ${host.agent.name} ${host.agent.agentId} via app-server stdio`);
+      console.error(`Agent ${host.agent.name} ${host.agent.agentId} via app-server stdio (${config.runtime} runtime)`);
       await runStdioAppServer(
         host.agent,
         {
@@ -92,7 +104,7 @@ async function main(): Promise<void> {
     }
 
     const channel = selectChannel(host.registry, config.channel);
-    console.log(`Agent ${host.agent.name} ${host.agent.agentId} via ${channel.id}`);
+    console.log(`Agent ${host.agent.name} ${host.agent.agentId} via ${channel.id} (${config.runtime} runtime)`);
     await channel.start(shutdown.signal);
   } finally {
     try {

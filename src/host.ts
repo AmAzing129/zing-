@@ -1,3 +1,5 @@
+import type { Storage } from "@earendil-works/pi-durable";
+
 import { createAgent, type Agent } from "./agent";
 import { resolveBlueprintTools, type Blueprint } from "./blueprint";
 import type { Capsule } from "./capsule";
@@ -19,6 +21,8 @@ export type CreateZingHostOptions = {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   configureRegistry?: (registry: PluginRegistry) => void | Promise<void>;
+  /** Run the capsule on the durable runtime, over the storage this opens. Absent: the legacy runtime. */
+  durableStorage?: (capsule: Capsule) => Promise<Storage>;
 };
 
 export type ZingHost = {
@@ -40,10 +44,14 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
     const station = createStation({ providers: registry.listProviders(), provider: options.provider });
     const capsule = await options.capsuleFactory(options.blueprint);
     const tools = resolveBlueprintTools(options.blueprint, registry);
-    const agent = createAgent(station, options.blueprint, capsule, {
-      tools,
-      listeners: registry.listListeners(),
-    });
+    const agentOptions = { tools, listeners: registry.listListeners() };
+    // pi-durable loads TypeBox and Chord; a legacy station never imports it.
+    const agent = options.durableStorage
+      ? await (await import("./durable")).createDurableAgent(station, options.blueprint, capsule, {
+          ...agentOptions,
+          storage: await options.durableStorage(capsule),
+        })
+      : createAgent(station, options.blueprint, capsule, agentOptions);
     registry.bindHost(agent);
 
     let closing: Promise<void> | undefined;

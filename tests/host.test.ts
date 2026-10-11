@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { fauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, Type } from "@earendil-works/pi-ai";
+import { MemoryStorage } from "@earendil-works/pi-durable";
 
 import type { Blueprint } from "../src/blueprint";
 import { createMemoryCapsule } from "../src/capsule";
@@ -31,6 +32,45 @@ test("createZingHost injects a capsule factory and closes idempotently", async (
   const closing = host.close();
   assert.strictEqual(host.close(), closing);
   await closing;
+  assert.throws(() => host.agent.startTurn({ threadId: "closed", text: "nope" }), /shutting down/);
+});
+
+test("createZingHost runs the durable runtime over the storage it is given", async () => {
+  const faux = fauxProvider({ models: [{ id: "host-model" }] });
+  const blueprint: Blueprint = { name: "durable-host", model: "host-model", tools: ["echo"] };
+  const capsule = createMemoryCapsule({ blueprintName: blueprint.name, agentId: "agt_durable" });
+  const conversations: string[] = [];
+  let storageFor: unknown;
+  const host = await createZingHost({
+    blueprint,
+    capsuleFactory: async () => capsule,
+    durableStorage: async (candidate) => {
+      storageFor = candidate;
+      return new MemoryStorage();
+    },
+    configureRegistry(registry) {
+      registry.api.registerProvider({ pluginId: "fake", provider: faux.provider });
+      registry.api.registerTool({
+        name: "echo",
+        description: "Echo",
+        parameters: Type.Object({ text: Type.String() }),
+        execute: async (input, context) => {
+          conversations.push(context.conversationId);
+          return { text: String(input.text) };
+        },
+      });
+    },
+  });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("echo", { text: "hi" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("echoed"),
+  ]);
+
+  assert.strictEqual(storageFor, capsule);
+  assert.equal(host.agent.agentId, "agt_durable");
+  assert.equal((await host.agent.handleMessage({ conversationId: "telegram:9", text: "echo hi" })).text, "echoed");
+  assert.deepEqual(conversations, ["telegram:9"]);
+  await host.close();
   assert.throws(() => host.agent.startTurn({ threadId: "closed", text: "nope" }), /shutting down/);
 });
 
