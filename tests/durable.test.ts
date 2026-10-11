@@ -668,6 +668,83 @@ test("durable: a settled turn whose observers never finished is observed after a
   await crashed.close().catch(() => undefined);
 });
 
+test("durable: every unobserved turn of a thread survives a crash, not only the latest", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-unobserved-many-"));
+  const file = join(dir, "durable.sqlite");
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const observerStarted = deferred();
+  const release = deferred();
+  const first = createTestStation();
+  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id, []), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    observerTimeoutMs: 60_000,
+    listeners: [async () => { observerStarted.resolve(); await release.promise; }],
+  });
+  first.faux.setResponses([fauxAssistantMessage("a"), fauxAssistantMessage("b")]);
+  await crashed.handleMessage({ conversationId: "telegram:1", text: "first", senderId: "alice" });
+  await observerStarted.promise;
+  // The second turn starts while the first one's observer is still running; both die unobserved.
+  await crashed.handleMessage({ conversationId: "telegram:1", text: "second", senderId: "bob" });
+
+  const second = createTestStation();
+  const observed: ConversationEvent[] = [];
+  const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id, []), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    listeners: [(event) => { observed.push(event); }],
+  });
+  second.faux.setResponses([fauxAssistantMessage("c")]);
+  await restarted.handleMessage({ conversationId: "telegram:1", text: "third", senderId: "carol" });
+  await restarted.drainObservers();
+  assert.deepEqual(
+    observed.map((event) => event.type === "turn" && [event.senderId, event.entries[0]?.type === "user" && event.entries[0].content]),
+    [["alice", "first"], ["bob", "second"], ["carol", "third"]],
+  );
+  await restarted.close();
+  release.resolve();
+  await crashed.close().catch(() => undefined);
+});
+
+test("durable: a turn that ran over budget stays failed across a crash and a redelivery", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-failure-"));
+  const file = join(dir, "durable.sqlite");
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const observerStarted = deferred();
+  const release = deferred();
+  const first = createTestStation();
+  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [webSearch],
+    limits: { maxToolCalls: 1 },
+    observerTimeoutMs: 60_000,
+    listeners: [async () => { observerStarted.resolve(); await release.promise; }],
+  });
+  first.faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "a" }), fauxToolCall(WEB_SEARCH, { query: "b" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("never"),
+  ]);
+  const request = { conversationId: "telegram:1", text: "search twice", senderId: "alice", requestId: "update:9" };
+  await assert.rejects(crashed.handleMessage(request), /1 tool-call limit/);
+  await observerStarted.promise;
+
+  const second = createTestStation();
+  const observed: ConversationEvent[] = [];
+  const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [webSearch],
+    listeners: [(event) => { observed.push(event); }],
+  });
+  await assert.rejects(restarted.handleMessage(request), /1 tool-call limit/);
+  await restarted.drainObservers();
+  assert.equal(second.faux.state.callCount, 0);
+  assert.deepEqual(
+    observed.map((event) => event.type === "turn" && [event.status, event.senderId]),
+    [["failed", "alice"]],
+  );
+  await restarted.close();
+  release.resolve();
+  await crashed.close().catch(() => undefined);
+});
+
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
   const events: ConversationEvent[] = [];
   const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });

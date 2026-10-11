@@ -61,6 +61,7 @@ import {
   TurnBudgetExceededError,
   TurnCanceledError,
   type ListThreadsOptions,
+  type TurnBudget as TurnBudgetKind,
   type RuntimeEvent,
   type ThreadEntry,
   type TurnHandle,
@@ -81,10 +82,21 @@ type ThreadRecord = { conversationId: number; updatedAt: number };
 /** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
 type ThreadsState = { threads: { [key: string]: ThreadRecord } };
 /**
- * The conversation's latest turn: who sent it, the request ID it was submitted under, and whether observers have
- * handled it. A turn whose observers did not finish before a crash is observed again on the next start.
+ * One submitted turn: who sent it, whether observers have handled it, and the budget that ended it, if any. A turn
+ * whose observers did not finish before a crash is observed again on the next start.
  */
-type TurnState = { senderId?: string; requestId?: string; observed?: boolean };
+type TurnRecord = {
+  requestId: string;
+  senderId?: string;
+  observed: boolean;
+  failure?: { budget: string; message: string };
+};
+/**
+ * `senderId` is the latest turn's, for tools. `turns` keeps every unobserved turn, and the latest observed turns that
+ * ended over budget, so a redelivery can report the same failure.
+ */
+type TurnState = { senderId?: string; turns?: TurnRecord[] };
+const RETAINED_FAILURES = 16;
 
 /** Zing thread IDs, which the runtime treats as opaque, mapped to durable conversations. */
 const ThreadsDoc = defineDoc<ThreadsState>({
@@ -104,7 +116,7 @@ function threadIdOf(key: string): string | undefined {
   return key.startsWith(THREAD_KEY_PREFIX) ? key.slice(THREAD_KEY_PREFIX.length) : undefined;
 }
 
-/** The latest turn of each conversation, so recovered tools keep its sender's trust and observers see it once. */
+/** Each conversation's turns, so recovered tools keep their sender's trust and observers see every turn. */
 const TurnDoc = defineDoc<TurnState>({
   kind: "zing.turn",
   version: 1,
@@ -120,6 +132,8 @@ export type CreateDurableAgentOptions = CreateAgentOptions & {
 };
 
 type TurnBudget = {
+  /** The submission's request ID, under which its failure is recorded. */
+  requestId?: string;
   modelTurns: number;
   toolCalls: number;
   failure?: TurnBudgetExceededError;
@@ -184,17 +198,43 @@ export async function createDurableAgent(
     return harness;
   };
 
-  const stop = (budget: TurnBudget): void => {
-    budget.aborting ??= budget.conversation.abort(CONTEXT).catch((error: unknown) => {
-      if (!closed) console.warn("durable conversation abort failed", error);
-    });
+  const stop = (budget: TurnBudget, after: Promise<void> = Promise.resolve()): void => {
+    budget.aborting ??= after
+      .then(() => budget.conversation.abort(CONTEXT))
+      .catch((error: unknown) => {
+        if (!closed) console.warn("durable conversation abort failed", error);
+      });
   };
 
   const fail = (budget: TurnBudget, failure: TurnBudgetExceededError): void => {
-    if (!budget.canceled) {
-      budget.failure ??= failure;
+    if (budget.canceled || budget.failure) {
+      stop(budget);
+      return;
     }
-    stop(budget);
+    budget.failure = failure;
+    // Recorded before the abort, so the aborted submission is always known to have failed, even across a crash.
+    const recorded =
+      budget.requestId === undefined
+        ? Promise.resolve()
+        : budget.conversation
+            .commit(async (tx) => {
+              const turn = findTurn((await tx.doc(TurnDoc, budget.conversation.id)).turns, budget.requestId);
+              if (turn) turn.failure = { budget: failure.budget, message: failure.message };
+            }, CONTEXT)
+            .catch((error: unknown) => {
+              if (!closed) console.warn("durable turn failure was not recorded", error);
+            });
+    stop(budget, recorded);
+  };
+
+  const createRecoveredBudget = (conversation: Conversation, requestId?: string): TurnBudget => {
+    const recovered: TurnBudget = { requestId, modelTurns: 0, toolCalls: 0, canceled: false, conversation };
+    recovered.deadline = setTimeout(() => {
+      fail(recovered, new TurnBudgetExceededError("timeout", `Turn exceeded the ${limits.turnTimeoutMs}ms timeout`));
+    }, limits.turnTimeoutMs);
+    recovered.deadline.unref();
+    budgets.set(conversation.id, recovered);
+    return recovered;
   };
 
   /**
@@ -210,13 +250,7 @@ export async function createDurableAgent(
     if (!conversation || budgets.has(id)) {
       return budgets.get(id);
     }
-    const recovered: TurnBudget = { modelTurns: 0, toolCalls: 0, canceled: false, conversation };
-    recovered.deadline = setTimeout(() => {
-      fail(recovered, new TurnBudgetExceededError("timeout", `Turn exceeded the ${limits.turnTimeoutMs}ms timeout`));
-    }, limits.turnTimeoutMs);
-    recovered.deadline.unref();
-    budgets.set(id, recovered);
-    return recovered;
+    return createRecoveredBudget(conversation);
   };
 
   const releaseBudget = (id: ConversationId, budget: TurnBudget): void => {
@@ -390,13 +424,15 @@ export async function createDurableAgent(
     return result;
   };
 
-  /** Record that observers handled the conversation's latest turn, unless a newer turn has replaced it since. */
+  /** Record that observers handled a turn. */
   const markObserved = (id: ConversationId, requestId: string, handled: Promise<void>): void => {
     const marked = handled
       .then(() =>
         open().commit(async (tx) => {
-          const turn = await tx.doc(TurnDoc, id);
-          if (turn.requestId === requestId) turn.observed = true;
+          const state = await tx.doc(TurnDoc, id);
+          const turn = findTurn(state.turns, requestId);
+          if (turn) turn.observed = true;
+          if (state.turns) pruneTurns(state.turns);
         }, CONTEXT),
       )
       .catch((error: unknown) => {
@@ -421,28 +457,24 @@ export async function createDurableAgent(
         const conversation = await findConversation(threadId);
         if (!conversation) return;
         const entries = await readTurnEntries(conversation, record);
-        const budget = budgets.get(id);
+        await budgets.get(id)?.aborting;
+        const turn = findTurn((await open().snapshot(TurnDoc, id, CONTEXT))?.turns, record.requestId);
+        const failed = turn?.failure !== undefined || budgets.get(id)?.failure !== undefined;
         const status =
-          record.status === "done"
-            ? "completed"
-            : record.reason === "aborted" && !budget?.failure
-              ? "canceled"
-              : "failed";
-        const turn = await open().snapshot(TurnDoc, id, CONTEXT);
-        const own = record.requestId !== undefined && turn?.requestId === record.requestId;
+          record.status === "done" ? "completed" : record.reason === "aborted" && !failed ? "canceled" : "failed";
         const handled =
           entries.length === 0
             ? Promise.resolve()
             : observers.notify({
                 type: "turn",
                 conversationId: threadId,
-                senderId: own ? turn?.senderId : undefined,
+                senderId: turn?.senderId,
                 capsule: capsuleRef,
                 status,
                 entries,
               });
         await touch(threadId);
-        if (own && record.requestId !== undefined) markObserved(id, record.requestId, handled);
+        if (turn) markObserved(id, turn.requestId, handled);
       } catch (error) {
         if (!closed) console.warn(`recovered turn of ${threadId} could not be observed`, error);
       } finally {
@@ -453,19 +485,28 @@ export async function createDurableAgent(
     });
   };
 
-  const unsettled = new Map<number, SubmissionId[]>();
+  const unsettled = new Map<number, SubmissionRecord[]>();
   for (const record of (await harness.inspect(CONTEXT)).submissions) {
-    if (record.type === "input") unsettled.set(record.conversationId, [...(unsettled.get(record.conversationId) ?? []), record.id]);
+    if (record.type === "input") {
+      unsettled.set(record.conversationId, [...(unsettled.get(record.conversationId) ?? []), record]);
+    }
   }
   for (const [threadId, id] of threads) {
-    const recovered = unsettled.get(id) ?? [];
-    const turn = await harness.snapshot(TurnDoc, id, CONTEXT);
-    if (turn?.requestId !== undefined && turn.observed === false) {
-      // Settled before the crash, but its observers never finished.
+    const live = unsettled.get(id) ?? [];
+    const recovered = new Set(live.map((record) => record.id));
+    for (const turn of (await harness.snapshot(TurnDoc, id, CONTEXT))?.turns ?? []) {
+      if (turn.observed) continue;
+      // Settled before the crash, but its observers never finished; or never admitted at all.
       const record = await requestRecord(harness, id, turn.requestId);
-      if (record && !recovered.includes(record.id)) recovered.push(record.id);
+      if (record) recovered.add(record.id);
+      else markObserved(id, turn.requestId, Promise.resolve());
     }
-    for (const submissionId of recovered) observeRecovered(threadId, id, submissionId);
+    const conversation = live.length > 0 ? await harness.conversation(id, CONTEXT) : undefined;
+    // A conversation runs one input at a time; its resumed run gets fresh limits from now.
+    if (conversation) createRecoveredBudget(conversation, live[0]?.requestId);
+    for (const submissionId of [...recovered].sort((left, right) => left - right)) {
+      observeRecovered(threadId, id, submissionId);
+    }
   }
   harness.resume();
 
@@ -516,6 +557,8 @@ export async function createDurableAgent(
         const original = input.requestId === undefined ? undefined : await requestRecord(open(), conversation.id, input.requestId);
         if (original && isSettled(original)) {
           controller.emit({ type: "turn/started", threadId, turnId });
+          const recorded = findTurn((await open().snapshot(TurnDoc, conversation.id, CONTEXT))?.turns, input.requestId);
+          if (original.status === "unanswered" && recorded?.failure) throw budgetError(recorded.failure);
           const result = await outcome(conversation, original);
           controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
           controller.resolve(result);
@@ -532,7 +575,7 @@ export async function createDurableAgent(
         await prepareConversation(conversation, modelRef, input.senderId, requestId);
         prepared = conversation;
 
-        turn = { turnId, threadId, conversation, modelTurns: 0, toolCalls: 0, canceled: false };
+        turn = { turnId, threadId, requestId, conversation, modelTurns: 0, toolCalls: 0, canceled: false };
         const current = turn;
         const recovered = budgets.get(conversation.id);
         if (recovered) releaseBudget(conversation.id, recovered);
@@ -793,8 +836,11 @@ async function prepareConversation(
     } else {
       turn.senderId = senderId;
     }
-    turn.requestId = requestId;
-    turn.observed = false;
+    turn.turns ??= [];
+    const index = turn.turns.findIndex((record) => record.requestId === requestId);
+    if (index >= 0) turn.turns.splice(index, 1);
+    turn.turns.push({ requestId, ...(senderId === undefined ? {} : { senderId }), observed: false });
+    pruneTurns(turn.turns);
   }, CONTEXT);
   // The blueprint decides the model; conversations created under another one follow it.
   if (agent.model?.provider !== model.provider || agent.model.modelId !== model.modelId) {
@@ -814,6 +860,32 @@ async function importMessages(tx: Tx, id: ConversationId, messages: readonly Mes
       await tx.appendEntry(ToolResultEntry, id, { model: [message], data: { diagnostics: [] } });
     }
   }
+}
+
+function findTurn<T extends TurnRecord>(turns: T[] | readonly T[] | undefined, requestId: string | undefined): T | undefined {
+  return requestId === undefined ? undefined : turns?.find((turn) => turn.requestId === requestId);
+}
+
+/** Drop observed turns that ended normally, and all but the latest retained failures. */
+function pruneTurns(turns: TurnRecord[]): void {
+  let failures = 0;
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (!turn || !turn.observed) continue;
+    if (turn.failure && failures < RETAINED_FAILURES) {
+      failures += 1;
+      continue;
+    }
+    turns.splice(index, 1);
+  }
+}
+
+const BUDGETS = new Set<string>(["context", "model-turns", "timeout", "tool-calls"]);
+
+function budgetError(failure: { budget: string; message: string }): Error {
+  return BUDGETS.has(failure.budget)
+    ? new TurnBudgetExceededError(failure.budget as TurnBudgetKind, failure.message)
+    : new Error(failure.message);
 }
 
 function requestRecord(harness: Harness, id: ConversationId, requestId: string): Promise<SubmissionRecord | undefined> {
