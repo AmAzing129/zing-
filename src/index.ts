@@ -42,20 +42,19 @@ async function main(): Promise<void> {
 
   const shutdown = new AbortController();
   let host: ZingHost | undefined;
-  let signalExitCode: number | undefined;
-  const stop = (signal: NodeJS.Signals): void => {
+  let forcedExitCode: number | undefined;
+  const stop = (exitCode: number): void => {
     if (shutdown.signal.aborted) {
       return;
     }
-    const exitCode = signal === "SIGINT" ? 130 : 143;
-    signalExitCode = exitCode;
+    forcedExitCode = exitCode;
     process.exitCode = exitCode;
     setTimeout(() => process.exit(exitCode), SHUTDOWN_TIMEOUT_MS).unref();
     shutdown.abort();
     void host?.close().catch((error) => console.error("Zing host cleanup failed", error));
   };
-  const onSigint = () => stop("SIGINT");
-  const onSigterm = () => stop("SIGTERM");
+  const onSigint = () => stop(130);
+  const onSigterm = () => stop(143);
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
 
@@ -77,6 +76,8 @@ async function main(): Promise<void> {
               return openNodeSqliteStorage(join(resolveCapsulePath(capsuleOptions), DURABLE_STORAGE_FILE));
             }
           : undefined,
+      // Exit non-zero so the supervisor restarts the station; reopening the storage resumes the agent.
+      onFatal: () => stop(1),
       pluginPaths: config.pluginPaths,
       provider: config.provider,
       env: process.env,
@@ -112,8 +113,8 @@ async function main(): Promise<void> {
     } finally {
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
-      if (signalExitCode !== undefined) {
-        process.exit(signalExitCode);
+      if (forcedExitCode !== undefined) {
+        process.exit(forcedExitCode);
       }
     }
   }

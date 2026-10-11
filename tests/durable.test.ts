@@ -921,6 +921,56 @@ test("durable: a resumed run keeps its limits while an earlier recovery on its t
   await restarted.close().catch(() => undefined);
 });
 
+test("durable: every budget failure stays reportable to its redelivery", async () => {
+  const { agent, faux } = await createTestAgent({ limits: { maxToolCalls: 1 } });
+  const twice = () =>
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "a" }), fauxToolCall(WEB_SEARCH, { query: "b" })], {
+      stopReason: "toolUse",
+    });
+  for (let index = 0; index < 20; index += 1) {
+    faux.setResponses([twice()]);
+    await assert.rejects(
+      agent.handleMessage({ conversationId: "chat:failures", text: `try ${index}`, requestId: `update:${index}` }),
+      /1 tool-call limit/,
+    );
+  }
+  const calls = faux.state.callCount;
+  await assert.rejects(
+    agent.handleMessage({ conversationId: "chat:failures", text: "try 0", requestId: "update:0" }),
+    /1 tool-call limit/,
+  );
+  assert.equal(faux.state.callCount, calls);
+  await agent.close();
+});
+
+test("durable: a storage failure that poisons the session stops the agent and reports it once", async () => {
+  let failing = false;
+  const memory = new MemoryStorage();
+  const storage = new Proxy(memory, {
+    get(target, property) {
+      if (property === "commit" && failing) {
+        return async () => {
+          throw new Error("disk is gone");
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const fatal: Error[] = [];
+  const { agent, faux } = await createTestAgent({ storage, onFatal: (error) => fatal.push(error) });
+  faux.setResponses([fauxAssistantMessage("fine"), fauxAssistantMessage("never")]);
+  assert.equal((await agent.handleMessage({ conversationId: "chat:disk", text: "one" })).text, "fine");
+
+  failing = true;
+  await assert.rejects(agent.handleMessage({ conversationId: "chat:disk", text: "two" }));
+  assert.equal(fatal.length, 1);
+  assert.match(fatal[0]?.message ?? "", /Session is poisoned/);
+  assert.throws(() => agent.startTurn({ threadId: "chat:disk", text: "three" }), /shutting down/);
+  await agent.close();
+  assert.equal(fatal.length, 1);
+});
+
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
   const events: ConversationEvent[] = [];
   const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });

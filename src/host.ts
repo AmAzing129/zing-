@@ -23,6 +23,8 @@ export type CreateZingHostOptions = {
   configureRegistry?: (registry: PluginRegistry) => void | Promise<void>;
   /** Run the capsule on the durable runtime, over the storage this opens. Absent: the legacy runtime. */
   durableStorage?: (capsule: Capsule) => Promise<Storage>;
+  /** The durable runtime stopped after a storage failure it cannot recover from in this process. */
+  onFatal?: (error: Error) => void;
 };
 
 export type ZingHost = {
@@ -50,6 +52,7 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
       ? await (await import("./durable")).createDurableAgent(station, options.blueprint, capsule, {
           ...agentOptions,
           storage: await options.durableStorage(capsule),
+          onFatal: options.onFatal,
         })
       : createAgent(station, options.blueprint, capsule, agentOptions);
     registry.bindHost(agent);

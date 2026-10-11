@@ -13,6 +13,7 @@ import {
   AssistantEntry,
   createRegistry,
   defineDoc,
+  defineDocFamily,
   defineExtension,
   defineTool,
   GenerationTask,
@@ -82,21 +83,13 @@ type ThreadRecord = { conversationId: number; updatedAt: number };
 /** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
 type ThreadsState = { threads: { [key: string]: ThreadRecord } };
 /**
- * One submitted turn: who sent it, whether observers have handled it, and the budget that ended it, if any. A turn
- * whose observers did not finish before a crash is observed again on the next start.
+ * One submitted turn: who sent it and whether observers have handled it. A turn whose observers did not finish before a
+ * crash is observed again on the next start.
  */
-type TurnRecord = {
-  requestId: string;
-  senderId?: string;
-  observed: boolean;
-  failure?: { budget: string; message: string };
-};
-/**
- * `senderId` is the latest turn's, for tools. `turns` keeps every unobserved turn, and the latest observed turns that
- * ended over budget, so a redelivery can report the same failure.
- */
+type TurnRecord = { requestId: string; senderId?: string; observed: boolean };
+/** `senderId` is the latest turn's, for tools. `turns` keeps the turns observers have not finished. */
 type TurnState = { senderId?: string; turns?: TurnRecord[] };
-const RETAINED_FAILURES = 16;
+type TurnFailure = { budget: string; message: string };
 
 /** Zing thread IDs, which the runtime treats as opaque, mapped to durable conversations. */
 const ThreadsDoc = defineDoc<ThreadsState>({
@@ -126,9 +119,32 @@ const TurnDoc = defineDoc<TurnState>({
   initial: () => ({}),
 });
 
+/**
+ * The budget that ended a turn, keyed by failureKey(requestId). pi-durable answers a request ID for as long as it keeps
+ * the conversation, so the classification is kept as long, one small document per failed turn.
+ */
+const FailureDoc = defineDocFamily<TurnFailure, TurnFailure>({
+  kind: "zing.turn-failure",
+  version: 1,
+  family: true,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: (failure) => ({ ...failure }),
+});
+
+function failureKey(requestId: string): string {
+  return `r:${requestId}`;
+}
+
 export type CreateDurableAgentOptions = CreateAgentOptions & {
   /** One process owns a storage at a time; pi-durable has no cross-process locking. */
   storage: Storage;
+  /**
+   * Called once when storage fails in a way pi-durable cannot recover from in this process. The agent has already
+   * stopped taking work and is closing; reopening the storage, normally by restarting the station, resumes it.
+   */
+  onFatal?: (error: Error) => void;
 };
 
 type TurnBudget = {
@@ -184,6 +200,25 @@ export async function createDurableAgent(
   let harness: Harness | undefined;
   let closed = false;
   let closing: Promise<void> | undefined;
+  let fatal: Error | undefined;
+
+  /** A poisoned Session rejects every later commit; only reopening the storage recovers it. */
+  const checkFatal = (error: unknown): void => {
+    if (fatal || !isPoisoned(error)) return;
+    fatal = toError(error);
+    console.error("Durable storage failed; the agent stops until the station restarts", fatal);
+    void close();
+    options.onFatal?.(fatal);
+  };
+
+  /** Surface a poisoned Session after a failure whose own error is the storage's, not pi-durable's. */
+  const probe = async (): Promise<void> => {
+    try {
+      await harness?.commit(() => undefined, CONTEXT);
+    } catch (error) {
+      checkFatal(error);
+    }
+  };
 
   const ensureOpen = (): void => {
     if (closed) {
@@ -212,16 +247,18 @@ export async function createDurableAgent(
       return;
     }
     budget.failure = failure;
+    const { requestId } = budget;
     // Recorded before the abort, so the aborted submission is always known to have failed, even across a crash.
     const recorded =
-      budget.requestId === undefined
+      requestId === undefined
         ? Promise.resolve()
         : budget.conversation
             .commit(async (tx) => {
-              const turn = findTurn((await tx.doc(TurnDoc, budget.conversation.id)).turns, budget.requestId);
-              if (turn) turn.failure = { budget: failure.budget, message: failure.message };
+              const value = { budget: failure.budget, message: failure.message };
+              await tx.doc(FailureDoc, budget.conversation.id, failureKey(requestId), value);
             }, CONTEXT)
-            .catch((error: unknown) => {
+            .catch(async (error: unknown) => {
+              await probe();
               if (!closed) console.warn("durable turn failure was not recorded", error);
             });
     stop(budget, recorded);
@@ -332,7 +369,10 @@ export async function createDurableAgent(
       // Zing keeps its own context policy: older turns leave the request, never the transcript, and no extra model
       // call summarizes them.
       settings: { compaction: { enabled: false } },
-      onReport: (error) => console.warn("durable runtime report", error),
+      onReport: (error) => {
+        console.warn("durable runtime report", error);
+        void probe();
+      },
     },
     CONTEXT,
   );
@@ -435,8 +475,9 @@ export async function createDurableAgent(
           if (state.turns) pruneTurns(state.turns);
         }, CONTEXT),
       )
-      .catch((error: unknown) => {
+      .catch(async (error: unknown) => {
         // Left unobserved: the next start reports the turn again.
+        await probe();
         if (!closed) console.warn("durable turn observation was not recorded", error);
       });
     marking.add(marked);
@@ -467,7 +508,7 @@ export async function createDurableAgent(
         const budget = ownBudget(record.requestId);
         await budget?.aborting;
         const turn = findTurn((await open().snapshot(TurnDoc, id, CONTEXT))?.turns, record.requestId);
-        const failed = turn?.failure !== undefined || budget?.failure !== undefined;
+        const failed = budget?.failure !== undefined || (await recordedFailure(open(), id, record.requestId)) !== undefined;
         const status =
           record.status === "done" ? "completed" : record.reason === "aborted" && !failed ? "canceled" : "failed";
         const handled =
@@ -484,6 +525,7 @@ export async function createDurableAgent(
         await touch(threadId);
         if (turn) markObserved(id, turn.requestId, handled);
       } catch (error) {
+        await probe();
         if (!closed) console.warn(`recovered turn of ${threadId} could not be observed`, error);
       } finally {
         const remaining = (recovering.get(threadId) ?? 1) - 1;
@@ -567,8 +609,8 @@ export async function createDurableAgent(
         const original = input.requestId === undefined ? undefined : await requestRecord(open(), conversation.id, input.requestId);
         if (original && isSettled(original)) {
           controller.emit({ type: "turn/started", threadId, turnId });
-          const recorded = findTurn((await open().snapshot(TurnDoc, conversation.id, CONTEXT))?.turns, input.requestId);
-          if (original.status === "unanswered" && recorded?.failure) throw budgetError(recorded.failure);
+          const recorded = await recordedFailure(open(), conversation.id, input.requestId);
+          if (original.status === "unanswered" && recorded) throw budgetError(recorded);
           const result = await outcome(conversation, original);
           controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
           controller.resolve(result);
@@ -638,6 +680,7 @@ export async function createDurableAgent(
         controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
         controller.resolve(result);
       } catch (error) {
+        if (!(error instanceof TurnCanceledError || error instanceof TurnBudgetExceededError)) await probe();
         const shuttingDown = closed && !(error instanceof TurnCanceledError) && !turn?.failure && !turn?.canceled;
         const canceled =
           !shuttingDown &&
@@ -688,11 +731,16 @@ export async function createDurableAgent(
     ensureOpen();
     const normalized = normalizeThreadId(threadId);
     return enqueue(normalized, async () => {
-      const { conversation } = await ensureConversation(normalized);
-      await conversation.waitForIdle(CONTEXT);
-      await conversation.reset(undefined, CONTEXT);
-      await conversation.waitForIdle(CONTEXT);
-      await touch(normalized);
+      try {
+        const { conversation } = await ensureConversation(normalized);
+        await conversation.waitForIdle(CONTEXT);
+        await conversation.reset(undefined, CONTEXT);
+        await conversation.waitForIdle(CONTEXT);
+        await touch(normalized);
+      } catch (error) {
+        await probe();
+        throw error;
+      }
       observers.notify({ type: "reset", conversationId: normalized, capsule: capsuleRef });
     });
   };
@@ -709,7 +757,12 @@ export async function createDurableAgent(
       await Promise.all([...marking]);
       const current = harness;
       harness = undefined;
-      await current?.close(CONTEXT);
+      try {
+        await current?.close(CONTEXT);
+      } catch (error) {
+        // A poisoned Session may fail to close cleanly; its committed state is what the next start reads.
+        if (!fatal) throw error;
+      }
       await Promise.all([...pending.values()]);
       await observers.drain();
     })();
@@ -876,23 +929,24 @@ function findTurn<T extends TurnRecord>(turns: T[] | readonly T[] | undefined, r
   return requestId === undefined ? undefined : turns?.find((turn) => turn.requestId === requestId);
 }
 
-/** Drop observed turns that ended normally, and all but the latest retained failures. */
+/** Drop the turns observers have handled. */
 function pruneTurns(turns: TurnRecord[]): void {
-  let failures = 0;
   for (let index = turns.length - 1; index >= 0; index -= 1) {
-    const turn = turns[index];
-    if (!turn || !turn.observed) continue;
-    if (turn.failure && failures < RETAINED_FAILURES) {
-      failures += 1;
-      continue;
-    }
-    turns.splice(index, 1);
+    if (turns[index]?.observed) turns.splice(index, 1);
   }
+}
+
+async function recordedFailure(
+  harness: Harness,
+  id: ConversationId,
+  requestId: string | undefined,
+): Promise<TurnFailure | undefined> {
+  return requestId === undefined ? undefined : harness.snapshot(FailureDoc, id, failureKey(requestId), CONTEXT);
 }
 
 const BUDGETS = new Set<string>(["context", "model-turns", "timeout", "tool-calls"]);
 
-function budgetError(failure: { budget: string; message: string }): Error {
+function budgetError(failure: TurnFailure): Error {
   return BUDGETS.has(failure.budget)
     ? new TurnBudgetExceededError(failure.budget as TurnBudgetKind, failure.message)
     : new Error(failure.message);
@@ -953,6 +1007,13 @@ async function outcome(conversation: Conversation, record: SubmissionRecord): Pr
     throw new Error(`Turn was not answered: ${record.reason}`);
   }
   throw new Error(`Turn ended in unexpected state: ${record.status}`);
+}
+
+function isPoisoned(error: unknown): boolean {
+  for (let current = error; current instanceof Error; current = current.cause) {
+    if (current.message.startsWith("Session is poisoned")) return true;
+  }
+  return false;
 }
 
 function isSettled(record: SubmissionRecord): boolean {
