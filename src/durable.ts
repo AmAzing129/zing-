@@ -449,17 +449,25 @@ export async function createDurableAgent(
    */
   const observeRecovered = (threadId: string, id: ConversationId, submissionId: SubmissionId): void => {
     recovering.set(threadId, (recovering.get(threadId) ?? 0) + 1);
+    // Only the resumed run's own budget belongs to this submission; an earlier recovery must leave it running.
+    const ownBudget = (requestId: string | undefined): TurnBudget | undefined => {
+      const budget = budgets.get(id);
+      return budget && !active.has(threadId) && budget.requestId === requestId ? budget : undefined;
+    };
+    let requestId: string | undefined;
     void enqueue(threadId, async () => {
       try {
         const submission = await open().submission(submissionId, CONTEXT);
         if (!submission) return;
         const record = await submission.wait(CONTEXT);
+        requestId = record.requestId;
         const conversation = await findConversation(threadId);
         if (!conversation) return;
         const entries = await readTurnEntries(conversation, record);
-        await budgets.get(id)?.aborting;
+        const budget = ownBudget(record.requestId);
+        await budget?.aborting;
         const turn = findTurn((await open().snapshot(TurnDoc, id, CONTEXT))?.turns, record.requestId);
-        const failed = turn?.failure !== undefined || budgets.get(id)?.failure !== undefined;
+        const failed = turn?.failure !== undefined || budget?.failure !== undefined;
         const status =
           record.status === "done" ? "completed" : record.reason === "aborted" && !failed ? "canceled" : "failed";
         const handled =
@@ -481,8 +489,8 @@ export async function createDurableAgent(
         const remaining = (recovering.get(threadId) ?? 1) - 1;
         if (remaining > 0) recovering.set(threadId, remaining);
         else recovering.delete(threadId);
-        const budget = budgets.get(id);
-        if (budget && !active.has(threadId)) releaseBudget(id, budget);
+        const budget = ownBudget(requestId);
+        if (budget) releaseBudget(id, budget);
       }
     });
   };

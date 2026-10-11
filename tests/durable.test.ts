@@ -845,6 +845,82 @@ test("durable: a thread stays active until every queued recovery on it finishes"
   await crashed.close().catch(() => undefined);
 });
 
+test("durable: a resumed run keeps its limits while an earlier recovery on its thread finishes", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-recovered-budget-"));
+  const file = join(dir, "durable.sqlite");
+  // "Crashed" processes here stay open on the same file; a short busy timeout keeps their late writes from stalling.
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const observerStarted = deferred();
+  const release = deferred();
+  const toolStarted = deferred();
+  const hanging: Tool = { ...webSearch, execute: async (_input, { signal }) => (toolStarted.resolve(), waitForAbort(signal)) };
+  const first = createTestStation();
+  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    tools: [hanging],
+    observerTimeoutMs: 60_000,
+    listeners: [async () => { observerStarted.resolve(); await release.promise; }],
+  });
+  first.faux.setResponses([
+    fauxAssistantMessage("a"),
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "b" })], { stopReason: "toolUse" }),
+  ]);
+  await crashed.handleMessage({ conversationId: "chat:limits", text: "a" });
+  await observerStarted.promise;
+  void crashed.startTurn({ threadId: "chat:limits", text: "b", senderId: "bob" }).completed.catch(() => undefined);
+  await toolStarted.promise;
+
+  // After restart the resumed model call never answers; only the turn timeout can end it.
+  const second = createTestStation();
+  const observed: ConversationEvent[] = [];
+  const bothObserved = deferred();
+  second.faux.setResponses([
+    async (_context, options) => {
+      await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+      return fauxAssistantMessage("", { stopReason: "aborted" });
+    },
+  ]);
+  const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    tools: [webSearch],
+    limits: { turnTimeoutMs: 300 },
+    observerTimeoutMs: 60_000,
+    listeners: [async (event) => {
+      observed.push(event);
+      if (observed.length === 2) {
+        bothObserved.resolve();
+        await release.promise;
+      }
+    }],
+  });
+  await bothObserved.promise;
+  assert.deepEqual(
+    observed.map((event) => event.type === "turn" && [event.status, event.senderId]),
+    [["completed", undefined], ["failed", "bob"]],
+  );
+  assert.equal((await restarted.readThread("chat:limits")).status, "idle");
+
+  // That process dies too before its observer finishes; the timeout must have been recorded with the turn.
+  const third = createTestStation();
+  const later: ConversationEvent[] = [];
+  const again = await createDurableAgent(third.station, blueprintFor(third.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    tools: [webSearch],
+    listeners: [(event) => { later.push(event); }],
+  });
+  third.faux.setResponses([fauxAssistantMessage("c")]);
+  await again.handleMessage({ conversationId: "chat:limits", text: "c" });
+  await again.drainObservers();
+  assert.deepEqual(
+    later.map((event) => event.type === "turn" && [event.status, event.senderId]),
+    [["failed", "bob"], ["completed", undefined]],
+  );
+  await again.close();
+  release.resolve();
+  await crashed.close().catch(() => undefined);
+  await restarted.close().catch(() => undefined);
+});
+
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
   const events: ConversationEvent[] = [];
   const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });
