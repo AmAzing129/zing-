@@ -78,8 +78,10 @@ const SYSTEM_SECTION = "system";
 const EVENT_DRAIN_TIMEOUT_MS = 1_000;
 const ENTRY_PAGE_SIZE = 256;
 const BUDGET_FAILURE_PREFIX = "zing:budget:";
-/** How long a hook whose run already has its outcome waits for the abort before failing its task instead. */
-const ABORT_GRACE_MS = 1_000;
+/** How often a hook holding a run whose outcome is decided re-issues its abort, if an earlier attempt gave up. */
+const ABORT_RECHECK_MS = 1_000;
+/** Delays before retrying an abort whose commit failed. A poisoned Session stops the agent through probe() instead. */
+const ABORT_RETRY_DELAYS_MS = [50, 250, 1_000];
 
 type ThreadRecord = { conversationId: number; updatedAt: number };
 /** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
@@ -258,15 +260,27 @@ export async function createDurableAgent(
     return harness;
   };
 
-  const stop = (budget: TurnBudget, after: Promise<void> = Promise.resolve()): void => {
+  const stop = (budget: TurnBudget): void => {
     if (budget.aborting) return;
-    const aborting: Promise<void> = after
-      .then(() => budget.conversation.abort(CONTEXT))
-      .catch((error: unknown) => {
-        // A later stop() tries again; a hook holding the run meanwhile fails its task after ABORT_GRACE_MS.
-        if (budget.aborting === aborting) budget.aborting = undefined;
-        if (!closed) console.warn("durable conversation abort failed", error);
-      });
+    let aborting: Promise<void> | undefined;
+    aborting = (async () => {
+      for (const delay of [...ABORT_RETRY_DELAYS_MS, undefined]) {
+        try {
+          await budget.conversation.abort(CONTEXT);
+          return;
+        } catch (error) {
+          await probe();
+          // Closing suspends the run for the next start, and a poisoned Session stops the agent: neither needs a retry.
+          if (delay === undefined || fatal || !harness) {
+            if (harness && !fatal) console.warn("durable conversation abort failed", error);
+            // A later stop() may try again, as a hook holding the run does every ABORT_RECHECK_MS.
+            if (budget.aborting === aborting) budget.aborting = undefined;
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
+      }
+    })();
     budget.aborting = aborting;
   };
 
@@ -334,6 +348,18 @@ export async function createDurableAgent(
     return budgets.get(id) ?? createRecoveredBudget(conversation, recorded);
   };
 
+  /**
+   * Hold a hook whose run already has its outcome until the abort reaches it, so the run spends nothing more. A hook
+   * error would not end the run (pi-durable reports and skips it), so the hold re-issues the abort if an attempt gave
+   * up, until it lands or the agent closes.
+   */
+  const holdUntilAborted = async (budget: TurnBudget, signal: AbortSignal | undefined): Promise<void> => {
+    while (signal && !signal.aborted && harness && !fatal) {
+      stop(budget);
+      await waitForSignal(signal, ABORT_RECHECK_MS);
+    }
+  };
+
   const checkDeadline = async (budget: TurnBudget): Promise<void> => {
     const turn = findTurn((await open().snapshot(TurnDoc, budget.conversation.id, CONTEXT))?.turns, budget.requestId);
     if (turn?.deadlineAt !== undefined && turn.deadlineAt <= Date.now()) {
@@ -364,7 +390,7 @@ export async function createDurableAgent(
             const record = await requestRecord(open(), api.conversationId, budget.requestId);
             if (record && isSettled(record)) {
               stop(budget);
-              await awaitAbort(context.abortSignal);
+              await holdUntilAborted(budget, context.abortSignal);
               return { messages: fitted };
             }
           }
@@ -377,7 +403,7 @@ export async function createDurableAgent(
               ),
             );
             // Hold the request until the abort reaches this invocation, so the doomed request is never sent.
-            await awaitAbort(context.abortSignal);
+            await holdUntilAborted(budget, context.abortSignal);
           }
           return { messages: fitted };
         },
@@ -393,7 +419,7 @@ export async function createDurableAgent(
           if (!record) return;
           if (isSettled(record)) {
             stop(budget);
-            await awaitAbort(context.abortSignal);
+            await holdUntilAborted(budget, context.abortSignal);
             return;
           }
           const spent = spentBudget(await readTurnRecords(budget.conversation, record));
@@ -403,7 +429,7 @@ export async function createDurableAgent(
               budget,
               new TurnBudgetExceededError("model-turns", `Turn exceeded the ${limits.maxModelTurns} model-turn limit`),
             );
-            await awaitAbort(context.abortSignal);
+            await holdUntilAborted(budget, context.abortSignal);
           }
         },
       }),
@@ -1185,15 +1211,6 @@ async function waitAtMost(promise: Promise<void>, timeoutMs: number): Promise<vo
   } finally {
     if (timer) clearTimeout(timer);
   }
-}
-
-/**
- * Hold a hook whose run already has its outcome until the abort reaches it. If the abort does not arrive (its commit
- * failed), fail the task instead: the scheduler then ends the run, so it can neither spend more nor hold its thread.
- */
-async function awaitAbort(signal: AbortSignal | undefined): Promise<void> {
-  await waitForSignal(signal, ABORT_GRACE_MS);
-  if (!signal?.aborted) throw new Error("The turn already ended, but its abort did not arrive");
 }
 
 async function waitForSignal(signal: AbortSignal | undefined, timeoutMs: number): Promise<void> {

@@ -1483,16 +1483,17 @@ test("durable: cancelAll ends live, queued, and recovered turns so none resumes 
   assert.deepEqual(later, []);
 });
 
-test("durable: a run whose abort cannot be recorded still ends and frees its thread", { timeout: 10_000 }, async (t) => {
-  let rejectAbort = true;
+/** Storage that rejects abort marks, without effect, while `reject()` allows it. */
+function rejectingAborts(reject: () => boolean) {
+  let rejected = 0;
   const memory = new MemoryStorage();
   const storage = new Proxy(memory, {
     get(target, property) {
       const value: unknown = Reflect.get(target, property, target);
       if (property === "commit" && typeof value === "function") {
         return async (writes: StorageWrite[], ...rest: unknown[]) => {
-          if (rejectAbort && writes.some((write) => write.type === "task" && write.value.abortRequested)) {
-            rejectAbort = false;
+          if (writes.some((write) => write.type === "task" && write.value.abortRequested) && reject()) {
+            rejected += 1;
             throw new StorageRejected("abort mark rejected");
           }
           return value.call(target, writes, ...rest);
@@ -1501,6 +1502,12 @@ test("durable: a run whose abort cannot be recorded still ends and frees its thr
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+  return { storage, rejected: () => rejected };
+}
+
+test("durable: a run whose abort attempts give up is held until a later abort lands", { timeout: 10_000 }, async (t) => {
+  // The first attempt and all its retries are rejected; the hook holding the run must re-issue the abort.
+  const { storage, rejected } = rejectingAborts(() => rejected() < 4);
   const { agent, faux } = await createTestAgent({ storage, limits: { maxModelTurns: 1 } });
   t.after(() => agent.close());
   faux.setResponses([
@@ -1508,7 +1515,8 @@ test("durable: a run whose abort cannot be recorded still ends and frees its thr
     fauxAssistantMessage("next turn"),
   ]);
   await assert.rejects(agent.handleMessage({ conversationId: "chat:abort", text: "loop" }), /1 model-turn limit/);
-  assert.equal(rejectAbort, false, "the abort mark was rejected");
+  assert.equal(rejected(), 4, "every attempt of the first abort was rejected");
+  assert.equal(faux.state.callCount, 1, "the held run made no further model request");
   assert.equal((await agent.handleMessage({ conversationId: "chat:abort", text: "again" })).text, "next turn");
 });
 
@@ -1592,5 +1600,35 @@ test("durable: a run that outlives its caller still ends at its deadline and fre
   await assert.rejects(agent.handleMessage(request), /transient read failure/);
   await assert.rejects(agent.handleMessage(request), /300ms timeout/);
   assert.equal((await agent.handleMessage({ conversationId: "chat:outlived", text: "again" })).text, "next turn");
+});
+
+test("durable: a cancel whose abort commit is rejected once is retried", { timeout: 10_000 }, async (t) => {
+  let rejectNext = true;
+  const { storage, rejected } = rejectingAborts(() => {
+    const reject = rejectNext;
+    rejectNext = false;
+    return reject;
+  });
+  let started = deferred();
+  // Waits for its abort; no hook runs while it does, so only a retry can deliver the cancel.
+  const tool: Tool = { ...webSearch, execute: async (_input, { signal }) => (started.resolve(), waitForAbort(signal)) };
+  const { agent, faux } = await createTestAgent({ storage, tools: [tool] });
+  t.after(() => agent.close());
+  const call = () => fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "wait" })], { stopReason: "toolUse" });
+  faux.setResponses([call(), call()]);
+
+  const canceled = agent.startTurn({ threadId: "chat:retry", text: "one" });
+  await started.promise;
+  await agent.cancelTurn("chat:retry", canceled.turnId);
+  await assert.rejects(canceled.completed, /canceled/i);
+  assert.equal(rejected(), 1);
+
+  rejectNext = true;
+  started = deferred();
+  const stopped = agent.startTurn({ threadId: "chat:retry", text: "two" });
+  await started.promise;
+  await agent.cancelAll();
+  await assert.rejects(stopped.completed, /canceled/i);
+  assert.equal(rejected(), 2);
 });
 
