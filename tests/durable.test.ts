@@ -1100,6 +1100,37 @@ test("durable: a resumed turn keeps the model rounds it already spent", async ()
   await crashed.close().catch(() => undefined);
 });
 
+test("durable: a turn that timed out as it answered reports the same failure to its redelivery", async () => {
+  let slow = false;
+  const memory = new MemoryStorage();
+  const storage = new Proxy(memory, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (property === "commit" && typeof value === "function") {
+        return async (...args: unknown[]) => {
+          if (slow) await new Promise((resolve) => setTimeout(resolve, 200));
+          return value.apply(target, args);
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const { agent, faux } = await createTestAgent({ tools: [], storage, limits: { turnTimeoutMs: 150 } });
+  faux.setResponses([
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Storage slows down while the answer is committed, so the deadline passes before the turn finishes.
+      slow = true;
+      return fauxAssistantMessage("late answer");
+    },
+  ]);
+  const request = { conversationId: "chat:late", text: "hello", requestId: "update:late" };
+  await assert.rejects(agent.handleMessage(request), /150ms timeout/);
+  slow = false;
+  await assert.rejects(agent.handleMessage(request), /150ms timeout/);
+  await agent.close();
+});
+
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
   const events: ConversationEvent[] = [];
   const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });

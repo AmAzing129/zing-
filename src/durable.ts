@@ -518,7 +518,7 @@ export async function createDurableAgent(
         const turn = findTurn((await open().snapshot(TurnDoc, id, CONTEXT))?.turns, record.requestId);
         const failed = budget?.failure !== undefined || (await recordedFailure(open(), id, record.requestId)) !== undefined;
         const status =
-          record.status === "done" ? "completed" : record.reason === "aborted" && !failed ? "canceled" : "failed";
+          failed ? "failed" : record.status === "done" ? "completed" : record.reason === "aborted" ? "canceled" : "failed";
         const handled =
           entries.length === 0
             ? Promise.resolve()
@@ -621,7 +621,8 @@ export async function createDurableAgent(
         if (original && isSettled(original)) {
           controller.emit({ type: "turn/started", threadId, turnId });
           const recorded = await recordedFailure(open(), conversation.id, input.requestId);
-          if (original.status === "unanswered" && recorded) throw budgetError(recorded);
+          // A recorded failure decides the outcome even when the answer was committed first, as it did for the caller.
+          if (recorded) throw budgetError(recorded);
           const result = await outcome(conversation, original);
           controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
           controller.resolve(result);
@@ -677,6 +678,8 @@ export async function createDurableAgent(
         if (settled.has(target)) drained();
         let record = await submission.status(CONTEXT);
         if (!isSettled(record)) record = await submission.wait(CONTEXT);
+        // The run is over; a limit can no longer be exceeded by work that already settled.
+        if (current.deadline) clearTimeout(current.deadline);
         // However the settled record arrived, report the turn's events before its completion.
         await waitAtMost(caughtUp, EVENT_DRAIN_TIMEOUT_MS);
 
@@ -684,7 +687,11 @@ export async function createDurableAgent(
         await touch(threadId);
 
         if (current.canceled) throw new TurnCanceledError();
-        if (current.failure) throw current.failure;
+        if (current.failure) {
+          // Recorded before the caller hears of it, so a redelivery or restart reports the same outcome.
+          await current.aborting;
+          throw current.failure;
+        }
         const result = await outcome(conversation, record);
         notifyTurn("completed");
         controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
