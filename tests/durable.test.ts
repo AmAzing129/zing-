@@ -971,6 +971,42 @@ test("durable: a storage failure that poisons the session stops the agent and re
   assert.equal(fatal.length, 1);
 });
 
+test("durable: a reset does not drop a turn whose observer had not finished", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-reset-unobserved-"));
+  const file = join(dir, "durable.sqlite");
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const observerStarted = deferred();
+  const release = deferred();
+  const first = createTestStation();
+  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id, []), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    observerTimeoutMs: 60_000,
+    listeners: [async () => { observerStarted.resolve(); await release.promise; }],
+  });
+  first.faux.setResponses([fauxAssistantMessage("noted")]);
+  await crashed.handleMessage({ conversationId: "telegram:1", text: "I like tea", senderId: "alice" });
+  await observerStarted.promise;
+  await crashed.resetThread("telegram:1");
+
+  const second = createTestStation();
+  const observed: ConversationEvent[] = [];
+  const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id, []), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    listeners: [(event) => { observed.push(event); }],
+  });
+  second.faux.setResponses([fauxAssistantMessage("fresh")]);
+  await restarted.handleMessage({ conversationId: "telegram:1", text: "new topic", senderId: "alice" });
+  await restarted.drainObservers();
+  assert.deepEqual(
+    observed.map((event) => event.type === "turn" && event.entries.map((entry) => (entry.type === "user" ? entry.content : entry.type))),
+    [["I like tea", "assistant"], ["new topic", "assistant"]],
+  );
+  assert.deepEqual((await restarted.readThread("telegram:1")).entries.map((entry) => entry.type), ["user", "assistant"]);
+  await restarted.close();
+  release.resolve();
+  await crashed.close().catch(() => undefined);
+});
+
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
   const events: ConversationEvent[] = [];
   const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });
