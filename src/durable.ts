@@ -31,6 +31,7 @@ import {
   type EntryRecord,
   type Storage,
   type SubmissionId,
+  type Submission,
   type SubmissionRecord,
   type ToolRegistration,
   type Tx,
@@ -734,7 +735,7 @@ export async function createDurableAgent(
       let turn: ActiveTurn | undefined;
       let stream: Awaited<ReturnType<typeof watchEvents>> | undefined;
       let settledRecord: SubmissionRecord | undefined;
-      let submitted = false;
+      let submitted: Submission | undefined;
       // Every turn is submitted under a request ID, so a restart can find it to observe it.
       const requestId = input.requestId ?? `zing:${turnId}`;
       try {
@@ -804,7 +805,7 @@ export async function createDurableAgent(
         controller.emit({ type: "turn/started", threadId, turnId });
         if (cancelRequested || canceling) throw new TurnCanceledError();
         const submission = await conversation.submit({ type: "input", content: input.text, requestId }, CONTEXT);
-        submitted = true;
+        submitted = submission;
         target = submission.id;
         if (canceling) {
           current.canceled = true;
@@ -853,10 +854,27 @@ export async function createDurableAgent(
         controller.reject(failed);
       } finally {
         if (active.get(threadId)?.turnId === turnId) active.delete(threadId);
-        // A run that goes on after its caller stopped waiting (a failed read, say) keeps its budget and deadline.
-        if (turn && (settledRecord || !submitted)) releaseBudget(turn.conversation.id, turn);
-        // The next turn of this thread starts only once this one's stream and abort are done.
+        // The caller has its outcome; later events of the run are not this turn's to report.
         await stream?.stop().catch(() => undefined);
+        // A run its caller stopped waiting for (a failed read, say) goes on, keeping its budget and deadline. It is
+        // observed once it settles, before the next turn of this thread starts.
+        const detached = turn && submitted && !settledRecord ? { turn, submission: submitted } : undefined;
+        if (detached) {
+          const record = await persist("turn settlement", async () => {
+            const settled = await detached.submission.wait(CONTEXT);
+            await detached.turn.conversation.waitForIdle(CONTEXT);
+            return settled;
+          });
+          if (record) {
+            settledRecord = record;
+            await observeTurn(threadId, detached.turn.conversation, record).catch(async (error: unknown) => {
+              await probe();
+              if (!closed) console.warn(`turn of ${threadId} could not be observed`, error);
+            });
+          }
+        }
+        if (turn && (settledRecord || !submitted)) releaseBudget(turn.conversation.id, turn);
+        // The next turn of this thread starts only once this one's abort is done.
         await turn?.aborting;
       }
     });

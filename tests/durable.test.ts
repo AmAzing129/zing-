@@ -1523,12 +1523,13 @@ test("durable: a run whose abort keeps failing is held until a retry lands", { t
   assert.equal((await agent.handleMessage({ conversationId: "chat:abort", text: "again" })).text, "next turn");
 });
 
-test("durable: a run keeps its limits after this process lost its budget", async (t) => {
-  // The live turn reads its submission twice: status() and wait(). Failing the second read once ends the waiting call
-  // and releases the run's budget, while the run itself goes on.
+/**
+ * Storage whose second submission read fails once. A live turn reads its submission twice, in status() and wait(), so
+ * its waiting call fails while the run itself goes on.
+ */
+function failingWaitRead() {
   let reads = 0;
-  const memory = new MemoryStorage();
-  const storage = new Proxy(memory, {
+  return new Proxy(new MemoryStorage(), {
     get(target, property) {
       const value: unknown = Reflect.get(target, property, target);
       if (property === "submission" && typeof value === "function") {
@@ -1541,6 +1542,11 @@ test("durable: a run keeps its limits after this process lost its budget", async
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
+}
+
+test("durable: a run keeps its limits after this process lost its budget", async (t) => {
+  // The waiting call fails while the run itself goes on.
+  const storage = failingWaitRead();
   const started = deferred();
   const release = deferred();
   let executions = 0;
@@ -1573,22 +1579,8 @@ test("durable: a run keeps its limits after this process lost its budget", async
 });
 
 test("durable: a run that outlives its caller still ends at its deadline and frees its thread", { timeout: 10_000 }, async (t) => {
-  // As above, the waiting call's second read fails; then the run's next model request hangs until it is aborted.
-  let reads = 0;
-  const memory = new MemoryStorage();
-  const storage = new Proxy(memory, {
-    get(target, property) {
-      const value: unknown = Reflect.get(target, property, target);
-      if (property === "submission" && typeof value === "function") {
-        return async (...args: unknown[]) => {
-          reads += 1;
-          if (reads === 2) throw new Error("transient read failure");
-          return value.apply(target, args);
-        };
-      }
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
+  // The waiting call fails; then the run's next model request hangs until it is aborted.
+  const storage = failingWaitRead();
   const { agent, faux } = await createTestAgent({ storage, limits: { turnTimeoutMs: 300 } });
   t.after(() => agent.close());
   faux.setResponses([
@@ -1661,5 +1653,28 @@ test("durable: a limit whose settlement is rejected still stops the run before a
   assert.equal(rejected(), 1);
   assert.equal(executions, 1);
   assert.equal(faux.state.callCount, 1);
+});
+
+test("durable: a run that outlives its caller is observed once it settles", { timeout: 5_000 }, async (t) => {
+  const observed: ConversationEvent[] = [];
+  const seen = deferred();
+  const { agent, faux } = await createTestAgent({
+    storage: failingWaitRead(),
+    listeners: [(event) => { observed.push(event); seen.resolve(); }],
+  });
+  t.after(() => agent.close());
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("answered after the caller left"),
+  ]);
+  await assert.rejects(
+    agent.handleMessage({ conversationId: "chat:detached", text: "search", senderId: "alice" }),
+    /transient read failure/,
+  );
+  await seen.promise;
+  assert.deepEqual(
+    observed.map((event) => event.type === "turn" && [event.status, event.senderId, event.entries.map((entry) => entry.type)]),
+    [["completed", "alice", ["user", "assistant", "toolResult", "assistant"]]],
+  );
 });
 
