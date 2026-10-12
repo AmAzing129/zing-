@@ -260,9 +260,10 @@ export async function createDurableAgent(
   };
 
   /**
-   * Run a write that enforces a turn's outcome (its failure, its abort) until it commits. A run waiting in a model call
-   * or tool reaches no hook that could issue it again, and a hook's error does not stop its run. Gives up only once the
-   * Session is fatal or the agent is closing, which suspends the run for the next start.
+   * Run storage work a turn depends on (its failure, its abort, its observation) until it succeeds. A run waiting in a
+   * model call or tool reaches no hook that could issue it again, a hook's error does not stop its run, and a missed
+   * observation would wait for the next start. Gives up once the Session is fatal or the agent is closing: the next
+   * start resumes the run and replays its observation.
    */
   const persist = async <T>(what: string, write: () => Promise<T>): Promise<T | undefined> => {
     for (let attempt = 0; ; attempt += 1) {
@@ -270,7 +271,7 @@ export async function createDurableAgent(
         return await write();
       } catch (error) {
         await probe();
-        if (fatal || !harness) return undefined;
+        if (fatal || !harness || closing) return undefined;
         if (attempt === 0) console.warn(`durable ${what} failed; retrying`, error);
         const delay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
         await new Promise((resolve) => setTimeout(resolve, delay));
@@ -583,6 +584,22 @@ export async function createDurableAgent(
     void markObserved(conversation.id, turn.requestId, handled).finally(() => observing.delete(record.id));
   };
 
+  /**
+   * Observe a settled turn once its run has stopped: the same step for a live turn, a detached or recovered run, and a
+   * redelivery.
+   */
+  const observeSettled = async (threadId: string, id: ConversationId, record: SubmissionRecord): Promise<void> => {
+    await persist("turn observation", async () => {
+      const conversation = await open().conversation(id, CONTEXT);
+      if (!conversation) return;
+      // A run settled by a limit may still be stopping; the rest of its transcript arrives with its abort.
+      if ((await open().snapshot(LiveDoc, id, CONTEXT))?.run?.inputs.includes(record.id)) {
+        await conversation.waitForIdle(CONTEXT);
+      }
+      await observeTurn(threadId, conversation, record);
+    });
+  };
+
   /** Recovery uses the same per-thread ordering and settlement consumer as a newly admitted turn. */
   const observeRecovered = (threadId: string, id: ConversationId, submissionId: SubmissionId): void => {
     // Only the resumed run's own budget belongs to this submission; an earlier recovery must leave it running.
@@ -593,23 +610,18 @@ export async function createDurableAgent(
     let requestId: string | undefined;
     void enqueue(threadId, async () => {
       try {
-        const submission = await open().submission(submissionId, CONTEXT);
-        if (!submission) return;
-        const record = await submission.wait(CONTEXT);
+        const record = await persist("recovered turn", async () => {
+          const submission = await open().submission(submissionId, CONTEXT);
+          return submission === undefined ? null : await submission.wait(CONTEXT);
+        });
+        if (!record) return;
         requestId = record.requestId;
         // Settled: bookkeeping that follows must not be able to time out the finished run.
         const budget = ownBudget(record.requestId);
         if (budget) budget.settled = true;
         const deadline = budget?.deadline;
         if (deadline) clearTimeout(deadline);
-        const conversation = await findConversation(threadId);
-        if (!conversation) return;
-        const run = (await open().snapshot(LiveDoc, id, CONTEXT))?.run;
-        if (run?.inputs.includes(record.id)) await conversation.waitForIdle(CONTEXT);
-        await observeTurn(threadId, conversation, record);
-      } catch (error) {
-        await probe();
-        if (!closed) console.warn(`recovered turn of ${threadId} could not be observed`, error);
+        await observeSettled(threadId, id, record);
       } finally {
         const budget = ownBudget(requestId);
         if (budget) releaseBudget(id, budget);
@@ -752,7 +764,7 @@ export async function createDurableAgent(
         if (original && isSettled(original)) {
           controller.emit({ type: "turn/started", threadId, turnId });
           settledRecord = original;
-          await observeTurn(threadId, conversation, original);
+          await observeSettled(threadId, conversation.id, original);
           const result = await outcome(conversation, original);
           controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
           controller.resolve(result);
@@ -823,8 +835,7 @@ export async function createDurableAgent(
         // However the settled record arrived, report the turn's events before its completion.
         await waitAtMost(caughtUp, EVENT_DRAIN_TIMEOUT_MS);
 
-        await conversation.waitForIdle(CONTEXT);
-        await observeTurn(threadId, conversation, record);
+        await observeSettled(threadId, conversation.id, record);
         const result = await outcome(conversation, record);
         controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
         controller.resolve(result);
@@ -860,17 +871,10 @@ export async function createDurableAgent(
         // observed once it settles, before the next turn of this thread starts.
         const detached = turn && submitted && !settledRecord ? { turn, submission: submitted } : undefined;
         if (detached) {
-          const record = await persist("turn settlement", async () => {
-            const settled = await detached.submission.wait(CONTEXT);
-            await detached.turn.conversation.waitForIdle(CONTEXT);
-            return settled;
-          });
+          const record = await persist("turn settlement", () => detached.submission.wait(CONTEXT));
           if (record) {
             settledRecord = record;
-            await observeTurn(threadId, detached.turn.conversation, record).catch(async (error: unknown) => {
-              await probe();
-              if (!closed) console.warn(`turn of ${threadId} could not be observed`, error);
-            });
+            await observeSettled(threadId, detached.turn.conversation.id, record);
           }
         }
         if (turn && (settledRecord || !submitted)) releaseBudget(turn.conversation.id, turn);

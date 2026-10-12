@@ -1678,3 +1678,35 @@ test("durable: a run that outlives its caller is observed once it settles", { ti
   );
 });
 
+test("durable: a settled turn's observation is retried after a transient write failure", async (t) => {
+  // After the answer commits, the first commit of only document changes (the thread's touch) is rejected once.
+  let settled = false;
+  let rejected = 0;
+  const memory = new MemoryStorage();
+  const storage = new Proxy(memory, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (property === "commit" && typeof value === "function") {
+        return async (writes: StorageWrite[], ...rest: unknown[]) => {
+          if (settled && rejected === 0 && writes.length > 0 && writes.every((write) => write.type === "document.change")) {
+            rejected += 1;
+            throw new StorageRejected("commit rejected");
+          }
+          const result = await value.call(target, writes, ...rest);
+          if (writes.some((write) => write.type === "submission" && write.value.status === "done")) settled = true;
+          return result;
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const observed: ConversationEvent[] = [];
+  const { agent, faux } = await createTestAgent({ storage, tools: [], listeners: [(event) => { observed.push(event); }] });
+  t.after(() => agent.close());
+  faux.setResponses([fauxAssistantMessage("answer")]);
+  assert.equal((await agent.handleMessage({ conversationId: "chat:observe-retry", text: "hi", senderId: "alice" })).text, "answer");
+  await agent.drainObservers();
+  assert.equal(rejected, 1);
+  assert.deepEqual(observed.map((event) => event.type === "turn" && [event.status, event.senderId]), [["completed", "alice"]]);
+});
+
