@@ -150,6 +150,20 @@ test("durable: startTurn streams message and tool events", async () => {
   await agent.close();
 });
 
+test("durable: a fast turn still reports its events before it completes", async () => {
+  const { agent, faux } = await createTestAgent({ tools: [] });
+  for (let index = 0; index < 40; index += 1) {
+    faux.setResponses([fauxAssistantMessage(`answer ${index}`)]);
+    const events: string[] = [];
+    const turn = agent.startTurn({ threadId: "web:fast", text: `question ${index}` });
+    turn.subscribe((event) => events.push(event.type));
+    await turn.completed;
+    assert.equal(events.at(-1), "turn/completed");
+    assert.ok(events.includes("message/completed"), `turn ${index} reported ${events.join(", ")}`);
+  }
+  await agent.close();
+});
+
 test("durable: threads open, read, list, and reset", async () => {
   const { agent, faux } = await createTestAgent();
   assert.deepEqual(await agent.openThread("web:history"), { threadId: "web:history", created: true });

@@ -676,10 +676,9 @@ export async function createDurableAgent(
         target = submission.id;
         if (settled.has(target)) drained();
         let record = await submission.status(CONTEXT);
-        if (!isSettled(record)) {
-          record = await submission.wait(CONTEXT);
-          await waitAtMost(caughtUp, EVENT_DRAIN_TIMEOUT_MS);
-        }
+        if (!isSettled(record)) record = await submission.wait(CONTEXT);
+        // However the settled record arrived, report the turn's events before its completion.
+        await waitAtMost(caughtUp, EVENT_DRAIN_TIMEOUT_MS);
 
         entries = await readTurnEntries(conversation, record);
         await touch(threadId);
