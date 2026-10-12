@@ -19,6 +19,8 @@ import { runStdioAppServer } from "./protocol/index";
 import { defaultStationConfig, findStationConfig, loadStationConfig } from "./station-config";
 
 const SHUTDOWN_TIMEOUT_MS = 60_000;
+/** How long channels drain at a stop; the rest of the forced-exit limit records the cancellation of what is left. */
+const DRAIN_TIMEOUT_MS = SHUTDOWN_TIMEOUT_MS - 10_000;
 const DURABLE_STORAGE_FILE = "durable.sqlite";
 
 async function main(): Promise<void> {
@@ -50,6 +52,11 @@ async function main(): Promise<void> {
     forcedExitCode = exitCode;
     process.exitCode = exitCode;
     setTimeout(() => process.exit(exitCode), SHUTDOWN_TIMEOUT_MS).unref();
+    // Turns still running when the drain runs out are canceled, as the legacy runtime does at a stop. A durable one
+    // would otherwise resume after the restart for a caller that is gone, such as an acknowledged Telegram update.
+    setTimeout(() => {
+      void host?.agent.cancelAll().catch((error) => console.error("Canceling turns at shutdown failed", error));
+    }, DRAIN_TIMEOUT_MS).unref();
     // Let the transport cancel sessions or drain handlers before closing their runtime/storage.
     shutdown.abort();
   };

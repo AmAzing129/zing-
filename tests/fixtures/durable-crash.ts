@@ -54,7 +54,11 @@ const agent = await createDurableAgent(
   {
     storage,
     tools: [tool],
-    limits: { maxModelTurns: scenario === "failure" ? 1 : 10, turnTimeoutMs: scenario === "observation" ? 2_000 : 500 },
+    limits: {
+      maxModelTurns: scenario === "failure" ? 1 : 10,
+      // "resume" leaves a run that the next start resumes rather than one already past its deadline.
+      turnTimeoutMs: scenario === "observation" ? 2_000 : scenario === "resume" ? 60_000 : 500,
+    },
     listeners: scenario === "observation" ? [async () => new Promise<void>(() => {})] : [],
   },
 );

@@ -78,6 +78,8 @@ const SYSTEM_SECTION = "system";
 const EVENT_DRAIN_TIMEOUT_MS = 1_000;
 const ENTRY_PAGE_SIZE = 256;
 const BUDGET_FAILURE_PREFIX = "zing:budget:";
+/** How long a hook whose run already has its outcome waits for the abort before failing its task instead. */
+const ABORT_GRACE_MS = 1_000;
 
 type ThreadRecord = { conversationId: number; updatedAt: number };
 /** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
@@ -178,6 +180,8 @@ export async function createDurableAgent(
   let harness: Harness | undefined;
   let resumed = false;
   let closed = false;
+  /** cancelAll() ran: no turn may run any more, including one admitted while it was canceling. */
+  let canceling = false;
   let closing: Promise<void> | undefined;
   let fatal: Error | undefined;
 
@@ -255,11 +259,15 @@ export async function createDurableAgent(
   };
 
   const stop = (budget: TurnBudget, after: Promise<void> = Promise.resolve()): void => {
-    budget.aborting ??= after
+    if (budget.aborting) return;
+    const aborting: Promise<void> = after
       .then(() => budget.conversation.abort(CONTEXT))
       .catch((error: unknown) => {
+        // A later stop() tries again; a hook holding the run meanwhile fails its task after ABORT_GRACE_MS.
+        if (budget.aborting === aborting) budget.aborting = undefined;
         if (!closed) console.warn("durable conversation abort failed", error);
       });
+    budget.aborting = aborting;
   };
 
   const fail = async (budget: TurnBudget, failure: TurnBudgetExceededError): Promise<void> => {
@@ -304,6 +312,21 @@ export async function createDurableAgent(
     if (budgets.get(id) === budget) budgets.delete(id);
   };
 
+  /**
+   * The budget of the run a hook fires in. Limits never depend on this process's memory alone: if it has no budget for
+   * the run (for example after a storage read failed while its caller waited), the run's request, and with it its
+   * deadline and spend, come from durable state.
+   */
+  const budgetOf = async (id: ConversationId): Promise<TurnBudget | undefined> => {
+    const known = budgets.get(id);
+    if (known) return known;
+    const input = (await open().snapshot(LiveDoc, id, CONTEXT))?.run?.inputs[0];
+    const record = input === undefined ? undefined : await (await open().submission(input, CONTEXT))?.status(CONTEXT);
+    if (record?.requestId === undefined) return undefined;
+    const conversation = await open().conversation(id, CONTEXT);
+    return conversation && { requestId: record.requestId, canceled: false, conversation };
+  };
+
   const checkDeadline = async (budget: TurnBudget): Promise<void> => {
     const turn = findTurn((await open().snapshot(TurnDoc, budget.conversation.id, CONTEXT))?.turns, budget.requestId);
     if (turn?.deadlineAt !== undefined && turn.deadlineAt <= Date.now()) {
@@ -328,13 +351,13 @@ export async function createDurableAgent(
       hook(GenerationTask, {
         beforeRequest: async ({ messages }, api, context) => {
           const fitted = policy.fit([...messages]);
-          const budget = budgets.get(api.conversationId);
+          const budget = await budgetOf(api.conversationId);
           if (budget) {
             await checkDeadline(budget);
             const record = await requestRecord(open(), api.conversationId, budget.requestId);
             if (record && isSettled(record)) {
               stop(budget);
-              await waitForSignal(context.abortSignal);
+              await awaitAbort(context.abortSignal);
               return { messages: fitted };
             }
           }
@@ -347,7 +370,7 @@ export async function createDurableAgent(
               ),
             );
             // Hold the request until the abort reaches this invocation, so the doomed request is never sent.
-            await waitForSignal(context.abortSignal);
+            await awaitAbort(context.abortSignal);
           }
           return { messages: fitted };
         },
@@ -356,14 +379,14 @@ export async function createDurableAgent(
           if (message.stopReason === "error" || message.stopReason === "aborted") {
             return;
           }
-          const budget = budgets.get(api.conversationId);
+          const budget = await budgetOf(api.conversationId);
           if (!budget) return;
           await checkDeadline(budget);
           const record = await requestRecord(open(), api.conversationId, budget.requestId);
           if (!record) return;
           if (isSettled(record)) {
             stop(budget);
-            await waitForSignal(context.abortSignal);
+            await awaitAbort(context.abortSignal);
             return;
           }
           const spent = spentBudget(await readTurnRecords(budget.conversation, record));
@@ -373,13 +396,13 @@ export async function createDurableAgent(
               budget,
               new TurnBudgetExceededError("model-turns", `Turn exceeded the ${limits.maxModelTurns} model-turn limit`),
             );
-            await waitForSignal(context.abortSignal);
+            await awaitAbort(context.abortSignal);
           }
         },
       }),
       hook(ToolTask, {
         beforeTool: async (_call, api) => {
-          const budget = budgets.get(api.conversationId);
+          const budget = await budgetOf(api.conversationId);
           if (!budget) return undefined;
           await checkDeadline(budget);
           const record = await requestRecord(open(), api.conversationId, budget.requestId);
@@ -751,9 +774,13 @@ export async function createDurableAgent(
         });
 
         controller.emit({ type: "turn/started", threadId, turnId });
-        if (cancelRequested) throw new TurnCanceledError();
+        if (cancelRequested || canceling) throw new TurnCanceledError();
         const submission = await conversation.submit({ type: "input", content: input.text, requestId }, CONTEXT);
         target = submission.id;
+        if (canceling) {
+          current.canceled = true;
+          stop(current);
+        }
         if (settled.has(target)) drained();
         let record = await submission.status(CONTEXT);
         if (!isSettled(record)) record = await submission.wait(CONTEXT);
@@ -816,6 +843,30 @@ export async function createDurableAgent(
     stop(current);
   };
 
+  /**
+   * Stop taking turns and durably cancel every queued, running, and recovered one. A graceful stop whose drain ran out
+   * of time uses this, so nothing resumes after the restart for a caller that is gone.
+   */
+  const cancelAll = async (): Promise<void> => {
+    if (canceling || closing || !harness) return;
+    canceling = true;
+    closed = true;
+    const stopping: TurnBudget[] = [];
+    for (const record of (await guarded(() => open().inspect(CONTEXT))).submissions) {
+      if (record.type !== "input") continue;
+      let budget = budgets.get(record.conversationId);
+      if (!budget) {
+        const conversation = await open().conversation(record.conversationId, CONTEXT);
+        if (!conversation) continue;
+        budget = { requestId: record.requestId ?? "", canceled: false, conversation };
+      }
+      budget.canceled = true;
+      stop(budget);
+      stopping.push(budget);
+    }
+    await Promise.all(stopping.map((budget) => budget.aborting));
+  };
+
   const resetThread = (threadId: string): Promise<void> => {
     ensureOpen();
     const normalized = normalizeThreadId(threadId);
@@ -839,6 +890,7 @@ export async function createDurableAgent(
     modelId: model.id,
     agentId: resolved.identity.agentId,
     close,
+    cancelAll,
     async drainObservers() {
       await observers.drain();
     },
@@ -1125,15 +1177,27 @@ async function waitAtMost(promise: Promise<void>, timeoutMs: number): Promise<vo
   }
 }
 
-async function waitForSignal(signal: AbortSignal | undefined): Promise<void> {
+/**
+ * Hold a hook whose run already has its outcome until the abort reaches it. If the abort does not arrive (its commit
+ * failed), fail the task instead: the scheduler then ends the run, so it can neither spend more nor hold its thread.
+ */
+async function awaitAbort(signal: AbortSignal | undefined): Promise<void> {
+  await waitForSignal(signal, ABORT_GRACE_MS);
+  if (!signal?.aborted) throw new Error("The turn already ended, but its abort did not arrive");
+}
+
+async function waitForSignal(signal: AbortSignal | undefined, timeoutMs: number): Promise<void> {
   if (!signal || signal.aborted) return;
+  let timer: NodeJS.Timeout | undefined;
   let onAbort: (() => void) | undefined;
   try {
     await new Promise<void>((resolve) => {
       onAbort = () => resolve();
       signal.addEventListener("abort", onAbort, { once: true });
+      timer = setTimeout(resolve, timeoutMs);
     });
   } finally {
+    if (timer) clearTimeout(timer);
     if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }

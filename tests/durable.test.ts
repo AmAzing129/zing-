@@ -16,7 +16,7 @@ import {
   Type,
   type Context,
 } from "@earendil-works/pi-ai";
-import { MemoryStorage } from "@earendil-works/pi-durable";
+import { MemoryStorage, StorageRejected, type StorageWrite } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 
 import { createAgent } from "../src/agent";
@@ -1413,3 +1413,151 @@ test("durable: closing after a committed answer preserves the completed turn", a
     await (closing ?? agent.close());
   }
 });
+
+test("durable: cancelAll ends live, queued, and recovered turns so none resumes after a restart", { timeout: 15_000 }, async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "zing-cancel-all-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  // A killed process leaves chat:crash mid-tool; the next start resumes it.
+  const child = spawn(process.execPath, ["--import", "tsx", "tests/fixtures/durable-crash.ts", directory, "resume"]);
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  let stderr = "";
+  child.stderr.on("data", (data) => { stderr += String(data); });
+  assert.deepEqual(await once(child, "close"), [null, "SIGKILL"], stderr);
+
+  const file = join(directory, "durable.sqlite");
+  const toolStarted = deferred();
+  const hanging: Tool = {
+    name: "crash",
+    description: "Wait",
+    parameters: Type.Object({}),
+    execute: async (_input, { signal }) => (toolStarted.resolve(), waitForAbort(signal)),
+  };
+  const second = createTestStation();
+  const resumedCall = deferred();
+  second.faux.setResponses([
+    // The resumed run's next request, then the live turn's tool call: both wait until they are aborted.
+    async (_context, options) => {
+      resumedCall.resolve();
+      await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+      return fauxAssistantMessage("", { stopReason: "aborted" });
+    },
+    fauxAssistantMessage([fauxToolCall("crash", {})], { stopReason: "toolUse" }),
+  ]);
+  const observed: ConversationEvent[] = [];
+  const bothObserved = deferred();
+  const agent = await createDurableAgent(second.station, blueprintFor(second.model.id, [hanging]), undefined, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [hanging],
+    listeners: [(event) => { observed.push(event); if (observed.length === 2) bothObserved.resolve(); }],
+  });
+  t.after(() => agent.close());
+  await resumedCall.promise;
+  const live = agent.startTurn({ threadId: "chat:live", text: "wait", senderId: "bob" });
+  await toolStarted.promise;
+  const queued = agent.startTurn({ threadId: "chat:live", text: "after" });
+
+  await agent.cancelAll();
+  await assert.rejects(live.completed, /canceled/i);
+  await assert.rejects(queued.completed, /canceled/i);
+  assert.throws(() => agent.startTurn({ threadId: "chat:live", text: "new" }), /shutting down/);
+  await bothObserved.promise;
+  assert.deepEqual(
+    observed.map((event) => event.type === "turn" && [event.conversationId, event.status, event.senderId]).sort(),
+    [["chat:crash", "canceled", "alice"], ["chat:live", "canceled", "bob"]],
+  );
+  await agent.close();
+
+  const third = createTestStation();
+  const later: ConversationEvent[] = [];
+  const reopened = await createDurableAgent(third.station, blueprintFor(third.model.id, [hanging]), undefined, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [hanging],
+    listeners: [(event) => { later.push(event); }],
+  });
+  t.after(() => reopened.close());
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(third.faux.state.callCount, 0, "nothing resumes after the restart");
+  assert.equal((await reopened.readThread("chat:crash")).status, "idle");
+  assert.equal((await reopened.readThread("chat:live")).status, "idle");
+  await reopened.drainObservers();
+  assert.deepEqual(later, []);
+});
+
+test("durable: a run whose abort cannot be recorded still ends and frees its thread", { timeout: 10_000 }, async (t) => {
+  let rejectAbort = true;
+  const memory = new MemoryStorage();
+  const storage = new Proxy(memory, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (property === "commit" && typeof value === "function") {
+        return async (writes: StorageWrite[], ...rest: unknown[]) => {
+          if (rejectAbort && writes.some((write) => write.type === "task" && write.value.abortRequested)) {
+            rejectAbort = false;
+            throw new StorageRejected("abort mark rejected");
+          }
+          return value.call(target, writes, ...rest);
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const { agent, faux } = await createTestAgent({ storage, limits: { maxModelTurns: 1 } });
+  t.after(() => agent.close());
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "loop" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("next turn"),
+  ]);
+  await assert.rejects(agent.handleMessage({ conversationId: "chat:abort", text: "loop" }), /1 model-turn limit/);
+  assert.equal(rejectAbort, false, "the abort mark was rejected");
+  assert.equal((await agent.handleMessage({ conversationId: "chat:abort", text: "again" })).text, "next turn");
+});
+
+test("durable: a run keeps its limits after this process lost its budget", async (t) => {
+  // The live turn reads its submission twice: status() and wait(). Failing the second read once ends the waiting call
+  // and releases the run's budget, while the run itself goes on.
+  let reads = 0;
+  const memory = new MemoryStorage();
+  const storage = new Proxy(memory, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (property === "submission" && typeof value === "function") {
+        return async (...args: unknown[]) => {
+          reads += 1;
+          if (reads === 2) throw new Error("transient read failure");
+          return value.apply(target, args);
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const started = deferred();
+  const release = deferred();
+  let executions = 0;
+  const tool: Tool = {
+    ...webSearch,
+    execute: async () => {
+      executions += 1;
+      if (executions === 1) {
+        started.resolve();
+        await release.promise;
+      }
+      return { text: "results" };
+    },
+  };
+  const { agent, faux } = await createTestAgent({ storage, tools: [tool], limits: { maxToolCalls: 1 } });
+  t.after(() => agent.close());
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "two" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("should not be reached"),
+  ]);
+  const request = { conversationId: "chat:lost-budget", text: "search", requestId: "update:lost" };
+  await assert.rejects(agent.handleMessage(request), /transient read failure/);
+  await started.promise;
+  release.resolve();
+  // The redelivery waits for the run and reports its durable outcome.
+  await assert.rejects(agent.handleMessage(request), /1 tool-call limit/);
+  assert.equal(executions, 1, "the call over the limit is blocked");
+  assert.equal(faux.state.callCount, 2);
+});
+

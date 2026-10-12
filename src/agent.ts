@@ -66,6 +66,8 @@ export type Agent = ConversationHost &
     modelId: string;
     agentId: string;
     close: () => Promise<void>;
+    /** Stop taking turns and cancel every queued and running one; close() still releases the agent afterwards. */
+    cancelAll: () => Promise<void>;
     drainObservers: () => Promise<void>;
   };
 
@@ -253,13 +255,18 @@ export function createAgent(
     });
   };
 
+  const cancelAll = async (): Promise<void> => {
+    closed = true;
+    for (const current of active.values()) {
+      current.canceled = true;
+      current.conversation.abort();
+    }
+  };
+
   const close = (): Promise<void> => {
     closed = true;
     closing ??= (async () => {
-      for (const current of active.values()) {
-        current.canceled = true;
-        current.conversation.abort();
-      }
+      await cancelAll();
       await Promise.all([...pending.values()]);
       await observers.drain();
     })();
@@ -271,6 +278,7 @@ export function createAgent(
     modelId: model.id,
     agentId: resolved.identity.agentId,
     close,
+    cancelAll,
     async drainObservers() {
       await observers.drain();
     },
