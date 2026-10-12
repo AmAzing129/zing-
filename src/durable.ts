@@ -78,8 +78,8 @@ const SYSTEM_SECTION = "system";
 const EVENT_DRAIN_TIMEOUT_MS = 1_000;
 const ENTRY_PAGE_SIZE = 256;
 const BUDGET_FAILURE_PREFIX = "zing:budget:";
-/** Delays before retrying an abort whose commit failed; the last one repeats until the abort commits. */
-const ABORT_RETRY_DELAYS_MS = [50, 250, 1_000];
+/** Delays before retrying a write that enforces a turn's outcome; the last one repeats until the write commits. */
+const RETRY_DELAYS_MS = [50, 250, 1_000];
 
 type ThreadRecord = { conversationId: number; updatedAt: number };
 /** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
@@ -258,30 +258,33 @@ export async function createDurableAgent(
     return harness;
   };
 
-  const stop = (budget: TurnBudget): void => {
-    if (budget.aborting) return;
-    budget.aborting = (async () => {
-      // Retried until it commits: a run waiting in a model call or tool reaches no hook that could abort it again.
-      for (let attempt = 0; ; attempt += 1) {
-        try {
-          await budget.conversation.abort(CONTEXT);
-          return;
-        } catch (error) {
-          await probe();
-          // Closing suspends the run for the next start, and a poisoned Session stops the agent: neither needs a retry.
-          if (fatal || !harness) return;
-          if (attempt === 0) console.warn("durable conversation abort failed; retrying", error);
-          const delay = ABORT_RETRY_DELAYS_MS[Math.min(attempt, ABORT_RETRY_DELAYS_MS.length - 1)];
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        }
+  /**
+   * Run a write that enforces a turn's outcome (its failure, its abort) until it commits. A run waiting in a model call
+   * or tool reaches no hook that could issue it again, and a hook's error does not stop its run. Gives up only once the
+   * Session is fatal or the agent is closing, which suspends the run for the next start.
+   */
+  const persist = async <T>(what: string, write: () => Promise<T>): Promise<T | undefined> => {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await write();
+      } catch (error) {
+        await probe();
+        if (fatal || !harness) return undefined;
+        if (attempt === 0) console.warn(`durable ${what} failed; retrying`, error);
+        const delay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
-    })();
+    }
+  };
+
+  const stop = (budget: TurnBudget): void => {
+    budget.aborting ??= persist("conversation abort", () => budget.conversation.abort(CONTEXT));
   };
 
   const fail = async (budget: TurnBudget, failure: TurnBudgetExceededError): Promise<void> => {
     // The submission is the only outcome authority. In particular, a deadline waiting behind an answer commit
     // must not rewrite that answer. Abort cleanup may lag this commit; startup fences it before resuming tasks.
-    const failed = await guarded(() =>
+    const failed = await persist("turn failure", () =>
       budget.conversation.commit(async (tx) => {
         const record = await tx.submissionByRequest(budget.conversation.id, budget.requestId);
         if (!record || isSettled(record)) return false;

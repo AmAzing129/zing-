@@ -1483,8 +1483,12 @@ test("durable: cancelAll ends live, queued, and recovered turns so none resumes 
   assert.deepEqual(later, []);
 });
 
-/** Storage that rejects abort marks, without effect, while `reject()` allows it. */
-function rejectingAborts(reject: () => boolean) {
+const isAbortMark = (write: StorageWrite) => write.type === "task" && write.value.abortRequested === true;
+const isTurnFailure = (write: StorageWrite) =>
+  write.type === "submission" && write.value.status === "unanswered" && write.value.reason === "faulted";
+
+/** Storage that rejects commits with a `match`ing write, without effect, while `reject()` allows it. */
+function rejectingCommits(match: (write: StorageWrite) => boolean, reject: () => boolean) {
   let rejected = 0;
   const memory = new MemoryStorage();
   const storage = new Proxy(memory, {
@@ -1492,9 +1496,9 @@ function rejectingAborts(reject: () => boolean) {
       const value: unknown = Reflect.get(target, property, target);
       if (property === "commit" && typeof value === "function") {
         return async (writes: StorageWrite[], ...rest: unknown[]) => {
-          if (writes.some((write) => write.type === "task" && write.value.abortRequested) && reject()) {
+          if (writes.some(match) && reject()) {
             rejected += 1;
-            throw new StorageRejected("abort mark rejected");
+            throw new StorageRejected("commit rejected");
           }
           return value.call(target, writes, ...rest);
         };
@@ -1506,7 +1510,7 @@ function rejectingAborts(reject: () => boolean) {
 }
 
 test("durable: a run whose abort keeps failing is held until a retry lands", { timeout: 10_000 }, async (t) => {
-  const { storage, rejected } = rejectingAborts(() => rejected() < 4);
+  const { storage, rejected } = rejectingCommits(isAbortMark, () => rejected() < 4);
   const { agent, faux } = await createTestAgent({ storage, limits: { maxModelTurns: 1 } });
   t.after(() => agent.close());
   faux.setResponses([
@@ -1603,7 +1607,7 @@ test("durable: a run that outlives its caller still ends at its deadline and fre
 
 test("durable: a cancel is retried until its abort commits", { timeout: 10_000 }, async (t) => {
   let remaining = 1;
-  const { storage, rejected } = rejectingAborts(() => remaining-- > 0);
+  const { storage, rejected } = rejectingCommits(isAbortMark, () => remaining-- > 0);
   let started = deferred();
   // Waits for its abort; no hook runs while it does, so only a retry can deliver the cancel.
   const tool: Tool = { ...webSearch, execute: async (_input, { signal }) => (started.resolve(), waitForAbort(signal)) };
@@ -1626,5 +1630,36 @@ test("durable: a cancel is retried until its abort commits", { timeout: 10_000 }
   await agent.cancelAll();
   assert.equal(rejected(), 6);
   await assert.rejects(stopped.completed, /canceled/i);
+});
+
+test("durable: a timeout whose settlement is rejected is retried while its tool hangs", { timeout: 10_000 }, async (t) => {
+  let remaining = 2;
+  const { storage, rejected } = rejectingCommits(isTurnFailure, () => remaining-- > 0);
+  // Waits for its abort; no hook runs while it does, so only the deadline can end the turn.
+  const tool: Tool = { ...webSearch, execute: async (_input, { signal }) => waitForAbort(signal) };
+  const { agent, faux } = await createTestAgent({ storage, tools: [tool], limits: { turnTimeoutMs: 200 } });
+  t.after(() => agent.close());
+  faux.setResponses([fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "wait" })], { stopReason: "toolUse" })]);
+  await assert.rejects(agent.handleMessage({ conversationId: "chat:deadline-retry", text: "wait" }), /200ms timeout/);
+  assert.equal(rejected(), 2);
+});
+
+test("durable: a limit whose settlement is rejected still stops the run before another model call", async (t) => {
+  let remaining = 1;
+  const { storage, rejected } = rejectingCommits(isTurnFailure, () => remaining-- > 0);
+  let executions = 0;
+  const tool: Tool = { ...webSearch, execute: async () => ({ text: String(++executions) }) };
+  const { agent, faux } = await createTestAgent({ storage, tools: [tool], limits: { maxToolCalls: 1 } });
+  t.after(() => agent.close());
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "a" }), fauxToolCall(WEB_SEARCH, { query: "b" })], {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("should not be reached"),
+  ]);
+  await assert.rejects(agent.handleMessage({ conversationId: "chat:limit-retry", text: "twice" }), /1 tool-call limit/);
+  assert.equal(rejected(), 1);
+  assert.equal(executions, 1);
+  assert.equal(faux.state.callCount, 1);
 });
 
