@@ -13,12 +13,12 @@ import {
   AssistantEntry,
   createRegistry,
   defineDoc,
-  defineDocFamily,
   defineExtension,
   defineTool,
   GenerationTask,
   Harness,
   hook,
+  LiveDoc,
   section,
   SystemEntry,
   ToolResultEntry,
@@ -77,7 +77,7 @@ const SYSTEM_SECTION = "system";
 /** How long a finished turn waits for its event stream to catch up before reporting completion anyway. */
 const EVENT_DRAIN_TIMEOUT_MS = 1_000;
 const ENTRY_PAGE_SIZE = 256;
-const ABORT_GRACE_MS = 5_000;
+const BUDGET_FAILURE_PREFIX = "zing:budget:";
 
 type ThreadRecord = { conversationId: number; updatedAt: number };
 /** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
@@ -86,7 +86,7 @@ type ThreadsState = { threads: { [key: string]: ThreadRecord } };
  * One submitted turn: who sent it and whether observers have handled it. A turn whose observers did not finish before a
  * crash is observed again on the next start.
  */
-type TurnRecord = { requestId: string; senderId?: string; observed: boolean };
+type TurnRecord = { requestId: string; senderId?: string; observed: boolean; deadlineAt?: number; timeoutMs?: number };
 /** `senderId` is the latest turn's, for tools. `turns` keeps the turns observers have not finished. */
 type TurnState = { senderId?: string; turns?: TurnRecord[] };
 type TurnFailure = { budget: string; message: string };
@@ -119,24 +119,6 @@ const TurnDoc = defineDoc<TurnState>({
   initial: () => ({}),
 });
 
-/**
- * The budget that ended a turn, keyed by failureKey(requestId). pi-durable answers a request ID for as long as it keeps
- * the conversation, so the classification is kept as long, one small document per failed turn.
- */
-const FailureDoc = defineDocFamily<TurnFailure, TurnFailure>({
-  kind: "zing.turn-failure",
-  version: 1,
-  family: true,
-  scope: "conversation",
-  history: "latest",
-  fork: "initial",
-  initial: (failure) => ({ ...failure }),
-});
-
-function failureKey(requestId: string): string {
-  return `r:${requestId}`;
-}
-
 export type CreateDurableAgentOptions = CreateAgentOptions & {
   /** One process owns a storage at a time; pi-durable has no cross-process locking. */
   storage: Storage;
@@ -148,12 +130,10 @@ export type CreateDurableAgentOptions = CreateAgentOptions & {
 };
 
 type TurnBudget = {
-  /** The submission's request ID, under which its failure is recorded. */
-  requestId?: string;
-  modelTurns: number;
-  toolCalls: number;
-  failure?: TurnBudgetExceededError;
+  requestId: string;
   canceled: boolean;
+  /** A committed receipt reached this process; only completion bookkeeping remains. */
+  settled?: boolean;
   conversation: Conversation;
   aborting?: Promise<void>;
   deadline?: NodeJS.Timeout;
@@ -193,14 +173,45 @@ export async function createDurableAgent(
   const creating = new Map<string, Promise<Conversation>>();
   const pending = new Map<string, Promise<void>>();
   const active = new Map<string, ActiveTurn>();
-  /** Threads whose turn the previous process left unfinished or unobserved. */
-  const recovering = new Map<string, number>();
   const marking = new Set<Promise<void>>();
   const budgets = new Map<number, TurnBudget>();
   let harness: Harness | undefined;
+  let resumed = false;
   let closed = false;
   let closing: Promise<void> | undefined;
   let fatal: Error | undefined;
+
+  const close = (): Promise<void> => {
+    closed = true;
+    closing ??= (async () => {
+      for (const budget of budgets.values()) {
+        if (budget.deadline) clearTimeout(budget.deadline);
+      }
+      // Explicit cancellations must be durable before storage closes. Other unfinished runs remain resumable.
+      await Promise.all([...budgets.values()].map((budget) => budget.aborting));
+      // Finish receipts already delivered to this process before closing their storage, including when an event
+      // listener initiated close(). Do not wait on unfinished turns: harness.close suspends those for recovery.
+      await Promise.all(
+        [...pending].flatMap(([threadId, tail]) => {
+          const id = threads.get(threadId);
+          const budget = id === undefined ? undefined : budgets.get(id);
+          return !budget || budget.settled ? [tail] : [];
+        }),
+      );
+      await observers.drain();
+      await Promise.all([...marking]);
+      const current = harness;
+      harness = undefined;
+      try {
+        await current?.close(CONTEXT);
+      } catch (error) {
+        if (!fatal) throw error;
+      }
+      await Promise.all([...pending.values()]);
+      await observers.drain();
+    })();
+    return closing;
+  };
 
   /** A poisoned Session rejects every later commit; only reopening the storage recovers it. */
   const checkFatal = (error: unknown): void => {
@@ -251,66 +262,56 @@ export async function createDurableAgent(
       });
   };
 
-  const fail = (budget: TurnBudget, failure: TurnBudgetExceededError): void => {
-    if (budget.canceled || budget.failure) {
-      stop(budget);
-      return;
-    }
-    budget.failure = failure;
-    const { requestId } = budget;
-    // Recorded before the abort, so the aborted submission is always known to have failed, even across a crash.
-    const recorded =
-      requestId === undefined
-        ? Promise.resolve()
-        : budget.conversation
-            .commit(async (tx) => {
-              const value = { budget: failure.budget, message: failure.message };
-              await tx.doc(FailureDoc, budget.conversation.id, failureKey(requestId), value);
-            }, CONTEXT)
-            .catch(async (error: unknown) => {
-              await probe();
-              if (!closed) console.warn("durable turn failure was not recorded", error);
-            });
-    stop(budget, recorded);
+  const fail = async (budget: TurnBudget, failure: TurnBudgetExceededError): Promise<void> => {
+    // The submission is the only outcome authority. In particular, a deadline waiting behind an answer commit
+    // must not rewrite that answer. Abort cleanup may lag this commit; startup fences it before resuming tasks.
+    const failed = await guarded(() =>
+      budget.conversation.commit(async (tx) => {
+        const record = await tx.submissionByRequest(budget.conversation.id, budget.requestId);
+        if (!record || isSettled(record)) return false;
+        tx.settleSubmission(record.id, {
+          status: "unanswered",
+          reason: "faulted",
+          detail: `${BUDGET_FAILURE_PREFIX}${JSON.stringify({ budget: failure.budget, message: failure.message })}`,
+        });
+        return true;
+      }, CONTEXT),
+    );
+    if (failed && resumed) stop(budget);
   };
 
-  /**
-   * A resumed run continues from what it already spent. Only its wall-clock limit starts over: downtime spends no
-   * model or tool calls, and those counters are what bound its cost across restarts.
-   */
-  const createRecoveredBudget = (
-    conversation: Conversation,
-    requestId?: string,
-    spent = { modelTurns: 0, toolCalls: 0 },
-  ): TurnBudget => {
-    const recovered: TurnBudget = { requestId, ...spent, canceled: false, conversation };
-    recovered.deadline = setTimeout(() => {
-      fail(recovered, new TurnBudgetExceededError("timeout", `Turn exceeded the ${limits.turnTimeoutMs}ms timeout`));
-    }, limits.turnTimeoutMs);
+  /** Only the wake-up timer is process-local; its deadline and all spent work are durable. */
+  const createRecoveredBudget = (conversation: Conversation, turn: TurnRecord): TurnBudget => {
+    const recovered: TurnBudget = { requestId: turn.requestId, canceled: false, conversation };
+    const timeoutMs = turn.timeoutMs ?? limits.turnTimeoutMs;
+    recovered.deadline = setTimeout(
+      () => {
+        void fail(recovered, new TurnBudgetExceededError("timeout", `Turn exceeded the ${timeoutMs}ms timeout`)).catch(
+          (error) => {
+            if (!closed) console.warn("durable deadline failed", error);
+          },
+        );
+      },
+      Math.max(0, (turn.deadlineAt ?? Date.now() + timeoutMs) - Date.now()),
+    );
     recovered.deadline.unref();
     budgets.set(conversation.id, recovered);
     return recovered;
   };
 
-  /**
-   * The budget of the run a hook fires in. A run the previous process left unfinished has no zing turn; it gets fresh
-   * limits from the moment it resumes, so a recovered loop cannot run unbounded.
-   */
-  const budgetFor = async (id: ConversationId): Promise<TurnBudget | undefined> => {
-    const current = budgets.get(id);
-    if (current || closed) {
-      return current;
-    }
-    const conversation = await open().conversation(id, CONTEXT);
-    if (!conversation || budgets.has(id)) {
-      return budgets.get(id);
-    }
-    return createRecoveredBudget(conversation);
-  };
-
   const releaseBudget = (id: ConversationId, budget: TurnBudget): void => {
     if (budget.deadline) clearTimeout(budget.deadline);
     if (budgets.get(id) === budget) budgets.delete(id);
+  };
+
+  const checkDeadline = async (budget: TurnBudget): Promise<void> => {
+    const turn = findTurn((await open().snapshot(TurnDoc, budget.conversation.id, CONTEXT))?.turns, budget.requestId);
+    if (turn?.deadlineAt !== undefined && turn.deadlineAt <= Date.now()) {
+      await fail(
+        budget,
+        new TurnBudgetExceededError("timeout", `Turn exceeded the ${turn.timeoutMs ?? limits.turnTimeoutMs}ms timeout`),
+      );
+    }
   };
 
   const extension = defineExtension({
@@ -327,50 +328,76 @@ export async function createDurableAgent(
       hook(GenerationTask, {
         beforeRequest: async ({ messages }, api, context) => {
           const fitted = policy.fit([...messages]);
-          const budget = await budgetFor(api.conversationId);
+          const budget = budgets.get(api.conversationId);
+          if (budget) {
+            await checkDeadline(budget);
+            const record = await requestRecord(open(), api.conversationId, budget.requestId);
+            if (record && isSettled(record)) {
+              stop(budget);
+              await waitForSignal(context.abortSignal);
+              return { messages: fitted };
+            }
+          }
           if (budget && !policy.currentTurnFits(fitted)) {
-            fail(
+            await fail(
               budget,
-              new TurnBudgetExceededError("context", `Current turn exceeded its ${policy.messageBudget}-token context budget`),
+              new TurnBudgetExceededError(
+                "context",
+                `Current turn exceeded its ${policy.messageBudget}-token context budget`,
+              ),
             );
             // Hold the request until the abort reaches this invocation, so the doomed request is never sent.
-            await waitForSignal(context.abortSignal, ABORT_GRACE_MS);
+            await waitForSignal(context.abortSignal);
           }
           return { messages: fitted };
         },
-        afterResponse: async (message, api) => {
+        afterResponse: async (message, api, context) => {
           // Error and aborted responses end or retry the run; they do not count as model turns.
           if (message.stopReason === "error" || message.stopReason === "aborted") {
             return;
           }
-          const budget = await budgetFor(api.conversationId);
+          const budget = budgets.get(api.conversationId);
           if (!budget) return;
-          budget.modelTurns += 1;
+          await checkDeadline(budget);
+          const record = await requestRecord(open(), api.conversationId, budget.requestId);
+          if (!record) return;
+          if (isSettled(record)) {
+            stop(budget);
+            await waitForSignal(context.abortSignal);
+            return;
+          }
+          const spent = spentBudget(await readTurnRecords(budget.conversation, record));
           const continues = message.content.some((block) => block.type === "toolCall");
-          if (continues && budget.modelTurns >= limits.maxModelTurns) {
-            fail(
+          if (continues && spent.modelTurns + 1 >= limits.maxModelTurns) {
+            await fail(
               budget,
               new TurnBudgetExceededError("model-turns", `Turn exceeded the ${limits.maxModelTurns} model-turn limit`),
             );
+            await waitForSignal(context.abortSignal);
           }
         },
       }),
       hook(ToolTask, {
         beforeTool: async (_call, api) => {
-          const budget = await budgetFor(api.conversationId);
+          const budget = budgets.get(api.conversationId);
           if (!budget) return undefined;
-          if (budget.failure || budget.canceled) {
-            return { block: budget.failure?.message ?? "Turn canceled" };
-          }
-          if (budget.toolCalls >= limits.maxToolCalls) {
+          await checkDeadline(budget);
+          const record = await requestRecord(open(), api.conversationId, budget.requestId);
+          if (!record || isSettled(record) || budget.canceled) return { block: "Turn ended" };
+          const records = await readTurnRecords(budget.conversation, record);
+          const slots = (await api.snapshot(LiveDoc, api.conversationId, CONTEXT))?.tools ?? [];
+          // Task IDs distinguish repeated model call IDs across rounds. Count the current call's position,
+          // not the entire batch, so the allowed prefix can execute and only excess calls are blocked.
+          const ordinal =
+            spentBudget(records).toolCalls - slots.length + slots.findIndex((slot) => slot.taskId === api.taskId);
+          if (ordinal >= limits.maxToolCalls) {
             const failure = new TurnBudgetExceededError(
               "tool-calls",
               `Turn exceeded the ${limits.maxToolCalls} tool-call limit`,
             );
-            fail(budget, failure);
+            await fail(budget, failure);
             return { block: failure.message };
           }
-          budget.toolCalls += 1;
           return undefined;
         },
       }),
@@ -379,29 +406,6 @@ export async function createDurableAgent(
 
   const registry = createRegistry();
   registry.install(extension);
-  harness = await Harness.open(
-    options.storage,
-    {
-      models: createStationModels(station, model),
-      registry,
-      // Zing keeps its own context policy: older turns leave the request, never the transcript, and no extra model
-      // call summarizes them.
-      settings: { compaction: { enabled: false } },
-      onReport: (error) => {
-        console.warn("durable runtime report", error);
-        void probe();
-      },
-    },
-    CONTEXT,
-  );
-
-  const persisted = await harness.snapshot(ThreadsDoc, CONTEXT);
-  for (const [key, record] of Object.entries(persisted?.threads ?? {})) {
-    const threadId = threadIdOf(key);
-    if (threadId === undefined) continue;
-    threads.set(threadId, record.conversationId as ConversationId);
-    threadOf.set(record.conversationId, threadId);
-  }
 
   const baseline = (): Message => ({
     role: "system",
@@ -411,9 +415,13 @@ export async function createDurableAgent(
     timestamp: Date.now(),
   });
 
-  const createConversation = async (threadId: string, updatedAt = Date.now()): Promise<Conversation> => {
+  const createConversation = async (
+    threadId: string,
+    updatedAt = Date.now(),
+    history?: Awaited<ReturnType<Capsule["loadConversation"]>>,
+  ): Promise<Conversation> => {
     // A thread the file capsule kept before this runtime existed continues from its live history.
-    const imported = await resolved.loadConversation(threadId);
+    const imported = history ?? (await resolved.loadConversation(threadId));
     const conversation = await open().createConversation(
       {
         ownership: { kind: "ownerless" },
@@ -461,13 +469,6 @@ export async function createDurableAgent(
     }, CONTEXT);
   };
 
-  // Import every capsule thread now, so listing threads never depends on which ones were touched since.
-  for (const legacy of await resolved.listConversations()) {
-    if (!threads.has(legacy.conversationId)) {
-      await createConversation(legacy.conversationId, legacy.updatedAt);
-    }
-  }
-
   const enqueue = <T>(threadId: string, run: () => Promise<T>): Promise<T> => {
     const previous = pending.get(threadId) ?? Promise.resolve();
     const result = previous.then(run);
@@ -483,7 +484,7 @@ export async function createDurableAgent(
   };
 
   /** Record that observers handled a turn. */
-  const markObserved = (id: ConversationId, requestId: string, handled: Promise<void>): void => {
+  const markObserved = (id: ConversationId, requestId: string, handled: Promise<void>): Promise<void> => {
     const marked = handled
       .then(() =>
         open().commit(async (tx) => {
@@ -500,14 +501,39 @@ export async function createDurableAgent(
       });
     marking.add(marked);
     void marked.finally(() => marking.delete(marked));
+    return marked;
   };
 
-  /**
-   * Report a turn the previous process did not finish observing, once it settles: observers see it like any other
-   * turn, under the sender it ran for. Queued on its thread, so a new turn there starts after it.
-   */
+  const observing = new Set<SubmissionId>();
+  /** The same durable settlement consumer handles live turns, recovery, and request redelivery. */
+  const observeTurn = async (threadId: string, conversation: Conversation, record: SubmissionRecord): Promise<void> => {
+    const turn = findTurn((await open().snapshot(TurnDoc, conversation.id, CONTEXT))?.turns, record.requestId);
+    if (!turn || turn.observed || observing.has(record.id)) return;
+    const entries = await readTurnEntries(conversation, record);
+    await touch(threadId);
+    observing.add(record.id);
+    const status =
+      record.status === "done"
+        ? "completed"
+        : record.status === "unanswered" && record.reason === "aborted"
+          ? "canceled"
+          : "failed";
+    const handled =
+      entries.length === 0
+        ? Promise.resolve()
+        : observers.notify({
+            type: "turn",
+            conversationId: threadId,
+            senderId: turn.senderId,
+            capsule: capsuleRef,
+            status,
+            entries,
+          });
+    void markObserved(conversation.id, turn.requestId, handled).finally(() => observing.delete(record.id));
+  };
+
+  /** Recovery uses the same per-thread ordering and settlement consumer as a newly admitted turn. */
   const observeRecovered = (threadId: string, id: ConversationId, submissionId: SubmissionId): void => {
-    recovering.set(threadId, (recovering.get(threadId) ?? 0) + 1);
     // Only the resumed run's own budget belongs to this submission; an earlier recovery must leave it running.
     const ownBudget = (requestId: string | undefined): TurnBudget | undefined => {
       const budget = budgets.get(id);
@@ -521,70 +547,124 @@ export async function createDurableAgent(
         const record = await submission.wait(CONTEXT);
         requestId = record.requestId;
         // Settled: bookkeeping that follows must not be able to time out the finished run.
-        const deadline = ownBudget(record.requestId)?.deadline;
+        const budget = ownBudget(record.requestId);
+        if (budget) budget.settled = true;
+        const deadline = budget?.deadline;
         if (deadline) clearTimeout(deadline);
         const conversation = await findConversation(threadId);
         if (!conversation) return;
-        const entries = await readTurnEntries(conversation, record);
-        const budget = ownBudget(record.requestId);
-        await budget?.aborting;
-        const turn = findTurn((await open().snapshot(TurnDoc, id, CONTEXT))?.turns, record.requestId);
-        const failed = budget?.failure !== undefined || (await recordedFailure(open(), id, record.requestId)) !== undefined;
-        const status =
-          failed ? "failed" : record.status === "done" ? "completed" : record.reason === "aborted" ? "canceled" : "failed";
-        const handled =
-          entries.length === 0
-            ? Promise.resolve()
-            : observers.notify({
-                type: "turn",
-                conversationId: threadId,
-                senderId: turn?.senderId,
-                capsule: capsuleRef,
-                status,
-                entries,
-              });
-        await touch(threadId);
-        if (turn) markObserved(id, turn.requestId, handled);
+        const run = (await open().snapshot(LiveDoc, id, CONTEXT))?.run;
+        if (run?.inputs.includes(record.id)) await conversation.waitForIdle(CONTEXT);
+        await observeTurn(threadId, conversation, record);
       } catch (error) {
         await probe();
         if (!closed) console.warn(`recovered turn of ${threadId} could not be observed`, error);
       } finally {
-        const remaining = (recovering.get(threadId) ?? 1) - 1;
-        if (remaining > 0) recovering.set(threadId, remaining);
-        else recovering.delete(threadId);
         const budget = ownBudget(requestId);
         if (budget) releaseBudget(id, budget);
       }
     });
   };
 
-  const unsettled = new Map<number, SubmissionRecord[]>();
-  for (const record of (await harness.inspect(CONTEXT)).submissions) {
-    if (record.type === "input") {
-      unsettled.set(record.conversationId, [...(unsettled.get(record.conversationId) ?? []), record]);
+  // No operation that enables scheduling may run until every conversation has been checked.
+  try {
+    harness = await Harness.open(
+      options.storage,
+      {
+        models: createStationModels(station, model),
+        registry,
+        // Zing fits model context itself; keep the original transcript and make no summarization calls.
+        settings: { compaction: { enabled: false } },
+        onReport: (error) => {
+          console.warn("durable runtime report", error);
+          void probe();
+        },
+      },
+      CONTEXT,
+    );
+    const persisted = await harness.snapshot(ThreadsDoc, CONTEXT);
+    for (const [key, record] of Object.entries(persisted?.threads ?? {})) {
+      const threadId = threadIdOf(key);
+      if (threadId === undefined) continue;
+      threads.set(threadId, record.conversationId as ConversationId);
+      threadOf.set(record.conversationId, threadId);
     }
+    for (const legacy of await resolved.listConversations()) {
+      if (threads.has(legacy.conversationId)) continue;
+      let history: Awaited<ReturnType<Capsule["loadConversation"]>>;
+      try {
+        history = await resolved.loadConversation(legacy.conversationId);
+      } catch (error) {
+        // Leave this thread unavailable, rather than silently replacing its history with an empty one.
+        console.warn(`Legacy thread ${legacy.conversationId} could not be imported`, error);
+        continue;
+      }
+      await createConversation(legacy.conversationId, legacy.updatedAt, history);
+    }
+    const unsettled = new Map<number, SubmissionRecord[]>();
+    for (const record of (await harness.inspect(CONTEXT)).submissions) {
+      if (record.type === "input") {
+        unsettled.set(record.conversationId, [...(unsettled.get(record.conversationId) ?? []), record]);
+      }
+    }
+    const recoveries: Array<{ threadId: string; id: ConversationId; submissionId: SubmissionId }> = [];
+    for (const [threadId, id] of threads) {
+      const live = unsettled.get(id) ?? [];
+      const recovered = new Set(live.map((record) => record.id));
+      const turns = (await harness.snapshot(TurnDoc, id, CONTEXT))?.turns ?? [];
+      for (const turn of turns) {
+        if (turn.observed) continue;
+        // Settled before the crash, but its observers never finished; or never admitted at all.
+        const record = await requestRecord(harness, id, turn.requestId);
+        if (record) recovered.add(record.id);
+        else markObserved(id, turn.requestId, Promise.resolve());
+      }
+      const conversation = await harness.conversation(id, CONTEXT);
+      const resumed = live[0];
+      if (conversation && resumed?.requestId) {
+        const turn = findTurn(turns, resumed.requestId) ?? { requestId: resumed.requestId, observed: false };
+        const budget = createRecoveredBudget(conversation, turn);
+        if (turn.deadlineAt !== undefined && turn.deadlineAt <= Date.now()) {
+          await fail(
+            budget,
+            new TurnBudgetExceededError(
+              "timeout",
+              `Turn exceeded the ${turn.timeoutMs ?? limits.turnTimeoutMs}ms timeout`,
+            ),
+          );
+        }
+      }
+      // A process may have died after settlement but before abort cleanup. Fence that generation (and its owned
+      // tools) before resume; never let a terminal submission spend more model or tool budget on restart.
+      const run = (await harness.snapshot(LiveDoc, id, CONTEXT))?.run;
+      if (run) {
+        const records = await Promise.all(
+          run.inputs.map(async (input) => (await harness!.submission(input, CONTEXT))?.status(CONTEXT)),
+        );
+        if (records.every((record) => record !== undefined && isSettled(record))) {
+          await harness.abortTask(run.taskId, CONTEXT);
+        }
+      }
+      for (const submissionId of [...recovered].sort((left, right) => left - right)) {
+        recoveries.push({ threadId, id, submissionId });
+      }
+    }
+    resumed = true;
+    for (const { threadId, id, submissionId } of recoveries) observeRecovered(threadId, id, submissionId);
+    harness.resume();
+  } catch (error) {
+    closed = true;
+    for (const budget of budgets.values()) {
+      if (budget.deadline) clearTimeout(budget.deadline);
+    }
+    try {
+      if (harness) await harness.close(CONTEXT);
+      else await options.storage.close(CONTEXT);
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Durable agent initialization and cleanup failed");
+    }
+    throw error;
   }
-  for (const [threadId, id] of threads) {
-    const live = unsettled.get(id) ?? [];
-    const recovered = new Set(live.map((record) => record.id));
-    for (const turn of (await harness.snapshot(TurnDoc, id, CONTEXT))?.turns ?? []) {
-      if (turn.observed) continue;
-      // Settled before the crash, but its observers never finished; or never admitted at all.
-      const record = await requestRecord(harness, id, turn.requestId);
-      if (record) recovered.add(record.id);
-      else markObserved(id, turn.requestId, Promise.resolve());
-    }
-    const conversation = live.length > 0 ? await harness.conversation(id, CONTEXT) : undefined;
-    // A conversation runs one input at a time; its resumed run gets fresh limits from now.
-    const resumed = live[0];
-    if (conversation && resumed) {
-      createRecoveredBudget(conversation, resumed.requestId, spentBudget(await readTurnRecords(conversation, resumed)));
-    }
-    for (const submissionId of [...recovered].sort((left, right) => left - right)) {
-      observeRecovered(threadId, id, submissionId);
-    }
-  }
-  harness.resume();
 
   const startTurn = (input: TurnInput): TurnHandle => {
     ensureOpen();
@@ -603,25 +683,9 @@ export async function createDurableAgent(
     void enqueue(threadId, async () => {
       let turn: ActiveTurn | undefined;
       let stream: Awaited<ReturnType<typeof watchEvents>> | undefined;
-      let entries: ThreadEntry[] = [];
       let settledRecord: SubmissionRecord | undefined;
       // Every turn is submitted under a request ID, so a restart can find it to observe it.
       const requestId = input.requestId ?? `zing:${turnId}`;
-      let prepared: Conversation | undefined;
-      const notifyTurn = (status: "completed" | "failed" | "canceled"): void => {
-        const handled =
-          entries.length === 0
-            ? Promise.resolve()
-            : observers.notify({
-                type: "turn",
-                conversationId: threadId,
-                senderId: input.senderId,
-                capsule: capsuleRef,
-                status,
-                entries,
-              });
-        if (prepared) markObserved(prepared.id, requestId, handled);
-      };
       try {
         if (closed || cancelRequested) throw new TurnCanceledError();
         const { conversation } = await ensureConversation(threadId);
@@ -631,38 +695,41 @@ export async function createDurableAgent(
 
         // A repeated request ID is answered from the original turn, which observers have already seen: in its own
         // process, or, if that one died first, through the recovery queued ahead of this turn.
-        const original = input.requestId === undefined ? undefined : await requestRecord(open(), conversation.id, input.requestId);
+        const original =
+          input.requestId === undefined ? undefined : await requestRecord(open(), conversation.id, input.requestId);
         if (original && isSettled(original)) {
           controller.emit({ type: "turn/started", threadId, turnId });
-          const recorded = await recordedFailure(open(), conversation.id, input.requestId);
-          // A recorded failure decides the outcome even when the answer was committed first, as it did for the caller.
-          if (recorded) throw budgetError(recorded);
+          settledRecord = original;
+          await observeTurn(threadId, conversation, original);
           const result = await outcome(conversation, original);
           controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
           controller.resolve(result);
           return;
         }
 
-        const view = await conversation.context(CONTEXT);
-        if (!policy.userInputFits(input.text, view.messages.some((message) => message.role !== "system"))) {
+        const history = await conversation.entries({ order: "descending" }, 1, undefined, CONTEXT);
+        if (
+          !policy.userInputFits(
+            input.text,
+            history.items.some((entry) => entry.model?.some((message) => message.role !== "system")),
+          )
+        ) {
           throw new TurnBudgetExceededError(
             "context",
             `User input exceeded its ${policy.messageBudget}-token context budget`,
           );
         }
-        await prepareConversation(conversation, modelRef, input.senderId, requestId);
-        prepared = conversation;
-
-        turn = { turnId, threadId, requestId, conversation, modelTurns: 0, toolCalls: 0, canceled: false };
+        const metadata: TurnRecord = {
+          requestId,
+          ...(input.senderId === undefined ? {} : { senderId: input.senderId }),
+          observed: false,
+          deadlineAt: Date.now() + limits.turnTimeoutMs,
+          timeoutMs: limits.turnTimeoutMs,
+        };
+        await prepareConversation(conversation, modelRef, metadata);
+        turn = Object.assign(createRecoveredBudget(conversation, metadata), { turnId, threadId });
         const current = turn;
-        const recovered = budgets.get(conversation.id);
-        if (recovered) releaseBudget(conversation.id, recovered);
-        budgets.set(conversation.id, current);
         active.set(threadId, current);
-        current.deadline = setTimeout(() => {
-          fail(current, new TurnBudgetExceededError("timeout", `Turn exceeded the ${limits.turnTimeoutMs}ms timeout`));
-        }, limits.turnTimeoutMs);
-        current.deadline.unref();
 
         const settled = new Map<number, SubmissionRecord>();
         let target: number | undefined;
@@ -677,6 +744,7 @@ export async function createDurableAgent(
             translate(event);
             if (event.type === "submission" && isSettled(event.record)) {
               settled.set(event.record.id, event.record);
+              if (event.record.requestId === requestId) current.settled = true;
             }
           }
           if (target !== undefined && settled.has(target)) drained();
@@ -684,10 +752,7 @@ export async function createDurableAgent(
 
         controller.emit({ type: "turn/started", threadId, turnId });
         if (cancelRequested) throw new TurnCanceledError();
-        const submission = await conversation.submit(
-          { type: "input", content: input.text, requestId },
-          CONTEXT,
-        );
+        const submission = await conversation.submit({ type: "input", content: input.text, requestId }, CONTEXT);
         target = submission.id;
         if (settled.has(target)) drained();
         let record = await submission.status(CONTEXT);
@@ -695,43 +760,33 @@ export async function createDurableAgent(
         // The durable record now decides the outcome, as it will for a redelivery or a restart: limits and
         // cancellation can no longer change work that already settled.
         settledRecord = record;
+        current.settled = true;
         if (current.deadline) clearTimeout(current.deadline);
         if (active.get(threadId)?.turnId === turnId) active.delete(threadId);
         // However the settled record arrived, report the turn's events before its completion.
         await waitAtMost(caughtUp, EVENT_DRAIN_TIMEOUT_MS);
 
-        entries = await readTurnEntries(conversation, record);
-        await touch(threadId);
-
-        if (current.failure) {
-          // Recorded before the caller hears of it, so a redelivery or restart reports the same outcome.
-          await current.aborting;
-          throw current.failure;
-        }
+        await conversation.waitForIdle(CONTEXT);
+        await observeTurn(threadId, conversation, record);
         const result = await outcome(conversation, record);
-        notifyTurn("completed");
         controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
         controller.resolve(result);
       } catch (error) {
         if (!(error instanceof TurnCanceledError || error instanceof TurnBudgetExceededError)) await probe();
-        const shuttingDown = closed && !(error instanceof TurnCanceledError) && !turn?.failure && !turn?.canceled;
+        const shuttingDown = closed && !settledRecord && !(error instanceof TurnCanceledError) && !turn?.canceled;
         const canceled = settledRecord
           ? error instanceof TurnCanceledError
           : !shuttingDown &&
-          !(error instanceof TurnBudgetExceededError) &&
-          !turn?.failure &&
-          (turn?.canceled === true || error instanceof TurnCanceledError);
+            !(error instanceof TurnBudgetExceededError) &&
+            (turn?.canceled === true || error instanceof TurnCanceledError);
         if (canceled) {
-          notifyTurn("canceled");
           controller.emit({ type: "turn/completed", threadId, turnId, status: "canceled" });
           controller.reject(error instanceof TurnCanceledError ? error : new TurnCanceledError());
           return;
         }
         const failed = shuttingDown
           ? new RuntimeError("RUNTIME_CLOSED", "Agent shut down; the turn resumes when the station restarts")
-          : (turn?.failure ?? toError(error));
-        // A turn cut off by shutdown is observed when the next start finishes it.
-        if (!shuttingDown) notifyTurn("failed");
+          : toError(error);
         controller.emit({
           type: "turn/completed",
           threadId,
@@ -779,30 +834,6 @@ export async function createDurableAgent(
     });
   };
 
-  const close = (): Promise<void> => {
-    closed = true;
-    closing ??= (async () => {
-      // Runs stay pending in storage; the next Harness.open resumes them. Only the waiting turn handles end here.
-      for (const budget of budgets.values()) {
-        if (budget.deadline) clearTimeout(budget.deadline);
-      }
-      // Record finished observations while storage is still open.
-      await observers.drain();
-      await Promise.all([...marking]);
-      const current = harness;
-      harness = undefined;
-      try {
-        await current?.close(CONTEXT);
-      } catch (error) {
-        // A poisoned Session may fail to close cleanly; its committed state is what the next start reads.
-        if (!fatal) throw error;
-      }
-      await Promise.all([...pending.values()]);
-      await observers.drain();
-    })();
-    return closing;
-  };
-
   return {
     name: blueprint.name,
     modelId: model.id,
@@ -833,9 +864,10 @@ export async function createDurableAgent(
         throw new RuntimeError("THREAD_NOT_FOUND", `Thread not found: ${normalized}`);
       }
       const view = await guarded(() => conversation.context(CONTEXT));
+      const live = await guarded(() => open().snapshot(LiveDoc, conversation.id, CONTEXT));
       return {
         threadId: normalized,
-        status: active.has(normalized) || recovering.has(normalized) ? "active" : "idle",
+        status: live?.run ? "active" : "idle",
         entries: toThreadEntries(view.entries),
       };
     },
@@ -870,6 +902,8 @@ export function createDurableTool(tool: Tool, scope: ToolScope): ToolRegistratio
     name: tool.name,
     description: tool.description,
     parameters: tool.parameters,
+    // Zing's context policy bounds model input; don't silently truncate the durable transcript a second time.
+    outputLimits: { maxBytes: Number.MAX_SAFE_INTEGER, maxLines: Number.MAX_SAFE_INTEGER },
     execute: async (input, api, context) => {
       const signal = context.abortSignal ?? new AbortController().signal;
       const work = (async () =>
@@ -882,8 +916,8 @@ export function createDurableTool(tool: Tool, scope: ToolScope): ToolRegistratio
       const result = await raceWithAbort(work, signal, `${tool.name} aborted`);
       return {
         content: [{ type: "text", text: result.text }],
-        // pi-ai and Chord describe the same JSON; they differ only in readonly arrays.
-        details: (result.details ?? null) as JsonValue,
+        // Match JSONL serialization: omit undefined properties and apply toJSON (for example Date).
+        details: JSON.parse(JSON.stringify(result.details ?? null)) as JsonValue,
       };
     },
   });
@@ -898,8 +932,7 @@ function createStationModels(station: Station, model: Model<Api>): Models {
     return apiKey === undefined ? options : ({ ...options, apiKey } as O);
   };
   const overrides: Partial<Models> = {
-    getModel: (provider, id) =>
-      provider === model.provider && id === model.id ? model : base.getModel(provider, id),
+    getModel: (provider, id) => (provider === model.provider && id === model.id ? model : base.getModel(provider, id)),
     stream: (target, context, options) => base.stream(target, context, withKey(target, options)),
     complete: (target, context, options) => base.complete(target, context, withKey(target, options)),
     streamSimple: (target, context, options) => base.streamSimple(target, context, withKey(target, options)),
@@ -922,9 +955,9 @@ function createStationModels(station: Station, model: Model<Api>): Models {
 async function prepareConversation(
   conversation: Conversation,
   model: { provider: string; modelId: string },
-  senderId: string | undefined,
-  requestId: string,
+  metadata: TurnRecord,
 ): Promise<void> {
+  const { senderId, requestId } = metadata;
   const agent = await conversation.agent(CONTEXT);
   await conversation.commit(async (tx) => {
     const turn = await tx.doc(TurnDoc, conversation.id);
@@ -936,7 +969,7 @@ async function prepareConversation(
     turn.turns ??= [];
     const index = turn.turns.findIndex((record) => record.requestId === requestId);
     if (index >= 0) turn.turns.splice(index, 1);
-    turn.turns.push({ requestId, ...(senderId === undefined ? {} : { senderId }), observed: false });
+    turn.turns.push(metadata);
     pruneTurns(turn.turns);
   }, CONTEXT);
   // The blueprint decides the model; conversations created under another one follow it.
@@ -959,7 +992,10 @@ async function importMessages(tx: Tx, id: ConversationId, messages: readonly Mes
   }
 }
 
-function findTurn<T extends TurnRecord>(turns: T[] | readonly T[] | undefined, requestId: string | undefined): T | undefined {
+function findTurn<T extends TurnRecord>(
+  turns: T[] | readonly T[] | undefined,
+  requestId: string | undefined,
+): T | undefined {
   return requestId === undefined ? undefined : turns?.find((turn) => turn.requestId === requestId);
 }
 
@@ -968,14 +1004,6 @@ function pruneTurns(turns: TurnRecord[]): void {
   for (let index = turns.length - 1; index >= 0; index -= 1) {
     if (turns[index]?.observed) turns.splice(index, 1);
   }
-}
-
-async function recordedFailure(
-  harness: Harness,
-  id: ConversationId,
-  requestId: string | undefined,
-): Promise<TurnFailure | undefined> {
-  return requestId === undefined ? undefined : harness.snapshot(FailureDoc, id, failureKey(requestId), CONTEXT);
 }
 
 const BUDGETS = new Set<string>(["context", "model-turns", "timeout", "tool-calls"]);
@@ -1057,6 +1085,13 @@ async function outcome(conversation: Conversation, record: SubmissionRecord): Pr
   }
   if (record.status === "unanswered") {
     if (record.reason === "aborted") throw new TurnCanceledError();
+    if (
+      record.reason === "faulted" &&
+      typeof record.detail === "string" &&
+      record.detail.startsWith(BUDGET_FAILURE_PREFIX)
+    ) {
+      throw budgetError(JSON.parse(record.detail.slice(BUDGET_FAILURE_PREFIX.length)) as TurnFailure);
+    }
     if (record.reason === "model_error") {
       throw new Error(typeof record.detail === "string" && record.detail ? record.detail : "model error");
     }
@@ -1090,18 +1125,15 @@ async function waitAtMost(promise: Promise<void>, timeoutMs: number): Promise<vo
   }
 }
 
-async function waitForSignal(signal: AbortSignal | undefined, timeoutMs: number): Promise<void> {
+async function waitForSignal(signal: AbortSignal | undefined): Promise<void> {
   if (!signal || signal.aborted) return;
-  let timer: NodeJS.Timeout | undefined;
   let onAbort: (() => void) | undefined;
   try {
     await new Promise<void>((resolve) => {
       onAbort = () => resolve();
       signal.addEventListener("abort", onAbort, { once: true });
-      timer = setTimeout(resolve, timeoutMs);
     });
   } finally {
-    if (timer) clearTimeout(timer);
     if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }

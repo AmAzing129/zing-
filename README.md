@@ -92,10 +92,16 @@ By default the capsule keeps each thread as a JSONL transcript, written when a t
 
 - Every user message, model response, and tool result is committed to `durable.sqlite` in the capsule before it is shown.
 - A restarted station resumes the turns it left unfinished. An interrupted tool call is not run again; the model receives an `interrupted` result and continues.
-- A redelivered message with the same request ID (Telegram uses the update ID) is answered once, from the original turn.
+- A redelivered message with the same request ID returns the original turn's outcome without running it again. Telegram keys requests by bot, chat, and message ID, not the reusable update ID.
 - Threads, turns, events, limits, plugins, and the App Server protocol behave as before. Existing JSONL threads are imported, from their last reset, the first time the durable runtime opens the capsule; the JSONL files stay untouched, so switching back to `legacy` does not see later turns.
 
-A graceful stop leaves channel turns (such as Telegram's) pending instead of canceling them; they resume on the next start. App Server turns are the exception: protocol v1 cancels a connection's turns when its transport closes, including at station shutdown. A resumed turn keeps the model rounds and tool calls it had already used; only its timeout starts over. pi-durable is marked experimental upstream, so Zing pins its exact version.
+A graceful station stop first stops intake and drains the channel. Telegram finishes in-flight replies; App Server protocol v1 cancels its connection's turns and waits for cancellation before the runtime closes. The existing 60-second forced-exit limit still applies. Directly closing the runtime leaves unfinished, uncanceled turns pending for restart.
+
+A resumed turn keeps its spent model/tool budget and its persisted deadline: downtime counts toward the timeout. A budget failure is stored in the submission itself, and startup cancels any leftover execution before resuming tasks. The first committed terminal outcome wins; a timeout queued behind an admitted answer commit cannot retroactively turn that answer into a failure. Observers use one settlement path for live turns, recovery, and redelivery, with durable per-turn acknowledgments rather than a global settlement watermark (pi-durable 1.1.0 does not expose a settlement-ordered replay log).
+
+Turn deduplication is not exactly-once reply delivery. Telegram can acknowledge an update before its handler finishes during shutdown; a crash or forced exit can still lose that reply. There is no durable reply outbox yet, and a crash after sending but before acknowledging can cause a repeated reply. Existing `update:*` request IDs from earlier preview revisions are not migrated to the new Telegram keys.
+
+An unreadable JSONL thread is reported and left unavailable without blocking other threads; its history is never replaced with an empty conversation. Import runs once per thread: switching back to legacy, adding messages, and switching to durable again does not merge those later JSONL messages. pi-durable is experimental upstream, so Zing pins its exact version.
 
 ## Deployment environments
 

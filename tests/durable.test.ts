@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -859,30 +861,16 @@ test("durable: a thread stays active until every queued recovery on it finishes"
   await crashed.close().catch(() => undefined);
 });
 
-test("durable: a resumed run keeps its limits while an earlier recovery on its thread finishes", async () => {
+test("durable: a resumed run keeps its limits while an earlier recovery on its thread finishes", { timeout: 15_000 }, async (t) => {
   const dir = await mkdtemp(join(tmpdir(), "zing-durable-recovered-budget-"));
   const file = join(dir, "durable.sqlite");
-  // "Crashed" processes here stay open on the same file; a short busy timeout keeps their late writes from stalling.
   const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
-  const observerStarted = deferred();
   const release = deferred();
-  const toolStarted = deferred();
-  const hanging: Tool = { ...webSearch, execute: async (_input, { signal }) => (toolStarted.resolve(), waitForAbort(signal)) };
-  const first = createTestStation();
-  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id), capsule, {
-    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
-    tools: [hanging],
-    observerTimeoutMs: 60_000,
-    listeners: [async () => { observerStarted.resolve(); await release.promise; }],
-  });
-  first.faux.setResponses([
-    fauxAssistantMessage("a"),
-    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "b" })], { stopReason: "toolUse" }),
-  ]);
-  await crashed.handleMessage({ conversationId: "chat:limits", text: "a" });
-  await observerStarted.promise;
-  void crashed.startTurn({ threadId: "chat:limits", text: "b", senderId: "bob" }).completed.catch(() => undefined);
-  await toolStarted.promise;
+  const child = spawn(process.execPath, ["--import", "tsx", "tests/fixtures/durable-crash.ts", dir, "observation"]);
+  t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+  let stderr = "";
+  child.stderr.on("data", (data) => { stderr += String(data); });
+  assert.deepEqual(await once(child, "close"), [null, "SIGKILL"], stderr);
 
   // After restart the resumed model call never answers; only the turn timeout can end it.
   const second = createTestStation();
@@ -907,12 +895,14 @@ test("durable: a resumed run keeps its limits while an earlier recovery on its t
       }
     }],
   });
+  t.after(async () => { release.resolve(); await restarted.close(); });
   await bothObserved.promise;
   assert.deepEqual(
     observed.map((event) => event.type === "turn" && [event.status, event.senderId]),
-    [["completed", undefined], ["failed", "bob"]],
+    [["completed", undefined], ["failed", "alice"]],
   );
-  assert.equal((await restarted.readThread("chat:limits")).status, "idle");
+  assert.equal(second.faux.state.callCount, 1, "the run resumes, but still ends at its original deadline");
+  assert.equal((await restarted.readThread("chat:crash")).status, "idle");
 
   // That process dies too before its observer finishes; the timeout must have been recorded with the turn.
   const third = createTestStation();
@@ -923,15 +913,14 @@ test("durable: a resumed run keeps its limits while an earlier recovery on its t
     listeners: [(event) => { later.push(event); }],
   });
   third.faux.setResponses([fauxAssistantMessage("c")]);
-  await again.handleMessage({ conversationId: "chat:limits", text: "c" });
+  await again.handleMessage({ conversationId: "chat:crash", text: "c" });
   await again.drainObservers();
   assert.deepEqual(
     later.map((event) => event.type === "turn" && [event.status, event.senderId]),
-    [["failed", "bob"], ["completed", undefined]],
+    [["failed", "alice"], ["completed", undefined]],
   );
   await again.close();
   release.resolve();
-  await crashed.close().catch(() => undefined);
   await restarted.close().catch(() => undefined);
 });
 
@@ -1034,7 +1023,7 @@ test("durable: a resumed turn keeps the model rounds and tool calls it already s
     limits: { maxToolCalls: 1 },
   });
   first.faux.setResponses([fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" })]);
-  void crashed.startTurn({ threadId: "chat:spent", text: "loop", senderId: "alice" }).completed.catch(() => undefined);
+  void crashed.startTurn({ threadId: "chat:spent", text: "loop", senderId: "alice", requestId: "spent:1" }).completed.catch(() => undefined);
   await toolStarted.promise;
 
   // The restarted station allows one tool call per turn; this turn already made it before the crash.
@@ -1058,7 +1047,8 @@ test("durable: a resumed turn keeps the model rounds and tool calls it already s
   assert.equal(second.faux.state.callCount, 1);
   assert.deepEqual(events.map((event) => event.type === "turn" && [event.status, event.senderId]), [["failed", "alice"]]);
   const blocked = (await restarted.readThread("chat:spent")).entries.at(-1);
-  assert.match(blocked?.type === "toolResult" ? contentText(blocked.content, "") : "", /1 tool-call limit/);
+  assert.equal(blocked?.type === "toolResult" && blocked.isError, true);
+  await assert.rejects(restarted.handleMessage({ conversationId: "chat:spent", text: "loop", requestId: "spent:1" }), /1 tool-call limit/);
   await restarted.close();
   await crashed.close().catch(() => undefined);
 });
@@ -1100,7 +1090,7 @@ test("durable: a resumed turn keeps the model rounds it already spent", async ()
   await crashed.close().catch(() => undefined);
 });
 
-test("durable: a turn that timed out as it answered reports the same failure to its redelivery", async () => {
+test("durable: an admitted answer commit wins over a queued timeout, including on redelivery", async () => {
   let slow = false;
   const memory = new MemoryStorage();
   const storage = new Proxy(memory, {
@@ -1125,9 +1115,10 @@ test("durable: a turn that timed out as it answered reports the same failure to 
     },
   ]);
   const request = { conversationId: "chat:late", text: "hello", requestId: "update:late" };
-  await assert.rejects(agent.handleMessage(request), /150ms timeout/);
+  assert.equal((await agent.handleMessage(request)).text, "late answer");
   slow = false;
-  await assert.rejects(agent.handleMessage(request), /150ms timeout/);
+  assert.equal((await agent.handleMessage(request)).text, "late answer");
+  assert.equal(faux.state.callCount, 1);
   await agent.close();
 });
 
@@ -1325,4 +1316,100 @@ test("durable: close ends waiting turns, cancels queued ones, and rejects new wo
   await assert.rejects(queued.completed, /canceled/i);
   await closing;
   assert.throws(() => agent.startTurn({ threadId: "chat:close", text: "three" }), /shutting down/);
+});
+
+test("durable: killed processes cannot resume a failed or expired turn", { timeout: 15_000 }, async (t) => {
+  for (const scenario of ["failure", "deadline"]) {
+    await t.test(scenario, async (t) => {
+      const directory = await mkdtemp(join(tmpdir(), "zing-crash-boundary-"));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const child = spawn(process.execPath, ["--import", "tsx", "tests/fixtures/durable-crash.ts", directory, scenario]);
+      t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); });
+      let stderr = "";
+      child.stderr.on("data", (data) => { stderr += String(data); });
+      assert.deepEqual(await once(child, "close"), [null, "SIGKILL"], stderr);
+      if (scenario === "deadline") await new Promise((resolve) => setTimeout(resolve, 550));
+
+      const { station, faux, model } = createTestStation();
+      const events: ConversationEvent[] = [];
+      let executions = 0;
+      const tool: Tool = { name: "crash", description: "Crash", parameters: Type.Object({}),
+        execute: async () => ({ text: String(++executions) }) };
+      faux.setResponses([fauxAssistantMessage("fresh turn")]);
+      const agent = await createDurableAgent(station, blueprintFor(model.id, [tool]), undefined, {
+        storage: await openNodeSqliteStorage(join(directory, "durable.sqlite")), tools: [tool],
+        listeners: [(event) => { events.push(event); }],
+      });
+      t.after(() => agent.close());
+      await assert.rejects(agent.handleMessage({ conversationId: "chat:crash", text: "crash", requestId: "crash:1" }),
+        scenario === "failure" ? /1 model-turn limit/ : /500ms timeout/);
+      assert.equal(faux.state.callCount, 0, "recovery must not make another model request");
+      assert.equal(executions, 0, "recovery must not execute a tool");
+      assert.equal((await agent.readThread("chat:crash")).status, "idle");
+      await agent.drainObservers();
+      assert.deepEqual(events.map((event) => event.type === "turn" && [event.status, event.senderId]), [["failed", "alice"]]);
+      assert.equal((await agent.handleMessage({ conversationId: "chat:crash", text: "new turn" })).text, "fresh turn");
+      assert.equal(faux.state.callCount, 1, "the next turn still works");
+    });
+  }
+});
+
+test("durable: tool output keeps JSONL-compatible details and is not silently truncated", async (t) => {
+  const text = "line of tool output\n".repeat(3_000);
+  const details = { absent: undefined, date: new Date("2026-01-02T03:04:05Z"), values: [undefined, "kept"] };
+  const tool: Tool = { ...webSearch, execute: async () => ({ text, details: details as unknown as NonNullable<Awaited<ReturnType<Tool["execute"]>>["details"]> }) };
+  const { agent, faux } = await createTestAgent({ tools: [tool] });
+  t.after(() => agent.close());
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "data" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("received"),
+  ]);
+  assert.equal((await agent.handleMessage({ conversationId: "chat:details", text: "data" })).text, "received");
+  const result = (await agent.readThread("chat:details")).entries.find((entry) => entry.type === "toolResult");
+  assert.equal(result?.isError, false);
+  assert.deepEqual(result?.content, [{ type: "text", text }]);
+  assert.deepEqual(result?.details, { date: "2026-01-02T03:04:05.000Z", values: [null, "kept"] });
+});
+
+test("durable: an unreadable legacy thread does not prevent healthy threads from starting", async (t) => {
+  const capsule = createMemoryCapsule();
+  await capsule.ensureConversation("chat:broken");
+  await capsule.ensureConversation("chat:healthy");
+  const load = capsule.loadConversation;
+  capsule.loadConversation = async (id) => {
+    if (id === "chat:broken") throw new Error("Unsupported transcript version");
+    return load(id);
+  };
+  const { agent, faux } = await createTestAgent({ capsule });
+  t.after(() => agent.close());
+  assert.deepEqual((await agent.listThreads()).data.map((thread) => thread.threadId), ["chat:healthy"]);
+  await assert.rejects(agent.openThread("chat:broken"), /Unsupported transcript version/);
+  faux.setResponses([fauxAssistantMessage("healthy")]);
+  assert.equal((await agent.handleMessage({ conversationId: "chat:healthy", text: "hello" })).text, "healthy");
+});
+
+test("durable: initialization failure after opening the harness releases storage", async () => {
+  const capsule = createMemoryCapsule();
+  capsule.listConversations = async () => { throw new Error("capsule unavailable"); };
+  const storage = new MemoryStorage();
+  let closed = false;
+  const close = storage.close.bind(storage);
+  storage.close = async (context) => { await close(context); closed = true; };
+  await assert.rejects(createTestAgent({ capsule, storage }), /capsule unavailable/);
+  assert.equal(closed, true);
+});
+
+test("durable: closing after a committed answer preserves the completed turn", async () => {
+  const { agent, faux } = await createTestAgent({ tools: [] });
+  faux.setResponses([fauxAssistantMessage("committed answer")]);
+  let closing: Promise<void> | undefined;
+  const turn = agent.startTurn({ threadId: "chat:close-after-answer", text: "hello" });
+  turn.subscribe((event) => {
+    if (event.type === "message/completed") closing = agent.close();
+  });
+  try {
+    assert.equal((await turn.completed).text, "committed answer");
+  } finally {
+    await (closing ?? agent.close());
+  }
 });
