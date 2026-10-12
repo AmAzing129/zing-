@@ -1155,6 +1155,72 @@ test("durable: a storage failure while opening a thread also stops the agent", a
   await agent.close();
 });
 
+test("durable: a cancel that arrives after the answer is committed does not change the outcome", async () => {
+  const { agent, faux } = await createTestAgent({ tools: [] });
+  faux.setResponses([fauxAssistantMessage("committed answer")]);
+  const request = { threadId: "web:late-cancel", text: "hello", requestId: "update:late-cancel" };
+  const turn = agent.startTurn(request);
+  turn.subscribe((event) => {
+    // message/completed arrives with the commit that settles the submission.
+    if (event.type === "message/completed") void agent.cancelTurn(request.threadId, turn.turnId).catch(() => undefined);
+  });
+  assert.equal((await turn.completed).text, "committed answer");
+  assert.equal((await agent.handleMessage({ conversationId: request.threadId, text: "hello", requestId: request.requestId })).text, "committed answer");
+  await agent.close();
+});
+
+test("durable: a recovered run that settled in time is not failed by slow bookkeeping", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-recovered-deadline-"));
+  const file = join(dir, "durable.sqlite");
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const toolStarted = deferred();
+  const hanging: Tool = { ...webSearch, execute: async (_input, { signal }) => (toolStarted.resolve(), waitForAbort(signal)) };
+  const first = createTestStation();
+  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    tools: [hanging],
+  });
+  first.faux.setResponses([fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "x" })], { stopReason: "toolUse" })]);
+  const request = { conversationId: "chat:bookkeeping", text: "look", requestId: "update:slow" };
+  void crashed.handleMessage(request).catch(() => undefined);
+  await toolStarted.promise;
+
+  // After the resumed submission settles, every later commit is slow enough to cross the restarted deadline.
+  const sqlite = await openNodeSqliteStorage(file, { busyTimeoutMs: 200 });
+  let settled = false;
+  const storage = new Proxy(sqlite, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (property === "commit" && typeof value === "function") {
+        return async (writes: Array<{ type: string; value?: { status?: string } }>, ...rest: unknown[]) => {
+          if (settled) await new Promise((resolve) => setTimeout(resolve, 400));
+          const result = await value.call(target, writes, ...rest);
+          if (writes.some((write) => write.type === "submission" && write.value?.status === "done")) settled = true;
+          return result;
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const second = createTestStation();
+  second.faux.setResponses([fauxAssistantMessage("answered in time")]);
+  const observed = deferred();
+  const events: ConversationEvent[] = [];
+  const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id), capsule, {
+    storage,
+    tools: [webSearch],
+    limits: { turnTimeoutMs: 300 },
+    listeners: [(event) => { events.push(event); observed.resolve(); }],
+  });
+  await observed.promise;
+  assert.deepEqual(events.map((event) => event.type === "turn" && event.status), ["completed"]);
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  settled = false;
+  assert.equal((await restarted.handleMessage(request)).text, "answered in time");
+  await restarted.close();
+  await crashed.close().catch(() => undefined);
+});
+
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
   const events: ConversationEvent[] = [];
   const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });

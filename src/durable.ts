@@ -520,6 +520,9 @@ export async function createDurableAgent(
         if (!submission) return;
         const record = await submission.wait(CONTEXT);
         requestId = record.requestId;
+        // Settled: bookkeeping that follows must not be able to time out the finished run.
+        const deadline = ownBudget(record.requestId)?.deadline;
+        if (deadline) clearTimeout(deadline);
         const conversation = await findConversation(threadId);
         if (!conversation) return;
         const entries = await readTurnEntries(conversation, record);
@@ -601,6 +604,7 @@ export async function createDurableAgent(
       let turn: ActiveTurn | undefined;
       let stream: Awaited<ReturnType<typeof watchEvents>> | undefined;
       let entries: ThreadEntry[] = [];
+      let settledRecord: SubmissionRecord | undefined;
       // Every turn is submitted under a request ID, so a restart can find it to observe it.
       const requestId = input.requestId ?? `zing:${turnId}`;
       let prepared: Conversation | undefined;
@@ -688,15 +692,17 @@ export async function createDurableAgent(
         if (settled.has(target)) drained();
         let record = await submission.status(CONTEXT);
         if (!isSettled(record)) record = await submission.wait(CONTEXT);
-        // The run is over; a limit can no longer be exceeded by work that already settled.
+        // The durable record now decides the outcome, as it will for a redelivery or a restart: limits and
+        // cancellation can no longer change work that already settled.
+        settledRecord = record;
         if (current.deadline) clearTimeout(current.deadline);
+        if (active.get(threadId)?.turnId === turnId) active.delete(threadId);
         // However the settled record arrived, report the turn's events before its completion.
         await waitAtMost(caughtUp, EVENT_DRAIN_TIMEOUT_MS);
 
         entries = await readTurnEntries(conversation, record);
         await touch(threadId);
 
-        if (current.canceled) throw new TurnCanceledError();
         if (current.failure) {
           // Recorded before the caller hears of it, so a redelivery or restart reports the same outcome.
           await current.aborting;
@@ -709,8 +715,9 @@ export async function createDurableAgent(
       } catch (error) {
         if (!(error instanceof TurnCanceledError || error instanceof TurnBudgetExceededError)) await probe();
         const shuttingDown = closed && !(error instanceof TurnCanceledError) && !turn?.failure && !turn?.canceled;
-        const canceled =
-          !shuttingDown &&
+        const canceled = settledRecord
+          ? error instanceof TurnCanceledError
+          : !shuttingDown &&
           !(error instanceof TurnBudgetExceededError) &&
           !turn?.failure &&
           (turn?.canceled === true || error instanceof TurnCanceledError);
