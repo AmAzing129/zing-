@@ -264,8 +264,16 @@ export async function createDurableAgent(
     stop(budget, recorded);
   };
 
-  const createRecoveredBudget = (conversation: Conversation, requestId?: string): TurnBudget => {
-    const recovered: TurnBudget = { requestId, modelTurns: 0, toolCalls: 0, canceled: false, conversation };
+  /**
+   * A resumed run continues from what it already spent. Only its wall-clock limit starts over: downtime spends no
+   * model or tool calls, and those counters are what bound its cost across restarts.
+   */
+  const createRecoveredBudget = (
+    conversation: Conversation,
+    requestId?: string,
+    spent = { modelTurns: 0, toolCalls: 0 },
+  ): TurnBudget => {
+    const recovered: TurnBudget = { requestId, ...spent, canceled: false, conversation };
     recovered.deadline = setTimeout(() => {
       fail(recovered, new TurnBudgetExceededError("timeout", `Turn exceeded the ${limits.turnTimeoutMs}ms timeout`));
     }, limits.turnTimeoutMs);
@@ -555,7 +563,10 @@ export async function createDurableAgent(
     }
     const conversation = live.length > 0 ? await harness.conversation(id, CONTEXT) : undefined;
     // A conversation runs one input at a time; its resumed run gets fresh limits from now.
-    if (conversation) createRecoveredBudget(conversation, live[0]?.requestId);
+    const resumed = live[0];
+    if (conversation && resumed) {
+      createRecoveredBudget(conversation, resumed.requestId, spentBudget(await readTurnRecords(conversation, resumed)));
+    }
     for (const submissionId of [...recovered].sort((left, right) => left - right)) {
       observeRecovered(threadId, id, submissionId);
     }
@@ -961,6 +972,10 @@ function requestRecord(harness: Harness, id: ConversationId, requestId: string):
  * entry. Zing submits one input at a time per thread, so the next user entry starts the next turn.
  */
 async function readTurnEntries(conversation: Conversation, record: SubmissionRecord): Promise<ThreadEntry[]> {
+  return toThreadEntries(await readTurnRecords(conversation, record));
+}
+
+async function readTurnRecords(conversation: Conversation, record: SubmissionRecord): Promise<EntryRecord[]> {
   if (record.entry === undefined) return [];
   const last = record.status === "done" && record.type === "input" ? record.answer : undefined;
   const records: EntryRecord[] = [];
@@ -978,7 +993,25 @@ async function readTurnEntries(conversation: Conversation, record: SubmissionRec
     }
     cursor = page.next;
   } while (cursor !== undefined);
-  return toThreadEntries(records);
+  return records;
+}
+
+/**
+ * What a turn has already spent: its answered model responses, and the tool calls they made. A call cut off by the crash
+ * has no result yet, so calls are counted from the responses; one that was blocked or never started counts too, which
+ * only errs toward stopping sooner.
+ */
+function spentBudget(records: readonly EntryRecord[]): { modelTurns: number; toolCalls: number } {
+  let modelTurns = 0;
+  let toolCalls = 0;
+  for (const record of records) {
+    const message = record.model?.[0];
+    if (!AssistantEntry.is(record) || message?.role !== "assistant") continue;
+    if (message.stopReason === "error" || message.stopReason === "aborted") continue;
+    modelTurns += 1;
+    toolCalls += message.content.filter((block) => block.type === "toolCall").length;
+  }
+  return { modelTurns, toolCalls };
 }
 
 function toThreadEntries(records: readonly EntryRecord[]): ThreadEntry[] {

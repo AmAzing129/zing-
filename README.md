@@ -95,7 +95,7 @@ By default the capsule keeps each thread as a JSONL transcript, written when a t
 - A redelivered message with the same request ID (Telegram uses the update ID) is answered once, from the original turn.
 - Threads, turns, events, limits, plugins, and the App Server protocol behave as before. Existing JSONL threads are imported, from their last reset, the first time the durable runtime opens the capsule; the JSONL files stay untouched, so switching back to `legacy` does not see later turns.
 
-A graceful stop leaves running turns pending instead of canceling them; they resume on the next start. pi-durable is marked experimental upstream, so Zing pins its exact version.
+A graceful stop leaves channel turns (such as Telegram's) pending instead of canceling them; they resume on the next start. App Server turns are the exception: protocol v1 cancels a connection's turns when its transport closes, including at station shutdown. A resumed turn keeps the model rounds and tool calls it had already used; only its timeout starts over. pi-durable is marked experimental upstream, so Zing pins its exact version.
 
 ## Deployment environments
 

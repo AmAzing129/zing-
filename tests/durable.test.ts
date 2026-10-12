@@ -1007,6 +1007,85 @@ test("durable: a reset does not drop a turn whose observer had not finished", as
   await crashed.close().catch(() => undefined);
 });
 
+test("durable: a resumed turn keeps the model rounds and tool calls it already spent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-spent-"));
+  const file = join(dir, "durable.sqlite");
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const toolStarted = deferred();
+  const hanging: Tool = { ...webSearch, execute: async (_input, { signal }) => (toolStarted.resolve(), waitForAbort(signal)) };
+  const first = createTestStation();
+  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    tools: [hanging],
+    limits: { maxToolCalls: 1 },
+  });
+  first.faux.setResponses([fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" })]);
+  void crashed.startTurn({ threadId: "chat:spent", text: "loop", senderId: "alice" }).completed.catch(() => undefined);
+  await toolStarted.promise;
+
+  // The restarted station allows one tool call per turn; this turn already made it before the crash.
+  let executions = 0;
+  const counting: Tool = { ...webSearch, execute: async () => (executions++, { text: "more" }) };
+  const second = createTestStation();
+  const observed = deferred();
+  const events: ConversationEvent[] = [];
+  second.faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "two" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("should not be reached"),
+  ]);
+  const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    tools: [counting],
+    limits: { maxToolCalls: 1 },
+    listeners: [(event) => { events.push(event); observed.resolve(); }],
+  });
+  await observed.promise;
+  assert.equal(executions, 0, "the second call is blocked, not run");
+  assert.equal(second.faux.state.callCount, 1);
+  assert.deepEqual(events.map((event) => event.type === "turn" && [event.status, event.senderId]), [["failed", "alice"]]);
+  const blocked = (await restarted.readThread("chat:spent")).entries.at(-1);
+  assert.match(blocked?.type === "toolResult" ? contentText(blocked.content, "") : "", /1 tool-call limit/);
+  await restarted.close();
+  await crashed.close().catch(() => undefined);
+});
+
+test("durable: a resumed turn keeps the model rounds it already spent", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-spent-rounds-"));
+  const file = join(dir, "durable.sqlite");
+  const capsule = await openFileCapsule({ blueprint: blueprintFor("faux-1"), path: dir });
+  const toolStarted = deferred();
+  const hanging: Tool = { ...webSearch, execute: async (_input, { signal }) => (toolStarted.resolve(), waitForAbort(signal)) };
+  const first = createTestStation();
+  const crashed = await createDurableAgent(first.station, blueprintFor(first.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    tools: [hanging],
+    limits: { maxModelTurns: 2 },
+  });
+  first.faux.setResponses([fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" })]);
+  void crashed.startTurn({ threadId: "chat:rounds", text: "loop" }).completed.catch(() => undefined);
+  await toolStarted.promise;
+
+  const second = createTestStation();
+  const observed = deferred();
+  const events: ConversationEvent[] = [];
+  second.faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "two" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "three" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("should not be reached"),
+  ]);
+  const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id), capsule, {
+    storage: await openNodeSqliteStorage(file, { busyTimeoutMs: 200 }),
+    tools: [webSearch],
+    limits: { maxModelTurns: 2 },
+    listeners: [(event) => { events.push(event); observed.resolve(); }],
+  });
+  await observed.promise;
+  assert.equal(second.faux.state.callCount, 1, "the second round is the last one");
+  assert.deepEqual(events.map((event) => event.type === "turn" && event.status), ["failed"]);
+  await restarted.close();
+  await crashed.close().catch(() => undefined);
+});
+
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
   const events: ConversationEvent[] = [];
   const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });
