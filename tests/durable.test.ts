@@ -1561,3 +1561,36 @@ test("durable: a run keeps its limits after this process lost its budget", async
   assert.equal(faux.state.callCount, 2);
 });
 
+test("durable: a run that outlives its caller still ends at its deadline and frees its thread", { timeout: 10_000 }, async (t) => {
+  // As above, the waiting call's second read fails; then the run's next model request hangs until it is aborted.
+  let reads = 0;
+  const memory = new MemoryStorage();
+  const storage = new Proxy(memory, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (property === "submission" && typeof value === "function") {
+        return async (...args: unknown[]) => {
+          reads += 1;
+          if (reads === 2) throw new Error("transient read failure");
+          return value.apply(target, args);
+        };
+      }
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const { agent, faux } = await createTestAgent({ storage, limits: { turnTimeoutMs: 300 } });
+  t.after(() => agent.close());
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" }),
+    async (_context, options) => {
+      await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+      return fauxAssistantMessage("", { stopReason: "aborted" });
+    },
+    fauxAssistantMessage("next turn"),
+  ]);
+  const request = { conversationId: "chat:outlived", text: "search", requestId: "update:outlived" };
+  await assert.rejects(agent.handleMessage(request), /transient read failure/);
+  await assert.rejects(agent.handleMessage(request), /300ms timeout/);
+  assert.equal((await agent.handleMessage({ conversationId: "chat:outlived", text: "again" })).text, "next turn");
+});
+

@@ -303,6 +303,9 @@ export async function createDurableAgent(
       Math.max(0, (turn.deadlineAt ?? Date.now() + timeoutMs) - Date.now()),
     );
     recovered.deadline.unref();
+    // A budget is replaced only once its run has ended, so the earlier deadline has nothing left to stop.
+    const previous = budgets.get(conversation.id);
+    if (previous?.deadline) clearTimeout(previous.deadline);
     budgets.set(conversation.id, recovered);
     return recovered;
   };
@@ -324,7 +327,11 @@ export async function createDurableAgent(
     const record = input === undefined ? undefined : await (await open().submission(input, CONTEXT))?.status(CONTEXT);
     if (record?.requestId === undefined) return undefined;
     const conversation = await open().conversation(id, CONTEXT);
-    return conversation && { requestId: record.requestId, canceled: false, conversation };
+    if (!conversation) return undefined;
+    const turn = findTurn((await open().snapshot(TurnDoc, id, CONTEXT))?.turns, record.requestId);
+    // Registered with its deadline armed, so a call that hangs after this hook still times out.
+    const recorded = turn ?? { requestId: record.requestId, observed: false };
+    return budgets.get(id) ?? createRecoveredBudget(conversation, recorded);
   };
 
   const checkDeadline = async (budget: TurnBudget): Promise<void> => {
@@ -707,6 +714,7 @@ export async function createDurableAgent(
       let turn: ActiveTurn | undefined;
       let stream: Awaited<ReturnType<typeof watchEvents>> | undefined;
       let settledRecord: SubmissionRecord | undefined;
+      let submitted = false;
       // Every turn is submitted under a request ID, so a restart can find it to observe it.
       const requestId = input.requestId ?? `zing:${turnId}`;
       try {
@@ -776,6 +784,7 @@ export async function createDurableAgent(
         controller.emit({ type: "turn/started", threadId, turnId });
         if (cancelRequested || canceling) throw new TurnCanceledError();
         const submission = await conversation.submit({ type: "input", content: input.text, requestId }, CONTEXT);
+        submitted = true;
         target = submission.id;
         if (canceling) {
           current.canceled = true;
@@ -824,7 +833,8 @@ export async function createDurableAgent(
         controller.reject(failed);
       } finally {
         if (active.get(threadId)?.turnId === turnId) active.delete(threadId);
-        if (turn) releaseBudget(turn.conversation.id, turn);
+        // A run that goes on after its caller stopped waiting (a failed read, say) keeps its budget and deadline.
+        if (turn && (settledRecord || !submitted)) releaseBudget(turn.conversation.id, turn);
         // The next turn of this thread starts only once this one's stream and abort are done.
         await stream?.stop().catch(() => undefined);
         await turn?.aborting;
