@@ -11,6 +11,37 @@ import type { Blueprint } from "../src/blueprint";
 import { createMemoryCapsule } from "../src/capsule";
 import { createZingHost } from "../src/host";
 
+test("host closes acquired storage on constructor failure and preserves cleanup errors", async () => {
+  for (const failsCleanup of [false, true]) {
+    const storage = new MemoryStorage();
+    let closes = 0;
+    const cleanupError = new Error("storage cleanup failed");
+    storage.close = async () => {
+      closes++;
+      if (failsCleanup) throw cleanupError;
+    };
+    const faux = fauxProvider({ models: [{ id: "host-model" }] });
+    await assert.rejects(createZingHost({
+      blueprint: { name: "broken", tools: [] },
+      capsuleFactory: async () => createMemoryCapsule({ blueprintName: "broken" }),
+      durableStorage: async () => storage,
+      configureRegistry(registry) {
+        registry.api.registerProvider({ pluginId: "fake", provider: faux.provider });
+      },
+    }), (error: unknown) => {
+      if (failsCleanup) {
+        assert.ok(error instanceof AggregateError);
+        assert.match(String(error.errors[0]), /has no model/);
+        assert.strictEqual(error.errors[1], cleanupError);
+      } else {
+        assert.match(String(error), /has no model/);
+      }
+      return true;
+    });
+    assert.equal(closes, 1);
+  }
+});
+
 test("createZingHost injects a capsule factory and closes idempotently", async () => {
   const faux = fauxProvider({ models: [{ id: "host-model" }] });
   const blueprint: Blueprint = { name: "host-test", model: "host-model", tools: [] };

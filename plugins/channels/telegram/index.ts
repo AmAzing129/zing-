@@ -41,17 +41,15 @@ export default function telegram(zing: ZingPluginAPI) {
             conversationId: conversation,
             text: ctx.message.text,
             senderId: ctx.from?.id !== undefined ? String(ctx.from.id) : undefined,
-            // Telegram redelivers an update the bot never confirmed, for example after a crash mid-turn.
-            requestId: `update:${ctx.update.update_id}`,
+            // Message IDs are stable on redelivery; update IDs may be reused after inactivity.
+            requestId: `telegram:${ctx.me.id}:${ctx.chat.id}:${ctx.message.message_id}`,
           });
           for (const chunk of splitMessage(result.text || "(empty response)")) {
             await ctx.reply(chunk);
           }
         } catch (error) {
           console.error("agent run failed", { conversationId: conversation, error });
-          if (!signal.aborted) {
-            await ctx.reply("调用失败，请稍后再试。");
-          }
+          await ctx.reply("调用失败，请稍后再试。");
         } finally {
           stopTyping();
         }
@@ -63,6 +61,8 @@ export default function telegram(zing: ZingPluginAPI) {
       };
       signal.addEventListener("abort", stop, { once: true });
       try {
+        // stop() cancels polling and confirms the offset, but start() drains middleware.
+        // Keep replies alive during that drain; this is graceful delivery, not a durable outbox.
         await bot.start({
           onStart: (info) => {
             console.log(`Telegram channel @${info.username} is running`);

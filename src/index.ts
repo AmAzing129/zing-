@@ -50,8 +50,8 @@ async function main(): Promise<void> {
     forcedExitCode = exitCode;
     process.exitCode = exitCode;
     setTimeout(() => process.exit(exitCode), SHUTDOWN_TIMEOUT_MS).unref();
+    // Let the transport cancel sessions or drain handlers before closing their runtime/storage.
     shutdown.abort();
-    void host?.close().catch((error) => console.error("Zing host cleanup failed", error));
   };
   const onSigint = () => stop(130);
   const onSigterm = () => stop(143);

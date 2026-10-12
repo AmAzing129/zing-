@@ -42,19 +42,41 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
     options.cwd,
   );
 
+  let closeStorage: (() => Promise<void>) | undefined;
   try {
     const station = createStation({ providers: registry.listProviders(), provider: options.provider });
     const capsule = await options.capsuleFactory(options.blueprint);
     const tools = resolveBlueprintTools(options.blueprint, registry);
     const agentOptions = { tools, listeners: registry.listListeners() };
     // pi-durable loads TypeBox and Chord; a legacy station never imports it.
-    const agent = options.durableStorage
-      ? await (await import("./durable")).createDurableAgent(station, options.blueprint, capsule, {
-          ...agentOptions,
-          storage: await options.durableStorage(capsule),
-          onFatal: options.onFatal,
-        })
-      : createAgent(station, options.blueprint, capsule, agentOptions);
+    let agent: Agent;
+    if (options.durableStorage) {
+      const { createDurableAgent } = await import("./durable");
+      const { BACKGROUND_CONTEXT } = await import("@earendil-works/chord/context");
+      const acquired = await options.durableStorage(capsule);
+      let closing: Promise<void> | undefined;
+      const close: Storage["close"] = (context) => {
+        closing ??= Promise.resolve().then(() => acquired.close(context));
+        return closing;
+      };
+      closeStorage = () => close(BACKGROUND_CONTEXT);
+      // Both constructor failure cleanup and the harness may close storage. Share one attempt,
+      // including its rejection, and preserve the receiver of storage implementations' methods.
+      const storage = new Proxy(acquired, {
+        get(target, key) {
+          if (key === "close") return close;
+          const value = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      agent = await createDurableAgent(station, options.blueprint, capsule, {
+        ...agentOptions,
+        storage,
+        onFatal: options.onFatal,
+      });
+    } else {
+      agent = createAgent(station, options.blueprint, capsule, agentOptions);
+    }
     registry.bindHost(agent);
 
     let closing: Promise<void> | undefined;
@@ -67,7 +89,7 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
       },
     };
   } catch (error) {
-    return closeAfterFailure(error, closePlugins);
+    return closeAfterFailure(error, closePlugins, closeStorage);
   }
 }
 
@@ -88,11 +110,21 @@ async function closeHost(agent: Agent, closePlugins: () => void | Promise<void>)
   }
 }
 
-async function closeAfterFailure(error: unknown, closePlugins: () => void | Promise<void>): Promise<never> {
-  try {
-    await closePlugins();
-  } catch (cleanupError) {
-    throw new AggregateError([error, cleanupError], "Zing host creation and cleanup failed");
+async function closeAfterFailure(
+  error: unknown,
+  closePlugins: () => void | Promise<void>,
+  closeStorage?: () => Promise<void>,
+): Promise<never> {
+  const errors = [error];
+  for (const cleanup of [closeStorage, closePlugins]) {
+    try {
+      await cleanup?.();
+    } catch (cleanupError) {
+      errors.push(cleanupError);
+    }
+  }
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Zing host creation and cleanup failed");
   }
   throw error;
 }
