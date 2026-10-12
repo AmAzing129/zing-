@@ -220,6 +220,16 @@ export async function createDurableAgent(
     }
   };
 
+  /** Run a public operation that touches storage, checking the Session when it fails unexpectedly. */
+  const guarded = async <T>(work: () => Promise<T>): Promise<T> => {
+    try {
+      return await work();
+    } catch (error) {
+      if (!(error instanceof RuntimeError)) await probe();
+      throw error;
+    }
+  };
+
   const ensureOpen = (): void => {
     if (closed) {
       throw new RuntimeError("RUNTIME_CLOSED", "Agent is shutting down");
@@ -806,16 +816,16 @@ export async function createDurableAgent(
     async openThread(threadId) {
       ensureOpen();
       const normalized = normalizeThreadId(threadId ?? createRuntimeId("thr"));
-      const { created } = await ensureConversation(normalized);
+      const { created } = await guarded(() => ensureConversation(normalized));
       return { threadId: normalized, created };
     },
     async readThread(threadId) {
       const normalized = normalizeThreadId(threadId);
-      const conversation = await findConversation(normalized);
+      const conversation = await guarded(() => findConversation(normalized));
       if (!conversation) {
         throw new RuntimeError("THREAD_NOT_FOUND", `Thread not found: ${normalized}`);
       }
-      const view = await conversation.context(CONTEXT);
+      const view = await guarded(() => conversation.context(CONTEXT));
       return {
         threadId: normalized,
         status: active.has(normalized) || recovering.has(normalized) ? "active" : "idle",
@@ -823,7 +833,7 @@ export async function createDurableAgent(
       };
     },
     async listThreads(options?: ListThreadsOptions) {
-      const snapshot = await open().snapshot(ThreadsDoc, CONTEXT);
+      const snapshot = await guarded(() => open().snapshot(ThreadsDoc, CONTEXT));
       const all = Object.entries(snapshot?.threads ?? {}).flatMap(([key, record]) => {
         const threadId = threadIdOf(key);
         return threadId === undefined ? [] : [{ threadId, updatedAt: record.updatedAt }];

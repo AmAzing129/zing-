@@ -1131,6 +1131,30 @@ test("durable: a turn that timed out as it answered reports the same failure to 
   await agent.close();
 });
 
+test("durable: a storage failure while opening a thread also stops the agent", async () => {
+  let failing = false;
+  const memory = new MemoryStorage();
+  const storage = new Proxy(memory, {
+    get(target, property) {
+      if (property === "commit" && failing) {
+        return async () => {
+          throw new Error("disk is gone");
+        };
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const fatal: Error[] = [];
+  const { agent } = await createTestAgent({ storage, onFatal: (error) => fatal.push(error) });
+  failing = true;
+  await assert.rejects(agent.openThread("web:new"), /disk is gone/);
+  assert.equal(fatal.length, 1);
+  assert.match(fatal[0]?.message ?? "", /Session is poisoned/);
+  await assert.rejects(agent.openThread("web:other"), /shutting down/);
+  await agent.close();
+});
+
 test("durable: a repeated request ID returns the original answer without re-observing history", async () => {
   const events: ConversationEvent[] = [];
   const { agent, faux } = await createTestAgent({ listeners: [(event) => { events.push(event); }] });
