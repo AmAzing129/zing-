@@ -78,9 +78,7 @@ const SYSTEM_SECTION = "system";
 const EVENT_DRAIN_TIMEOUT_MS = 1_000;
 const ENTRY_PAGE_SIZE = 256;
 const BUDGET_FAILURE_PREFIX = "zing:budget:";
-/** How often a hook holding a run whose outcome is decided re-issues its abort, if an earlier attempt gave up. */
-const ABORT_RECHECK_MS = 1_000;
-/** Delays before retrying an abort whose commit failed. A poisoned Session stops the agent through probe() instead. */
+/** Delays before retrying an abort whose commit failed; the last one repeats until the abort commits. */
 const ABORT_RETRY_DELAYS_MS = [50, 250, 1_000];
 
 type ThreadRecord = { conversationId: number; updatedAt: number };
@@ -262,26 +260,22 @@ export async function createDurableAgent(
 
   const stop = (budget: TurnBudget): void => {
     if (budget.aborting) return;
-    let aborting: Promise<void> | undefined;
-    aborting = (async () => {
-      for (const delay of [...ABORT_RETRY_DELAYS_MS, undefined]) {
+    budget.aborting = (async () => {
+      // Retried until it commits: a run waiting in a model call or tool reaches no hook that could abort it again.
+      for (let attempt = 0; ; attempt += 1) {
         try {
           await budget.conversation.abort(CONTEXT);
           return;
         } catch (error) {
           await probe();
           // Closing suspends the run for the next start, and a poisoned Session stops the agent: neither needs a retry.
-          if (delay === undefined || fatal || !harness) {
-            if (harness && !fatal) console.warn("durable conversation abort failed", error);
-            // A later stop() may try again, as a hook holding the run does every ABORT_RECHECK_MS.
-            if (budget.aborting === aborting) budget.aborting = undefined;
-            return;
-          }
+          if (fatal || !harness) return;
+          if (attempt === 0) console.warn("durable conversation abort failed; retrying", error);
+          const delay = ABORT_RETRY_DELAYS_MS[Math.min(attempt, ABORT_RETRY_DELAYS_MS.length - 1)];
           await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
     })();
-    budget.aborting = aborting;
   };
 
   const fail = async (budget: TurnBudget, failure: TurnBudgetExceededError): Promise<void> => {
@@ -349,15 +343,12 @@ export async function createDurableAgent(
   };
 
   /**
-   * Hold a hook whose run already has its outcome until the abort reaches it, so the run spends nothing more. A hook
-   * error would not end the run (pi-durable reports and skips it), so the hold re-issues the abort if an attempt gave
-   * up, until it lands or the agent closes.
+   * Hold a hook whose run already has its outcome until its abort lands, so the run spends nothing more. Throwing
+   * instead would not end the run: pi-durable reports and skips a hook's error. Closing the harness aborts the hold too.
    */
   const holdUntilAborted = async (budget: TurnBudget, signal: AbortSignal | undefined): Promise<void> => {
-    while (signal && !signal.aborted && harness && !fatal) {
-      stop(budget);
-      await waitForSignal(signal, ABORT_RECHECK_MS);
-    }
+    stop(budget);
+    await waitForSignal(signal);
   };
 
   const checkDeadline = async (budget: TurnBudget): Promise<void> => {
@@ -1213,18 +1204,15 @@ async function waitAtMost(promise: Promise<void>, timeoutMs: number): Promise<vo
   }
 }
 
-async function waitForSignal(signal: AbortSignal | undefined, timeoutMs: number): Promise<void> {
+async function waitForSignal(signal: AbortSignal | undefined): Promise<void> {
   if (!signal || signal.aborted) return;
-  let timer: NodeJS.Timeout | undefined;
   let onAbort: (() => void) | undefined;
   try {
     await new Promise<void>((resolve) => {
       onAbort = () => resolve();
       signal.addEventListener("abort", onAbort, { once: true });
-      timer = setTimeout(resolve, timeoutMs);
     });
   } finally {
-    if (timer) clearTimeout(timer);
     if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }

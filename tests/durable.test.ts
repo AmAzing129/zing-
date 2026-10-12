@@ -1505,8 +1505,7 @@ function rejectingAborts(reject: () => boolean) {
   return { storage, rejected: () => rejected };
 }
 
-test("durable: a run whose abort attempts give up is held until a later abort lands", { timeout: 10_000 }, async (t) => {
-  // The first attempt and all its retries are rejected; the hook holding the run must re-issue the abort.
+test("durable: a run whose abort keeps failing is held until a retry lands", { timeout: 10_000 }, async (t) => {
   const { storage, rejected } = rejectingAborts(() => rejected() < 4);
   const { agent, faux } = await createTestAgent({ storage, limits: { maxModelTurns: 1 } });
   t.after(() => agent.close());
@@ -1515,7 +1514,7 @@ test("durable: a run whose abort attempts give up is held until a later abort la
     fauxAssistantMessage("next turn"),
   ]);
   await assert.rejects(agent.handleMessage({ conversationId: "chat:abort", text: "loop" }), /1 model-turn limit/);
-  assert.equal(rejected(), 4, "every attempt of the first abort was rejected");
+  assert.equal(rejected(), 4);
   assert.equal(faux.state.callCount, 1, "the held run made no further model request");
   assert.equal((await agent.handleMessage({ conversationId: "chat:abort", text: "again" })).text, "next turn");
 });
@@ -1602,13 +1601,9 @@ test("durable: a run that outlives its caller still ends at its deadline and fre
   assert.equal((await agent.handleMessage({ conversationId: "chat:outlived", text: "again" })).text, "next turn");
 });
 
-test("durable: a cancel whose abort commit is rejected once is retried", { timeout: 10_000 }, async (t) => {
-  let rejectNext = true;
-  const { storage, rejected } = rejectingAborts(() => {
-    const reject = rejectNext;
-    rejectNext = false;
-    return reject;
-  });
+test("durable: a cancel is retried until its abort commits", { timeout: 10_000 }, async (t) => {
+  let remaining = 1;
+  const { storage, rejected } = rejectingAborts(() => remaining-- > 0);
   let started = deferred();
   // Waits for its abort; no hook runs while it does, so only a retry can deliver the cancel.
   const tool: Tool = { ...webSearch, execute: async (_input, { signal }) => (started.resolve(), waitForAbort(signal)) };
@@ -1623,12 +1618,13 @@ test("durable: a cancel whose abort commit is rejected once is retried", { timeo
   await assert.rejects(canceled.completed, /canceled/i);
   assert.equal(rejected(), 1);
 
-  rejectNext = true;
+  // More rejections than the backoff has steps: cancelAll must still not return before the abort commits.
+  remaining = 5;
   started = deferred();
   const stopped = agent.startTurn({ threadId: "chat:retry", text: "two" });
   await started.promise;
   await agent.cancelAll();
+  assert.equal(rejected(), 6);
   await assert.rejects(stopped.completed, /canceled/i);
-  assert.equal(rejected(), 2);
 });
 
