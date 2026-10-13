@@ -1,0 +1,12 @@
+{
+  "name": "zing-trigger-schedule",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "zing": {
+    "plugin": "./index.ts"
+  },
+  "dependencies": {
+    "croner": "^10.0.1"
+  }
+}

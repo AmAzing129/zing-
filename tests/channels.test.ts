@@ -8,6 +8,7 @@ import { createPluginRegistry } from "../src/plugin/index";
 test("stdio channel sends the message and prints the reply", async () => {
   const seen: string[] = [];
   const host: ConversationHost = {
+    dispatch: async () => ({ text: "unused" }),
     handleMessage: async (message) => {
       seen.push(message.conversationId, message.text);
       return { text: "ok" };
@@ -37,6 +38,7 @@ test("stdio channel sends the message and prints the reply", async () => {
 test("stdio channel requires a message", async () => {
   const registry = createPluginRegistry({
     host: {
+      dispatch: async () => ({ text: "unused" }),
       handleMessage: async () => ({ text: "ok" }),
       resetConversation: () => {},
     },
@@ -50,6 +52,7 @@ test("stdio channel requires a message", async () => {
 test("stdio channel refuses work after its host signal is aborted", async () => {
   const registry = createPluginRegistry({
     host: {
+      dispatch: async () => ({ text: "unused" }),
       handleMessage: async () => ({ text: "unreachable" }),
       resetConversation: () => {},
     },

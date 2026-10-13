@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { Bot } from "grammy";
+import { Api, Bot } from "grammy";
 
 import telegram, { parseAllowedUserIds, splitMessage } from "../plugins/channels/telegram/index";
 import type { ConversationHost } from "../src/agent";
 import { createPluginRegistry, loadPlugin } from "../src/plugin/index";
 
 const host: ConversationHost = {
+  dispatch: async () => ({ text: "ok" }),
   handleMessage: async () => ({ text: "ok" }),
   resetConversation: () => {},
 };
@@ -92,4 +93,22 @@ test("telegram channel waits for its asynchronous stop before resolving", async 
     methods.start = originalStart;
     methods.stop = originalStop;
   }
+});
+
+test("telegram send splits long replies and addresses numeric chats by number", async () => {
+  const methods = Api.prototype as unknown as { sendMessage: (chatId: number | string, text: string) => Promise<unknown> };
+  const original = methods.sendMessage;
+  const sent: Array<[number | string, number]> = [];
+  methods.sendMessage = async (chatId, text) => { sent.push([chatId, text.length]); return {}; };
+  try {
+    const registry = createPluginRegistry({ host, env: { TELEGRAM_BOT_TOKEN: "123:test" } });
+    telegram(registry.api);
+    const channel = registry.getChannel("telegram");
+    assert.ok(channel?.send);
+    await channel.send({ conversationId: "telegram:-100", to: "-100", text: "x".repeat(5000) });
+    await channel.send({ conversationId: "telegram:@news", to: "@news", text: "hi" });
+  } finally {
+    methods.sendMessage = original;
+  }
+  assert.deepEqual(sent, [[-100, 4096], [-100, 904], ["@news", 2]]);
 });

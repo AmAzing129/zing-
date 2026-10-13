@@ -11,6 +11,7 @@ import { registerStdioChannel } from "./channels/stdio";
 import { parseCli, usage } from "./cli";
 import { loadConfig } from "./config";
 import { zingHome } from "./env";
+import { runTriggerSources } from "./dispatcher";
 import { createZingHost, type ZingHost } from "./host";
 import { selectChannel } from "./plugin/index";
 import { runStdioAppServer } from "./protocol/index";
@@ -92,8 +93,11 @@ async function main(): Promise<void> {
     }
 
     const channel = selectChannel(host.registry, config.channel);
-    console.log(`Agent ${host.agent.name} ${host.agent.agentId} via ${channel.id}`);
-    await channel.start(shutdown.signal);
+    // --once answers one message and exits; background trigger sources only run in a long-lived station.
+    const sources = once ? [] : host.registry.listTriggerSources();
+    const via = [channel.id, ...sources.map((source) => source.id)].join(", ");
+    console.log(`Agent ${host.agent.name} ${host.agent.agentId} via ${via}`);
+    await runTriggerSources([channel, ...sources], shutdown.signal);
   } finally {
     try {
       await host?.close();

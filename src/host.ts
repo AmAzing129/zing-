@@ -1,6 +1,8 @@
 import { createAgent, type Agent } from "./agent";
 import { resolveBlueprintTools, type Blueprint } from "./blueprint";
 import type { Capsule } from "./capsule";
+import { createDispatcher } from "./dispatcher";
+import type { ConversationHost } from "./plugin/types";
 import {
   createPluginRegistry,
   loadPlugins,
@@ -23,6 +25,8 @@ export type CreateZingHostOptions = {
 
 export type ZingHost = {
   readonly agent: Agent;
+  /** Runs triggers and delivers their replies; the host plugins see as zing.host. */
+  readonly dispatcher: ConversationHost;
   readonly registry: PluginRegistry;
   close: () => Promise<void>;
 };
@@ -44,11 +48,17 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
       tools,
       listeners: registry.listListeners(),
     });
-    registry.bindHost(agent);
+    const dispatcher = createDispatcher({
+      agent,
+      state: capsule.state,
+      getChannel: (id) => registry.getChannel(id),
+    });
+    registry.bindHost(dispatcher, { agentId: agent.agentId, state: capsule.state });
 
     let closing: Promise<void> | undefined;
     return {
       agent,
+      dispatcher,
       registry,
       close() {
         closing ??= closeHost(agent, closePlugins);

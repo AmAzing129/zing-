@@ -5,5 +5,8 @@ plugins:
   - ./plugins/channels/telegram
   - ./plugins/tools/brave
   - ./plugins/tools/notes
+  - ./plugins/triggers/schedule
+  # Opt-in: opens an HTTP port and needs ZING_WEBHOOK_TOKEN.
+  # - ./plugins/triggers/webhook
 
 channel: telegram

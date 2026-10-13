@@ -674,6 +674,7 @@ test("conversation observers receive persisted completed turns and resets", asyn
     type: "turn",
     conversationId: "chat:observed",
     senderId: "alice",
+    trigger: { kind: "message" },
     capsule: { agentId: agent.agentId },
     status: "completed",
     entries: snapshot.entries,

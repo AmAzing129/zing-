@@ -10,7 +10,11 @@ import type {
   TextContent,
   ThinkingContent,
   ToolCall,
+  UserMessage,
 } from "@earendil-works/pi-ai";
+
+import type { TriggerInfo } from "./plugin/types";
+import { isMessageTrigger, renderTriggerText } from "./trigger";
 
 export const TRANSCRIPT_VERSION = 1;
 
@@ -25,6 +29,8 @@ export type TranscriptEvent =
       type: "user";
       at: number;
       content: string | Array<StoredText | StoredImage>;
+      /** Present for non-message triggers; content then holds the raw trigger text, not the framed prompt. */
+      trigger?: TriggerInfo;
     }
   | {
       v: typeof TRANSCRIPT_VERSION;
@@ -59,6 +65,21 @@ const EMPTY_USAGE = {
   totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+
+const triggerMessages = new WeakMap<AgentMessage, { trigger: TriggerInfo; text: string }>();
+
+/** The user-role message a trigger puts in front of the model. */
+export function createTriggerMessage(trigger: TriggerInfo, text: string, at: number): UserMessage {
+  const message: UserMessage = {
+    role: "user",
+    content: [{ type: "text", text: renderTriggerText(trigger, text, at) }],
+    timestamp: at,
+  };
+  if (!isMessageTrigger(trigger)) {
+    triggerMessages.set(message, { trigger, text });
+  }
+  return message;
+}
 
 export function splitConversationId(conversationId: string): { channel: string; localId: string } {
   const cut = conversationId.indexOf(":");
@@ -142,6 +163,10 @@ export function resetEvent(at = Date.now()): TranscriptEvent {
 
 function encodeMessage(message: AgentMessage): TranscriptEvent | undefined {
   if (message.role === "user") {
+    const trigger = triggerMessages.get(message);
+    if (trigger) {
+      return { v: TRANSCRIPT_VERSION, type: "user", at: message.timestamp, content: trigger.text, trigger: trigger.trigger };
+    }
     return {
       v: TRANSCRIPT_VERSION,
       type: "user",
@@ -177,6 +202,9 @@ function encodeMessage(message: AgentMessage): TranscriptEvent | undefined {
 
 function decodeEvent(event: TranscriptEvent): AgentMessage {
   if (event.type === "user") {
+    if (event.trigger && typeof event.content === "string") {
+      return createTriggerMessage(event.trigger, event.content, event.at);
+    }
     return { role: "user", content: event.content, timestamp: event.at };
   }
   if (event.type === "assistant") {
@@ -284,7 +312,14 @@ function parseEvent(raw: unknown, source: string): TranscriptEvent {
     return { v: TRANSCRIPT_VERSION, type: "reset", at };
   }
   if (type === "user") {
-    return { v: TRANSCRIPT_VERSION, type: "user", at, content: parseUserContent(record.content, source) };
+    const content = parseUserContent(record.content, source);
+    const trigger = parseTrigger(record.trigger, source);
+    if (trigger && typeof content !== "string") {
+      throw new Error(`${source}: trigger content must be a string`);
+    }
+    return trigger
+      ? { v: TRANSCRIPT_VERSION, type: "user", at, content, trigger }
+      : { v: TRANSCRIPT_VERSION, type: "user", at, content };
   }
   if (type === "assistant") {
     return {
@@ -310,6 +345,22 @@ function parseEvent(raw: unknown, source: string): TranscriptEvent {
     };
   }
   throw new Error(`${source}: unknown event type ${String(type)}`);
+}
+
+function parseTrigger(raw: unknown, source: string): TriggerInfo | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`${source}: trigger must be a mapping`);
+  }
+  const record = raw as Record<string, unknown>;
+  const kind = requiredString(record.kind, `${source}: trigger kind`);
+  if (isMessageTrigger({ kind })) {
+    throw new Error(`${source}: message triggers are stored as plain user events`);
+  }
+  const triggerSource = optionalString(record.source);
+  return triggerSource === undefined ? { kind } : { kind, source: triggerSource };
 }
 
 function parseUserContent(raw: unknown, source: string): string | Array<StoredText | StoredImage> {
