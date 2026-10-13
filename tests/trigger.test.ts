@@ -187,6 +187,28 @@ test("a message trigger's route is remembered and reused by later triggers, acro
   await assert.rejects(agent.readThread("mute:1"), /Thread not found/);
 });
 
+test("routes for opaque conversation IDs such as __proto__ persist as ordinary keys", async () => {
+  const { faux, model, station } = harness();
+  const capsule = createMemoryCapsule({ blueprintName: "proto" });
+  const agent = createAgent(station, { name: "proto", model: model.id, tools: [] }, capsule);
+  const telegram = recordingChannel("telegram");
+  const options = { agent, state: capsule.state, getChannel: (id: string) => (id === "telegram" ? telegram : undefined) };
+  faux.setResponses([fauxAssistantMessage("hi"), fauxAssistantMessage("reminder"), fauxAssistantMessage("nothing")]);
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await createDispatcher(options).dispatch({ kind: "message", conversationId: "__proto__", text: "hi", deliver: { channel: "telegram", to: "1" } });
+    const restarted = createDispatcher(options);
+    await restarted.dispatch({ kind: "schedule", conversationId: "__proto__", text: "ping", deliver: "conversation" });
+    // An inherited property must not pass for a remembered route.
+    await restarted.dispatch({ kind: "schedule", conversationId: "constructor", text: "ping", deliver: "conversation" });
+  } finally {
+    console.warn = warn;
+  }
+  assert.deepEqual(telegram.sent.map((message) => [message.to, message.text]), [["1", "hi"], ["1", "reminder"]]);
+  assert.match((await capsule.state.read(ROUTES_KEY)) ?? "", /"__proto__": \{/);
+});
+
 test("a trigger for a conversation with no route still runs and stays in the conversation", async () => {
   const { faux, model, station } = harness();
   const capsule = createMemoryCapsule({ blueprintName: "routeless" });

@@ -116,26 +116,28 @@ type RouteStore = {
 };
 
 function createRouteStore(state: CapsuleState): RouteStore {
-  let loaded: Promise<Record<string, Route>> | undefined;
+  // Conversation IDs are opaque; a Map keeps IDs such as "__proto__" or "constructor" ordinary keys.
+  let loaded: Promise<Map<string, Route>> | undefined;
   let writes: Promise<void> = Promise.resolve();
 
-  const load = (): Promise<Record<string, Route>> => {
+  const load = (): Promise<Map<string, Route>> => {
     loaded ??= state.read(ROUTES_KEY).then((text) => parseRoutes(text));
     return loaded;
   };
 
   return {
     async get(conversationId) {
-      return (await load())[conversationId];
+      return (await load()).get(conversationId);
     },
     async remember(conversationId, route) {
       const routes = await load();
-      const current = routes[conversationId];
+      const current = routes.get(conversationId);
       if (current?.channel === route.channel && current.to === route.to) {
         return;
       }
-      routes[conversationId] = route;
-      const snapshot = `${JSON.stringify(routes, null, 2)}\n`;
+      routes.set(conversationId, route);
+      // Object.fromEntries and JSON.parse both define own properties, so "__proto__" round-trips as data.
+      const snapshot = `${JSON.stringify(Object.fromEntries(routes), null, 2)}\n`;
       const write = writes.then(() => state.write(ROUTES_KEY, snapshot));
       writes = write.catch(() => undefined);
       await write;
@@ -143,19 +145,19 @@ function createRouteStore(state: CapsuleState): RouteStore {
   };
 }
 
-function parseRoutes(text: string | undefined): Record<string, Route> {
+function parseRoutes(text: string | undefined): Map<string, Route> {
+  const routes = new Map<string, Route>();
   if (!text?.trim()) {
-    return {};
+    return routes;
   }
   const raw = JSON.parse(text) as unknown;
-  const routes: Record<string, Route> = {};
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error(`${ROUTES_KEY} must be a mapping`);
   }
   for (const [conversationId, value] of Object.entries(raw)) {
     const route = value as Partial<Route> | null;
     if (typeof route?.channel === "string" && typeof route.to === "string") {
-      routes[conversationId] = { channel: route.channel, to: route.to };
+      routes.set(conversationId, { channel: route.channel, to: route.to });
     }
   }
   return routes;
