@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import type { AddressInfo } from "node:net";
 import test from "node:test";
 
-import { MAX_BODY_BYTES, runWebhookServer, triggerText } from "../plugins/triggers/webhook/index";
+import { MAX_BODY_BYTES, MAX_TEXT_CHARS, runWebhookServer, triggerText } from "../plugins/triggers/webhook/index";
 import type { Trigger } from "../src/plugin/index";
 
 test("webhook authenticates, fires a webhook trigger, and drains in-flight turns on stop", async () => {
@@ -30,6 +30,9 @@ test("webhook authenticates, fires a webhook trigger, and drains in-flight turns
   assert.equal((await post("/elsewhere", "x")).status, 404);
   assert.equal((await post("/hooks/ci", "x".repeat(MAX_BODY_BYTES + 1))).status, 413);
   assert.equal((await post("/hooks/ci", "   ")).status, 400);
+  // Within the byte limit but over the text limit: rejected whole, never truncated.
+  assert.equal((await post("/hooks/ci", "y".repeat(MAX_TEXT_CHARS + 1))).status, 413);
+  assert.equal((await post("/hooks/ci", JSON.stringify({ text: "z".repeat(MAX_TEXT_CHARS + 1) }), { "content-type": "application/json" })).status, 413);
   assert.equal(fired.length, 0);
 
   const accepted = await post("/hooks/ci", JSON.stringify({ text: "Build #7 failed on main" }), { "content-type": "application/json" });

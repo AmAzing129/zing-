@@ -6,7 +6,7 @@ import type { Trigger, ZingPluginAPI } from "zing";
 
 export const WEBHOOK_SOURCE_ID = "webhook";
 export const MAX_BODY_BYTES = 64 * 1024;
-const MAX_TEXT_CHARS = 16_000;
+export const MAX_TEXT_CHARS = 16_000;
 const HOOK_PATH = /^\/hooks\/([A-Za-z0-9][A-Za-z0-9_-]{0,63})$/;
 
 export type WebhookOptions = {
@@ -66,6 +66,11 @@ export async function runWebhookServer(options: WebhookOptions, signal: AbortSig
       reply(response, 400, { error: "empty body" });
       return;
     }
+    // Reject rather than truncate: an accepted request always reaches the agent whole.
+    if (text.length > MAX_TEXT_CHARS) {
+      reply(response, 413, { error: `trigger text exceeds ${MAX_TEXT_CHARS} characters` });
+      return;
+    }
 
     const work = options
       .dispatch({ kind: "webhook", source: `webhook:${match[1]}`, conversationId, text, deliver: "conversation" })
@@ -113,13 +118,13 @@ export function triggerText(body: string, contentType: string | undefined): stri
     try {
       const parsed = JSON.parse(body) as unknown;
       if (parsed && typeof parsed === "object" && typeof (parsed as { text?: unknown }).text === "string") {
-        return (parsed as { text: string }).text.trim().slice(0, MAX_TEXT_CHARS);
+        return (parsed as { text: string }).text.trim();
       }
     } catch {
       // Not JSON after all; fall through to the raw body.
     }
   }
-  return body.trim().slice(0, MAX_TEXT_CHARS);
+  return body.trim();
 }
 
 function authorized(request: IncomingMessage, url: URL, token: Buffer): boolean {

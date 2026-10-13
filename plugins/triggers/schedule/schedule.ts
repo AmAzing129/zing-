@@ -73,14 +73,7 @@ export function createJob(
   }
 
   const raw = spec.at?.trim() ?? "";
-  // Require an explicit offset so "09:00" never silently means the station's local time.
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/.test(raw)) {
-    throw new Error("at must be an ISO 8601 date-time with an offset, for example 2026-10-14T09:00:00+08:00");
-  }
-  const at = Date.parse(raw);
-  if (!Number.isFinite(at)) {
-    throw new Error(`Invalid at: ${raw}`);
-  }
+  const at = parseOffsetDateTime(raw);
   if (at <= now) {
     throw new Error("at must be in the future");
   }
@@ -127,6 +120,30 @@ export function parseJobs(text: string | undefined): ScheduleJob[] {
 
 export function formatJobs(jobs: readonly ScheduleJob[]): string {
   return `${JSON.stringify({ jobs }, null, 2)}\n`;
+}
+
+const OFFSET_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(\.\d+)?)?(Z|([+-])(\d{2}):(\d{2}))$/;
+
+/**
+ * Parse an ISO 8601 date-time with an explicit offset, so "09:00" never silently means the station's local time.
+ * Date.parse rolls impossible dates over (2026-02-30 becomes March 2), so every field is range-checked first.
+ */
+export function parseOffsetDateTime(raw: string): number {
+  const match = OFFSET_DATE_TIME.exec(raw);
+  if (!match) {
+    throw new Error("at must be an ISO 8601 date-time with an offset, for example 2026-10-14T09:00:00+08:00");
+  }
+  const [year, month, day, hour, minute, second = 0, offsetHours = 0, offsetMinutes = 0] = [
+    match[1], match[2], match[3], match[4], match[5], match[6], match[10], match[11],
+  ].map((part) => (part === undefined ? undefined : Number(part))) as number[];
+  const daysInMonth = new Date(Date.UTC(year!, month!, 0)).getUTCDate();
+  if (
+    month! < 1 || month! > 12 || day! < 1 || day! > daysInMonth ||
+    hour! > 23 || minute! > 59 || second > 59 || offsetHours > 23 || offsetMinutes > 59
+  ) {
+    throw new Error(`at is not a valid date-time: ${raw}`);
+  }
+  return Date.parse(raw);
 }
 
 export function validateTimezone(timezone: string): string {

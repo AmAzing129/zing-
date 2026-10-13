@@ -13,6 +13,12 @@ test("createJob accepts exactly one well-formed schedule", () => {
   assert.equal(createJob("c", "ping", { at: "2026-10-13T09:00:00+08:00" }, T0, "UTC").at, Date.parse("2026-10-13T01:00:00Z"));
   assert.throws(() => createJob("c", "ping", { at: "2026-10-13T09:00:00" }, T0, "UTC"), /offset/);
   assert.throws(() => createJob("c", "ping", { at: "2026-10-12T09:00:00Z" }, T0, "UTC"), /future/);
+  // Date.parse would roll these over to another day instead of rejecting them.
+  assert.throws(() => createJob("c", "ping", { at: "2027-02-30T09:00:00Z" }, T0, "UTC"), /not a valid date-time/);
+  assert.throws(() => createJob("c", "ping", { at: "2026-11-31T09:00:00+08:00" }, T0, "UTC"), /not a valid date-time/);
+  assert.throws(() => createJob("c", "ping", { at: "2026-12-01T24:00:00Z" }, T0, "UTC"), /not a valid date-time/);
+  assert.throws(() => createJob("c", "ping", { at: "2027-02-29T09:00:00Z" }, T0, "UTC"), /not a valid date-time/);
+  assert.equal(createJob("c", "ping", { at: "2027-02-28T23:59:59-01:00" }, T0, "UTC").at, Date.parse("2027-03-01T00:59:59Z"));
   assert.throws(() => createJob("c", "ping", { inMinutes: 5, cron: "* * * * *" }, T0, "UTC"), /exactly one/);
   assert.throws(() => createJob("c", "ping", { cron: "*/5 * * * * *" }, T0, "UTC"), /five fields/);
   assert.throws(() => createJob("c", "ping", { cron: "0 9 * * *", timezone: "Mars/Base" }, T0, "UTC"), /Unknown timezone/);
