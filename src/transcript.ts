@@ -81,6 +81,11 @@ export function createTriggerMessage(trigger: TriggerInfo, text: string, at: num
   return message;
 }
 
+/** The trigger behind a message made by createTriggerMessage, if it was not a user message. */
+export function triggerOf(message: AgentMessage): TriggerInfo | undefined {
+  return triggerMessages.get(message)?.trigger;
+}
+
 export function splitConversationId(conversationId: string): { channel: string; localId: string } {
   const cut = conversationId.indexOf(":");
   if (cut <= 0) {

@@ -32,7 +32,7 @@ ZING_HOME=/zing
 
 - 副本数固定为 **1**；禁止滚动更新期间新旧副本重叠写入同一个卷。使用 Recreate/停止后启动语义。
 - 平台停止容器时应向主进程发送 `SIGTERM`。让 `npm start` 成为容器命令，不要用会吞掉信号的 shell 包装器。
-- Zing 内部的强制退出上限为 60 秒；平台应留出至少 65 秒的宽限期，超时后才可发送 `SIGKILL`。
+- Zing 内部的强制退出上限为 60 秒；平台应留出至少 65 秒的宽限期，超时后才可发送 `SIGKILL`。其中前 50 秒用于排空 Channel，届时仍在运行的 turn 会被取消，剩余时间用于记录取消并关闭存储。
 - 不要配置 TCP/HTTP 端口、Service 或 HTTP 探针。若平台强制要求监听端口，它不适合当前运行模式。
 
 `deploy/kubernetes/statefulset.yaml` 是这些约束的 Kubernetes 示例；其他 PaaS 应映射为等价的单副本后台 Worker 和持久卷配置。

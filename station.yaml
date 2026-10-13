@@ -10,3 +10,5 @@ plugins:
   # - ./plugins/triggers/webhook
 
 channel: telegram
+# Optional. durable resumes interrupted turns after a restart; see README.
+# runtime: durable

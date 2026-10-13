@@ -6,7 +6,9 @@ import {
   loadBlueprint,
   withModelOverride,
 } from "./blueprint";
-import { openFileCapsule } from "./capsule";
+import { join } from "node:path";
+
+import { openFileCapsule, resolveCapsulePath } from "./capsule";
 import { registerStdioChannel } from "./channels/stdio";
 import { parseCli, usage } from "./cli";
 import { loadConfig } from "./config";
@@ -18,6 +20,9 @@ import { runStdioAppServer } from "./protocol/index";
 import { defaultStationConfig, findStationConfig, loadStationConfig } from "./station-config";
 
 const SHUTDOWN_TIMEOUT_MS = 60_000;
+/** How long channels drain at a stop; the rest of the forced-exit limit records the cancellation of what is left. */
+const DRAIN_TIMEOUT_MS = SHUTDOWN_TIMEOUT_MS - 10_000;
+const DURABLE_STORAGE_FILE = "durable.sqlite";
 
 async function main(): Promise<void> {
   const cli = parseCli(process.argv.slice(2));
@@ -40,20 +45,24 @@ async function main(): Promise<void> {
 
   const shutdown = new AbortController();
   let host: ZingHost | undefined;
-  let signalExitCode: number | undefined;
-  const stop = (signal: NodeJS.Signals): void => {
+  let forcedExitCode: number | undefined;
+  const stop = (exitCode: number): void => {
     if (shutdown.signal.aborted) {
       return;
     }
-    const exitCode = signal === "SIGINT" ? 130 : 143;
-    signalExitCode = exitCode;
+    forcedExitCode = exitCode;
     process.exitCode = exitCode;
     setTimeout(() => process.exit(exitCode), SHUTDOWN_TIMEOUT_MS).unref();
+    // Turns still running when the drain runs out are canceled, as the legacy runtime does at a stop. A durable one
+    // would otherwise resume after the restart for a caller that is gone, such as an acknowledged Telegram update.
+    setTimeout(() => {
+      void host?.agent.cancelAll().catch((error) => console.error("Canceling turns at shutdown failed", error));
+    }, DRAIN_TIMEOUT_MS).unref();
+    // Let the transport cancel sessions or drain handlers before closing their runtime/storage.
     shutdown.abort();
-    void host?.close().catch((error) => console.error("Zing host cleanup failed", error));
   };
-  const onSigint = () => stop("SIGINT");
-  const onSigterm = () => stop("SIGTERM");
+  const onSigint = () => stop(130);
+  const onSigterm = () => stop(143);
   process.once("SIGINT", onSigint);
   process.once("SIGTERM", onSigterm);
 
@@ -63,9 +72,20 @@ async function main(): Promise<void> {
       blueprintPath ? await loadBlueprint(blueprintPath) : defaultBlueprint(),
       config.model,
     );
+    const capsuleOptions = { blueprint, path: config.capsulePath, home };
     host = await createZingHost({
       blueprint,
-      capsuleFactory: (candidate) => openFileCapsule({ blueprint: candidate, path: config.capsulePath, home }),
+      capsuleFactory: (candidate) => openFileCapsule({ ...capsuleOptions, blueprint: candidate }),
+      durableStorage:
+        config.runtime === "durable"
+          ? async () => {
+              // Loaded only when selected: node:sqlite is still experimental in Node 22.
+              const { openNodeSqliteStorage } = await import("@earendil-works/pi-durable/storage/sqlite/node");
+              return openNodeSqliteStorage(join(resolveCapsulePath(capsuleOptions), DURABLE_STORAGE_FILE));
+            }
+          : undefined,
+      // Exit non-zero so the supervisor restarts the station; reopening the storage resumes the agent.
+      onFatal: () => stop(1),
       pluginPaths: config.pluginPaths,
       provider: config.provider,
       env: process.env,
@@ -79,7 +99,7 @@ async function main(): Promise<void> {
     }
 
     if (cli.mode === "app-server") {
-      console.error(`Agent ${host.agent.name} ${host.agent.agentId} via app-server stdio`);
+      console.error(`Agent ${host.agent.name} ${host.agent.agentId} via app-server stdio (${config.runtime} runtime)`);
       await runStdioAppServer(
         host.agent,
         {
@@ -96,7 +116,7 @@ async function main(): Promise<void> {
     // --once answers one message and exits; background trigger sources only run in a long-lived station.
     const sources = once ? [] : host.registry.listTriggerSources();
     const via = [channel.id, ...sources.map((source) => source.id)].join(", ");
-    console.log(`Agent ${host.agent.name} ${host.agent.agentId} via ${via}`);
+    console.log(`Agent ${host.agent.name} ${host.agent.agentId} via ${via} (${config.runtime} runtime)`);
     await runTriggerSources([channel, ...sources], shutdown.signal);
   } finally {
     try {
@@ -104,8 +124,8 @@ async function main(): Promise<void> {
     } finally {
       process.off("SIGINT", onSigint);
       process.off("SIGTERM", onSigterm);
-      if (signalExitCode !== undefined) {
-        process.exit(signalExitCode);
+      if (forcedExitCode !== undefined) {
+        process.exit(forcedExitCode);
       }
     }
   }

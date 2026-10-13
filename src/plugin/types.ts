@@ -18,6 +18,8 @@ export type IncomingMessage = {
   conversationId: string;
   text: string;
   senderId?: string;
+  /** Stable per-message key, such as a platform update ID, so a redelivered message is answered once. */
+  requestId?: string;
 };
 
 /** What kind of event started a turn. A user message is kind "message"; other kinds are automated. */
@@ -39,6 +41,8 @@ export type Trigger = TriggerInfo & {
   text: string;
   /** A human sender. Only message triggers carry one. */
   senderId?: string;
+  /** Deduplication key scoped to the conversation, e.g. a chat message id; see IncomingMessage.requestId. */
+  requestId?: string;
   /**
    * Where the reply goes. A Route delivers there and becomes the conversation's remembered route;
    * "conversation" delivers to the remembered route. Omitted: the caller consumes the result.

@@ -4,11 +4,43 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { fauxProvider } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, Type } from "@earendil-works/pi-ai";
+import { MemoryStorage } from "@earendil-works/pi-durable";
 
 import type { Blueprint } from "../src/blueprint";
 import { createMemoryCapsule } from "../src/capsule";
 import { createZingHost } from "../src/host";
+
+test("host closes acquired storage on constructor failure and preserves cleanup errors", async () => {
+  for (const failsCleanup of [false, true]) {
+    const storage = new MemoryStorage();
+    let closes = 0;
+    const cleanupError = new Error("storage cleanup failed");
+    storage.close = async () => {
+      closes++;
+      if (failsCleanup) throw cleanupError;
+    };
+    const faux = fauxProvider({ models: [{ id: "host-model" }] });
+    await assert.rejects(createZingHost({
+      blueprint: { name: "broken", tools: [] },
+      capsuleFactory: async () => createMemoryCapsule({ blueprintName: "broken" }),
+      durableStorage: async () => storage,
+      configureRegistry(registry) {
+        registry.api.registerProvider({ pluginId: "fake", provider: faux.provider });
+      },
+    }), (error: unknown) => {
+      if (failsCleanup) {
+        assert.ok(error instanceof AggregateError);
+        assert.match(String(error.errors[0]), /has no model/);
+        assert.strictEqual(error.errors[1], cleanupError);
+      } else {
+        assert.match(String(error), /has no model/);
+      }
+      return true;
+    });
+    assert.equal(closes, 1);
+  }
+});
 
 test("createZingHost injects a capsule factory and closes idempotently", async () => {
   const faux = fauxProvider({ models: [{ id: "host-model" }] });
@@ -31,6 +63,45 @@ test("createZingHost injects a capsule factory and closes idempotently", async (
   const closing = host.close();
   assert.strictEqual(host.close(), closing);
   await closing;
+  assert.throws(() => host.agent.startTurn({ threadId: "closed", text: "nope" }), /shutting down/);
+});
+
+test("createZingHost runs the durable runtime over the storage it is given", async () => {
+  const faux = fauxProvider({ models: [{ id: "host-model" }] });
+  const blueprint: Blueprint = { name: "durable-host", model: "host-model", tools: ["echo"] };
+  const capsule = createMemoryCapsule({ blueprintName: blueprint.name, agentId: "agt_durable" });
+  const conversations: string[] = [];
+  let storageFor: unknown;
+  const host = await createZingHost({
+    blueprint,
+    capsuleFactory: async () => capsule,
+    durableStorage: async (candidate) => {
+      storageFor = candidate;
+      return new MemoryStorage();
+    },
+    configureRegistry(registry) {
+      registry.api.registerProvider({ pluginId: "fake", provider: faux.provider });
+      registry.api.registerTool({
+        name: "echo",
+        description: "Echo",
+        parameters: Type.Object({ text: Type.String() }),
+        execute: async (input, context) => {
+          conversations.push(context.conversationId);
+          return { text: String(input.text) };
+        },
+      });
+    },
+  });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("echo", { text: "hi" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("echoed"),
+  ]);
+
+  assert.strictEqual(storageFor, capsule);
+  assert.equal(host.agent.agentId, "agt_durable");
+  assert.equal((await host.agent.handleMessage({ conversationId: "telegram:9", text: "echo hi" })).text, "echoed");
+  assert.deepEqual(conversations, ["telegram:9"]);
+  await host.close();
   assert.throws(() => host.agent.startTurn({ threadId: "closed", text: "nope" }), /shutting down/);
 });
 

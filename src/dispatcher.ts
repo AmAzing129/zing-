@@ -47,6 +47,7 @@ export function createDispatcher(options: CreateDispatcherOptions): Conversation
       threadId: trigger.conversationId,
       text: trigger.text,
       senderId: trigger.senderId,
+      requestId: trigger.requestId,
       trigger: { kind: trigger.kind, source: trigger.source },
     }).completed;
 

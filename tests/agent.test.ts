@@ -56,6 +56,7 @@ function createTestStation(faux: ReturnType<typeof fauxProvider>) {
   }
   const station: Station = {
     resolveModel: (id) => (id === model.id ? model : { ...model, id, name: id }),
+    models,
     streamFn: models.streamSimple.bind(models),
     getApiKey: () => undefined,
   };

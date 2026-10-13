@@ -1,4 +1,4 @@
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model, UserMessage } from "@earendil-works/pi-ai";
 import { estimateMessageTokens, estimateTextTokens } from "@earendil-works/pi-ai/utils/estimate";
 
@@ -12,7 +12,7 @@ const MIN_SAFETY_MARGIN_TOKENS = 32;
 
 export type ContextWindowPolicy = {
   messageBudget: number;
-  fit: (messages: AgentMessage[]) => AgentMessage[];
+  fit: <T extends AgentMessage>(messages: T[]) => T[];
   currentTurnFits: (messages: AgentMessage[]) => boolean;
   userInputFits: (text: string, hasHistory: boolean) => boolean;
 };
@@ -20,7 +20,7 @@ export type ContextWindowPolicy = {
 export function createContextWindowPolicy(
   model: Model<Api>,
   system: string,
-  tools: readonly AgentTool[],
+  tools: readonly object[],
 ): ContextWindowPolicy {
   const contextWindow = Math.max(1, model.contextWindow);
   const outputReserve = Math.max(
@@ -40,7 +40,7 @@ export function createContextWindowPolicy(
     messageBudget,
     fit: (messages) => fitMessages(messages, messageBudget, omission, omissionTokens),
     currentTurnFits(messages) {
-      const conversation = withoutSystemPrefix(messages);
+      const conversation = messages.filter((message) => message.role !== "system");
       const start = lastUserIndex(conversation);
       if (start < 0) {
         return estimateMessageList(conversation) <= messageBudget;
@@ -55,33 +55,31 @@ export function createContextWindowPolicy(
   };
 }
 
-export function fitMessages(
-  messages: AgentMessage[],
+export function fitMessages<T extends AgentMessage>(
+  messages: T[],
   budget: number,
   omission = omissionMessage(),
   omissionTokens = estimateMessageTokens(omission),
-): AgentMessage[] {
-  // The leading system message carries the prompt and tool declarations; the budget already excludes it.
-  const conversation = withoutSystemPrefix(messages);
-  if (estimateMessageList(conversation) <= budget) {
+): T[] {
+  // System messages carry the prompt and tool declarations; the budget already excludes them, and they are never dropped.
+  if (estimateConversation(messages) <= budget) {
     return messages;
   }
 
-  const starts = userTurnStarts(conversation);
+  const starts = userTurnStarts(messages);
   const currentStart = starts.at(-1);
   if (currentStart === undefined) {
     return messages;
   }
 
   let keptStart = currentStart;
-  let used = omissionTokens + estimateMessageList(conversation.slice(currentStart));
+  let used = omissionTokens + estimateConversation(messages.slice(currentStart));
   for (let index = starts.length - 2; index >= 0; index -= 1) {
     const start = starts[index];
     if (start === undefined) {
       continue;
     }
-    const end = keptStart;
-    const turnTokens = estimateMessageList(conversation.slice(start, end));
+    const turnTokens = estimateConversation(messages.slice(start, keptStart));
     if (used + turnTokens > budget) {
       break;
     }
@@ -89,11 +87,12 @@ export function fitMessages(
     keptStart = start;
   }
 
-  if (keptStart === 0) {
+  const omitted = messages.slice(0, keptStart);
+  if (omitted.every((message) => message.role === "system")) {
     return messages;
   }
-  const system = messages.slice(0, messages.length - conversation.length);
-  return [...system, omission, ...conversation.slice(keptStart)];
+  const system = omitted.filter((message) => message.role === "system");
+  return [...system, omission as T, ...messages.slice(keptStart)];
 }
 
 export function estimateMessageList(messages: readonly AgentMessage[]): number {
@@ -104,12 +103,14 @@ export function estimateMessageList(messages: readonly AgentMessage[]): number {
   return total;
 }
 
-function withoutSystemPrefix(messages: AgentMessage[]): AgentMessage[] {
-  const start = messages.findIndex((message) => message.role !== "system");
-  if (start < 0) {
-    return [];
+function estimateConversation(messages: readonly AgentMessage[]): number {
+  let total = 0;
+  for (const message of messages) {
+    if (message.role !== "system") {
+      total += estimateMessageTokens(message);
+    }
   }
-  return start === 0 ? messages : messages.slice(start);
+  return total;
 }
 
 function userTurnStarts(messages: readonly AgentMessage[]): number[] {

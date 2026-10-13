@@ -1,5 +1,5 @@
 import { type StreamFn } from "@earendil-works/pi-agent-core";
-import { createModels, type Api, type Model } from "@earendil-works/pi-ai";
+import { createModels, type Api, type Model, type Models } from "@earendil-works/pi-ai";
 
 import { findProvider } from "./plugin/registry";
 import type { ModelProvider } from "./plugin/types";
@@ -7,6 +7,8 @@ import type { ModelProvider } from "./plugin/types";
 /** Where a capsule docks: models, keys, and the process that keeps it awake. */
 export type Station = {
   resolveModel: (id: string) => Model<Api>;
+  /** The provider catalog behind streamFn, for runtimes that call pi-ai directly. */
+  models: Models;
   streamFn: StreamFn;
   getApiKey: (provider: string) => string | undefined;
 };
@@ -35,6 +37,7 @@ export function createStation(options: CreateStationOptions): Station {
 
   return {
     resolveModel: (id) => resolveModel(models, providers, id, options.provider),
+    models,
     streamFn: models.streamSimple.bind(models),
     getApiKey: (providerId) => findProvider(providers, providerId)?.getApiKey?.(),
   };

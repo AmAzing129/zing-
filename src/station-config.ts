@@ -4,13 +4,17 @@ import { dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 const STATION_NAMES = ["station.yaml", "station.yml"] as const;
-const STATION_FIELDS = new Set(["plugins", "channel", "provider"]);
+const STATION_FIELDS = new Set(["plugins", "channel", "provider", "runtime"]);
+export const RUNTIME_KINDS = ["legacy", "durable"] as const;
+export type RuntimeKind = (typeof RUNTIME_KINDS)[number];
 
 export type StationConfig = {
   /** Ordered local modules trusted to run inside this station process. */
   plugins: string[];
   channel?: string;
   provider?: string;
+  /** Which agent runtime runs the capsule. Default: legacy. */
+  runtime?: RuntimeKind;
 };
 
 export type FindStationOptions = {
@@ -39,11 +43,23 @@ export function parseStationConfig(
     }
   }
 
+  const runtime = parseRuntimeKind(optionalString(record.runtime, `${source}: runtime`), `${source}: runtime`);
   return {
     plugins: parsePluginPaths(record.plugins, source, baseDir),
     channel: optionalString(record.channel, `${source}: channel`),
     provider: optionalString(record.provider, `${source}: provider`),
+    ...(runtime === undefined ? {} : { runtime }),
   };
+}
+
+export function parseRuntimeKind(value: string | undefined, source: string): RuntimeKind | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!(RUNTIME_KINDS as readonly string[]).includes(value)) {
+    throw new Error(`${source} must be one of ${RUNTIME_KINDS.join(", ")}`);
+  }
+  return value as RuntimeKind;
 }
 
 export async function loadStationConfig(path: string, cwd = process.cwd()): Promise<StationConfig> {

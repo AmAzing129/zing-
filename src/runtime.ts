@@ -68,6 +68,11 @@ export type TurnInput = {
   senderId?: string;
   /** Defaults to a message trigger. */
   trigger?: TriggerInfo;
+  /**
+   * Client deduplication key, scoped to the thread. The durable runtime answers a repeated key with the original
+   * turn's outcome instead of running it again; the legacy runtime ignores it.
+   */
+  requestId?: string;
 };
 
 export type RuntimeEvent =
