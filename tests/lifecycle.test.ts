@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 
-test("SIGTERM exits after cleanup even when an untracked handle remains", async () => {
+test("SIGTERM drains the channel before closing durable storage, even with an untracked handle", async () => {
   const root = await mkdtemp(join(tmpdir(), "zing-lifecycle-"));
   const pluginPath = join(root, "sticky.ts");
   const stationPath = join(root, "station.yaml");
@@ -19,6 +19,9 @@ test("SIGTERM exits after cleanup even when an untracked handle remains", async 
       const timer = setInterval(() => {}, 1000)
       console.log("LIFECYCLE_READY")
       await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }))
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      await zing.host.resetConversation("sticky:drain")
+      console.log("LIFECYCLE_DRAINED")
       void timer
     },
   })
@@ -27,7 +30,7 @@ test("SIGTERM exits after cleanup even when an untracked handle remains", async 
   );
   await writeFile(
     stationPath,
-    `plugins:\n  - ${JSON.stringify(resolve("plugins/providers/xai"))}\nchannel: sticky\nprovider: xai\n`,
+    `plugins:\n  - ${JSON.stringify(resolve("plugins/providers/xai"))}\nchannel: sticky\nprovider: xai\nruntime: durable\n`,
   );
   await writeFile(blueprintPath, "name: lifecycle\nmodel: grok-4.6\ntools: []\n");
 
@@ -49,6 +52,8 @@ test("SIGTERM exits after cleanup even when an untracked handle remains", async 
     },
   );
   let stderr = "";
+  let stdout = "";
+  child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString("utf8"); });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => { stderr += chunk; });
 
@@ -57,6 +62,7 @@ test("SIGTERM exits after cleanup even when an untracked handle remains", async 
     child.kill("SIGTERM");
     const exit = await waitForExit(child, 2_000);
     assert.deepEqual(exit, { code: 143, signal: null }, stderr);
+    assert.match(stdout, /LIFECYCLE_DRAINED/, stderr);
   } finally {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGKILL");

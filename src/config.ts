@@ -1,5 +1,5 @@
 import { splitList } from "./env";
-import type { StationConfig } from "./station-config";
+import { parseRuntimeKind, type RuntimeKind, type StationConfig } from "./station-config";
 
 export type Config = {
   model?: string;
@@ -7,6 +7,7 @@ export type Config = {
   provider?: string;
   capsulePath?: string;
   pluginPaths: string[];
+  runtime: RuntimeKind;
 };
 
 export type LoadConfigOptions = {
@@ -25,6 +26,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, options: LoadCo
     provider: options.provider ?? emptyToUndefined(env.PROVIDER) ?? station?.provider,
     capsulePath: options.capsulePath ?? emptyToUndefined(env.ZING_CAPSULE),
     pluginPaths: [...(station?.plugins ?? []), ...splitList(env.ZING_PLUGINS), ...(options.pluginPaths ?? [])],
+    runtime: parseRuntimeKind(emptyToUndefined(env.ZING_RUNTIME), "ZING_RUNTIME") ?? station?.runtime ?? "legacy",
   };
 }
 

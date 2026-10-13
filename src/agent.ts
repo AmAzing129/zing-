@@ -44,7 +44,7 @@ export const DEFAULT_AGENT_LIMITS: AgentLimits = {
   maxToolCalls: 32,
 };
 
-const OBSERVER_TIMEOUT_MS = 5_000;
+export const OBSERVER_TIMEOUT_MS = 5_000;
 
 export type { AgentLimits, Blueprint } from "./blueprint";
 export type { Capsule, CapsuleIdentity } from "./capsule";
@@ -66,6 +66,8 @@ export type Agent = ConversationHost &
     modelId: string;
     agentId: string;
     close: () => Promise<void>;
+    /** Stop taking turns and cancel every queued and running one; close() still releases the agent afterwards. */
+    cancelAll: () => Promise<void>;
     drainObservers: () => Promise<void>;
   };
 
@@ -253,13 +255,18 @@ export function createAgent(
     });
   };
 
+  const cancelAll = async (): Promise<void> => {
+    closed = true;
+    for (const current of active.values()) {
+      current.canceled = true;
+      current.conversation.abort();
+    }
+  };
+
   const close = (): Promise<void> => {
     closed = true;
     closing ??= (async () => {
-      for (const current of active.values()) {
-        current.canceled = true;
-        current.conversation.abort();
-      }
+      await cancelAll();
       await Promise.all([...pending.values()]);
       await observers.drain();
     })();
@@ -271,6 +278,7 @@ export function createAgent(
     modelId: model.id,
     agentId: resolved.identity.agentId,
     close,
+    cancelAll,
     async drainObservers() {
       await observers.drain();
     },
@@ -533,7 +541,7 @@ function createAbortableAgentTool(tool: AgentTool): AgentTool {
   };
 }
 
-function raceWithAbort<T>(work: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
+export function raceWithAbort<T>(work: Promise<T>, signal: AbortSignal | undefined, message: string): Promise<T> {
   if (!signal) {
     return work;
   }
@@ -561,14 +569,14 @@ function raceWithAbort<T>(work: Promise<T>, signal: AbortSignal | undefined, mes
   });
 }
 
-type TurnController = {
+export type TurnController = {
   handle: TurnHandle;
   emit: (event: RuntimeEvent) => void;
   resolve: (result: AgentResult) => void;
   reject: (error: Error) => void;
 };
 
-function createTurnController(turnId: string, cancel: () => void): TurnController {
+export function createTurnController(turnId: string, cancel: () => void): TurnController {
   const listeners = new Set<(event: RuntimeEvent) => void>();
   let resolve!: (result: AgentResult) => void;
   let reject!: (error: Error) => void;
@@ -657,12 +665,13 @@ function createRuntimeEventCollector(
   };
 }
 
-type ObserverQueue = {
-  notify: (event: ConversationEvent) => void;
+export type ObserverQueue = {
+  /** Settles once every listener has handled, failed, or timed out on this event; it never rejects. */
+  notify: (event: ConversationEvent) => Promise<void>;
   drain: () => Promise<void>;
 };
 
-function createObserverQueue(
+export function createObserverQueue(
   listeners: readonly ConversationListener[],
   timeoutMs: number,
 ): ObserverQueue {
@@ -670,14 +679,17 @@ function createObserverQueue(
 
   return {
     notify(event) {
+      const handled: Promise<void>[] = [];
       for (const listener of listeners) {
         const previous = tails.get(listener) ?? Promise.resolve();
         const tail = previous.then(() => runConversationListener(listener, event, timeoutMs));
         tails.set(listener, tail);
+        handled.push(tail);
         void tail.finally(() => {
           if (tails.get(listener) === tail) tails.delete(listener);
         });
       }
+      return Promise.all(handled).then(() => undefined);
     },
     async drain() {
       while (tails.size > 0) {
@@ -723,7 +735,7 @@ function lastAssistantMessage(messages: AgentMessage[]) {
   return undefined;
 }
 
-function normalizeThreadId(value: string): string {
+export function normalizeThreadId(value: string): string {
   const threadId = value.trim();
   if (
     !threadId ||
@@ -735,11 +747,11 @@ function normalizeThreadId(value: string): string {
   return threadId;
 }
 
-function createRuntimeId(prefix: "msg" | "thr" | "turn"): string {
+export function createRuntimeId(prefix: "msg" | "thr" | "turn"): string {
   return `${prefix}_${randomUUID().replaceAll("-", "")}`;
 }
 
-function decodeCursor(cursor: string | undefined): number {
+export function decodeCursor(cursor: string | undefined): number {
   if (cursor === undefined) {
     return 0;
   }
@@ -759,11 +771,11 @@ function decodeCursor(cursor: string | undefined): number {
   return offset;
 }
 
-function encodeCursor(offset: number): string {
+export function encodeCursor(offset: number): string {
   return Buffer.from(String(offset), "utf8").toString("base64url");
 }
 
-function normalizeLimit(limit: number | undefined): number {
+export function normalizeLimit(limit: number | undefined): number {
   if (limit === undefined) {
     return 50;
   }
@@ -773,7 +785,7 @@ function normalizeLimit(limit: number | undefined): number {
   return Math.min(limit, 100);
 }
 
-function toThreadEntry(event: TranscriptEvent): ThreadEntry {
+export function toThreadEntry(event: TranscriptEvent): ThreadEntry {
   if (event.type === "reset") {
     throw new Error("Reset marker cannot be exposed as a thread entry");
   }
@@ -801,11 +813,11 @@ function toThreadEntry(event: TranscriptEvent): ThreadEntry {
   };
 }
 
-function toError(error: unknown): Error {
+export function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-function resolveAgentLimits(
+export function resolveAgentLimits(
   blueprint: Partial<AgentLimits> | undefined,
   overrides: Partial<AgentLimits> | undefined,
 ): AgentLimits {

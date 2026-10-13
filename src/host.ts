@@ -1,3 +1,5 @@
+import type { Storage } from "@earendil-works/pi-durable";
+
 import { createAgent, type Agent } from "./agent";
 import { resolveBlueprintTools, type Blueprint } from "./blueprint";
 import type { Capsule } from "./capsule";
@@ -19,6 +21,10 @@ export type CreateZingHostOptions = {
   env?: NodeJS.ProcessEnv;
   cwd?: string;
   configureRegistry?: (registry: PluginRegistry) => void | Promise<void>;
+  /** Run the capsule on the durable runtime, over the storage this opens. Absent: the legacy runtime. */
+  durableStorage?: (capsule: Capsule) => Promise<Storage>;
+  /** The durable runtime stopped after a storage failure it cannot recover from in this process. */
+  onFatal?: (error: Error) => void;
 };
 
 export type ZingHost = {
@@ -36,14 +42,41 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
     options.cwd,
   );
 
+  let closeStorage: (() => Promise<void>) | undefined;
   try {
     const station = createStation({ providers: registry.listProviders(), provider: options.provider });
     const capsule = await options.capsuleFactory(options.blueprint);
     const tools = resolveBlueprintTools(options.blueprint, registry);
-    const agent = createAgent(station, options.blueprint, capsule, {
-      tools,
-      listeners: registry.listListeners(),
-    });
+    const agentOptions = { tools, listeners: registry.listListeners() };
+    // pi-durable loads TypeBox and Chord; a legacy station never imports it.
+    let agent: Agent;
+    if (options.durableStorage) {
+      const { createDurableAgent } = await import("./durable");
+      const { BACKGROUND_CONTEXT } = await import("@earendil-works/chord/context");
+      const acquired = await options.durableStorage(capsule);
+      let closing: Promise<void> | undefined;
+      const close: Storage["close"] = (context) => {
+        closing ??= Promise.resolve().then(() => acquired.close(context));
+        return closing;
+      };
+      closeStorage = () => close(BACKGROUND_CONTEXT);
+      // Both constructor failure cleanup and the harness may close storage. Share one attempt,
+      // including its rejection, and preserve the receiver of storage implementations' methods.
+      const storage = new Proxy(acquired, {
+        get(target, key) {
+          if (key === "close") return close;
+          const value = Reflect.get(target, key, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      agent = await createDurableAgent(station, options.blueprint, capsule, {
+        ...agentOptions,
+        storage,
+        onFatal: options.onFatal,
+      });
+    } else {
+      agent = createAgent(station, options.blueprint, capsule, agentOptions);
+    }
     registry.bindHost(agent);
 
     let closing: Promise<void> | undefined;
@@ -56,7 +89,7 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
       },
     };
   } catch (error) {
-    return closeAfterFailure(error, closePlugins);
+    return closeAfterFailure(error, closePlugins, closeStorage);
   }
 }
 
@@ -77,11 +110,21 @@ async function closeHost(agent: Agent, closePlugins: () => void | Promise<void>)
   }
 }
 
-async function closeAfterFailure(error: unknown, closePlugins: () => void | Promise<void>): Promise<never> {
-  try {
-    await closePlugins();
-  } catch (cleanupError) {
-    throw new AggregateError([error, cleanupError], "Zing host creation and cleanup failed");
+async function closeAfterFailure(
+  error: unknown,
+  closePlugins: () => void | Promise<void>,
+  closeStorage?: () => Promise<void>,
+): Promise<never> {
+  const errors = [error];
+  for (const cleanup of [closeStorage, closePlugins]) {
+    try {
+      await cleanup?.();
+    } catch (cleanupError) {
+      errors.push(cleanupError);
+    }
+  }
+  if (errors.length > 1) {
+    throw new AggregateError(errors, "Zing host creation and cleanup failed");
   }
   throw error;
 }

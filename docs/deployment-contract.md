@@ -8,6 +8,7 @@
 - **一个 Capsule 只能有一个写者。** 不得让两个进程或副本共享并写入同一个 `ZING_HOME`；文件锁、共享卷或调度亲和性都不能把多写者变成受支持配置。
 - `ZING_HOME` 必须位于可靠的 **POSIX 持久存储**上，并在重启、重新部署和主机维护后保留。不要使用容器可写层或临时目录。
 - 备份 `ZING_HOME` 时应先停止进程，或使用能够提供一致时间点快照的存储。恢复时仍只能启动一个写者。
+- 选择 `runtime: durable` 时，Capsule 目录中还会有 `durable.sqlite`（及其 `-wal`、`-shm` 文件）。它使用 Node 内置的 `node:sqlite`，同样只允许一个写者；备份时需连同这些文件一起保存。
 - 云数据库只是外部工具或数据源，**不是 Zing 的计算环境，也不能代替 `ZING_HOME`**。当前不支持用 Postgres 存储 Capsule。
 
 此工作单元不提供 Webhook、Serverless、Postgres 或横向扩展方案。Zing 是后台常驻进程；平台必须允许它持续运行并优雅停止。

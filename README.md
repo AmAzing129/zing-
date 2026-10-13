@@ -86,6 +86,23 @@ limits:
 
 A turn that exceeds a limit ends as `failed`, but its completed transcript remains durable. Plugin tools receive an `AbortSignal` through `ToolContext`; Zing stops waiting once a turn is canceled or out of budget, even if a plugin does not cooperate.
 
+### Durable runtime (experimental)
+
+By default the capsule keeps each thread as a JSONL transcript, written when a turn ends. A crash mid-turn loses that turn. Set `runtime: durable` in `station.yaml` (or `ZING_RUNTIME=durable`) to run the capsule on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable) instead:
+
+- Every user message, model response, and tool result is committed to `durable.sqlite` in the capsule before it is shown.
+- A restarted station resumes the turns it left unfinished. An interrupted tool call is not run again; the model receives an `interrupted` result and continues.
+- A redelivered message with the same request ID returns the original turn's outcome without running it again. Telegram keys requests by bot, chat, and message ID, not the reusable update ID.
+- Threads, turns, events, limits, plugins, and the App Server protocol behave as before. Existing JSONL threads are imported, from their last reset, the first time the durable runtime opens the capsule; the JSONL files stay untouched, so switching back to `legacy` does not see later turns.
+
+A graceful station stop first stops intake and drains the channel. Telegram finishes in-flight replies; App Server protocol v1 cancels its connection's turns and waits for cancellation before the runtime closes. The drain lasts at most 50 seconds: turns still running then are canceled, as the legacy runtime does at a stop, and their callers are told (Telegram replies with its failure message). None of them resumes after the restart for a caller that is gone, and the rest of the 60-second forced-exit limit records the cancellation. Directly closing the runtime leaves unfinished, uncanceled turns pending for restart.
+
+A resumed turn keeps its spent model/tool budget and its persisted deadline: downtime counts toward the timeout. A budget failure is stored in the submission itself, and startup cancels any leftover execution before resuming tasks. The first committed terminal outcome wins; a timeout queued behind an admitted answer commit cannot retroactively turn that answer into a failure. Observers use one settlement path for live turns, recovery, and redelivery, with durable per-turn acknowledgments rather than a global settlement watermark (pi-durable 1.1.0 does not expose a settlement-ordered replay log).
+
+Turn deduplication is not exactly-once reply delivery. Telegram acknowledges an update before its handler finishes during shutdown; a crash during that drain still loses the reply, and the turn then resumes without a recipient. There is no durable reply outbox yet, and a crash after sending but before acknowledging can cause a repeated reply. Existing `update:*` request IDs from earlier preview revisions are not migrated to the new Telegram keys.
+
+An unreadable JSONL thread is reported and left unavailable without blocking other threads; its history is never replaced with an empty conversation. Import runs once per thread: switching back to legacy, adding messages, and switching to durable again does not merge those later JSONL messages. pi-durable is experimental upstream, so Zing pins its exact version.
+
 ## Deployment environments
 
 The same Zing runtime can be deployed independently on a VPS, a Mac mini, or a single-replica container platform. The current supported contract is intentionally narrow: one resident Node.js 22 process, one writer for each Capsule, and a persistent POSIX filesystem mounted at `ZING_HOME`. Each deployment can keep its own agent and Capsule without changing application code.

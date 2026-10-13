@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { Bot } from "grammy";
+import { Bot, type Transformer } from "grammy";
 
 import telegram, { parseAllowedUserIds, splitMessage } from "../plugins/channels/telegram/index";
 import type { ConversationHost } from "../src/agent";
@@ -40,6 +40,77 @@ test("telegram plugin loads through its directory entry", async () => {
   const registry = createPluginRegistry({ host });
   await loadPlugin(registry, fileURLToPath(new URL("../plugins/channels/telegram", import.meta.url)));
   assert.equal(registry.getChannel("telegram")?.id, "telegram");
+});
+
+test("telegram drains in-flight replies and keys requests by bot, chat and message", async () => {
+  const originalStart = Bot.prototype.start;
+  const originalStop = Bot.prototype.stop;
+  const requests: string[] = [];
+  const replies: string[] = [];
+  try {
+    for (const fail of [false, true]) {
+      let release!: () => void;
+      let entered!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const handling = new Promise<void>((resolve) => { entered = resolve; });
+      Bot.prototype.start = async function () {
+        this.botInfo = {
+          id: fail ? 456 : 123, is_bot: true, first_name: "Test", username: "test_bot",
+          can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false,
+          can_connect_to_business: false, has_main_web_app: false, has_topics_enabled: false,
+          allows_users_to_create_topics: false, can_manage_bots: false, supports_join_request_queries: false,
+        };
+        const transform: Transformer = async (_previous, method, payload) => {
+          if (method === "sendMessage") replies.push((payload as { text: string }).text);
+          return { ok: true, result: true } as never;
+        };
+        this.api.config.use(transform);
+        for (const [updateId, chatId, messageId] of [[7, 9, 1], [8, 9, 1], [7, 9, 2], [7, 10, 1]]) {
+          await this.handleUpdate({
+            update_id: updateId!,
+            message: {
+              message_id: messageId!, date: 1,
+              from: { id: 1, is_bot: false, first_name: "User" },
+              chat: { id: chatId!, type: "private", first_name: "User" }, text: "hello",
+            },
+          });
+        }
+      };
+      Bot.prototype.stop = async () => {};
+      const registry = createPluginRegistry({
+        env: { TELEGRAM_BOT_TOKEN: "123:test" },
+        host: {
+          resetConversation() {},
+          async handleMessage(message) {
+            requests.push(message.requestId!);
+            entered();
+            await gate;
+            if (fail) throw new Error("expected failure");
+            return { text: "completed" };
+          },
+        },
+      });
+      telegram(registry.api);
+      const controller = new AbortController();
+      const running = registry.getChannel("telegram")!.start(controller.signal);
+      await handling;
+      controller.abort();
+      let settled = false;
+      void running.then(() => { settled = true; });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false);
+      release();
+      await running;
+    }
+    assert.deepEqual(requests, [
+      "telegram:123:9:1", "telegram:123:9:1", "telegram:123:9:2", "telegram:123:10:1",
+      "telegram:456:9:1", "telegram:456:9:1", "telegram:456:9:2", "telegram:456:10:1",
+    ]);
+    assert.deepEqual(replies, [...Array(4).fill("completed"), ...Array(4).fill("调用失败，请稍后再试。")]);
+  } finally {
+    Bot.prototype.start = originalStart;
+    Bot.prototype.stop = originalStop;
+  }
 });
 
 test("telegram channel waits for its asynchronous stop before resolving", async () => {
