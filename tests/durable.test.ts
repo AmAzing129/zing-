@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,6 +17,7 @@ import {
   type Context,
   type FauxResponseStep,
 } from "@earendil-works/pi-ai";
+import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { MemoryStorage, type StorageWrite } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 
@@ -26,6 +27,7 @@ import { createMemoryCapsule, openFileCapsule, type Capsule } from "../src/capsu
 import { CONTEXT_OMISSION_TEXT } from "../src/context";
 import { createDurableAgent, type CreateDurableAgentOptions } from "../src/durable";
 import type { ConversationEvent, IncomingMessage, Tool, ToolContext } from "../src/plugin/index";
+import { loadSkills } from "../src/skills";
 import type { Station } from "../src/station";
 
 const WEB_SEARCH = "web_search";
@@ -1305,6 +1307,88 @@ test("durable: threads from a file capsule continue with their live history", as
   });
   assert.equal((await reopened.readThread("telegram:1")).entries.length, 6);
   await reopened.close();
+});
+
+async function weeklyReportSkill() {
+  const root = await mkdtemp(join(tmpdir(), "zing-durable-skills-"));
+  await mkdir(join(root, "weekly-report"));
+  await writeFile(
+    join(root, "weekly-report", "SKILL.md"),
+    "---\nname: weekly-report\ndescription: Write my weekly report.\n---\nList three highlights first.\n",
+  );
+  return loadSkills([join(root, "weekly-report")]);
+}
+
+/** Responses that load the weekly-report skill and record what each request offered. */
+function loadSkillResponses() {
+  const seen = { systems: [] as string[], systemMessages: [] as number[], tools: [] as string[][], results: [] as string[] };
+  const responses = [
+    (context: Context) => {
+      seen.systems.push(getCurrentSystemPrompt(context.messages));
+      seen.systemMessages.push(context.messages.filter((message) => message.role === "system").length);
+      seen.tools.push(getCurrentTools(context.messages).map((tool) => tool.name));
+      return fauxAssistantMessage([fauxToolCall("skill", { name: "weekly-report" })], { stopReason: "toolUse" });
+    },
+    (context: Context) => {
+      const last = context.messages.at(-1);
+      seen.results.push(last?.role === "toolResult" ? contentText(last.content, "") : "");
+      return fauxAssistantMessage("report");
+    },
+  ];
+  return { seen, responses };
+}
+
+test("durable: skills give the same prompt and tools as the legacy runtime, also in an imported thread", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-skills-import-"));
+  const skills = await weeklyReportSkill();
+  const { faux, model, station } = createTestStation();
+  const blueprint = blueprintFor(model.id);
+  const legacy = createAgent(station, blueprint, await openFileCapsule({ blueprint, path: dir }), { tools: [webSearch], skills });
+  const before = loadSkillResponses();
+  faux.setResponses(before.responses);
+  await legacy.handleMessage({ conversationId: "telegram:1", text: "weekly report" });
+  await legacy.close();
+
+  const agent = await createDurableAgent(station, blueprint, await openFileCapsule({ blueprint, path: dir }), {
+    storage: await openNodeSqliteStorage(join(dir, "durable.sqlite")),
+    tools: [webSearch],
+    skills,
+  });
+  const after = loadSkillResponses();
+  faux.setResponses(after.responses);
+  assert.equal((await agent.handleMessage({ conversationId: "telegram:1", text: "again" })).text, "report");
+  assert.match(before.seen.systems[0] ?? "", /^be brief\n\n<skills>\n[^]*\n- weekly-report: Write my weekly report\.\n<\/skills>$/);
+  assert.deepEqual(after.seen.systems, before.seen.systems);
+  assert.deepEqual(after.seen.systemMessages, [1], "the imported baseline already matches the skills section");
+  assert.deepEqual(after.seen.tools, [["web_search", "skill"]]);
+  assert.deepEqual(after.seen.results, ["List three highlights first."]);
+  await agent.close();
+});
+
+test("durable: skills listed after a thread started reach it on the next start", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-skills-later-"));
+  const file = join(dir, "durable.sqlite");
+  const { faux, model, station } = createTestStation();
+  const before = await createDurableAgent(station, blueprintFor(model.id), undefined, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [webSearch],
+  });
+  faux.setResponses([fauxAssistantMessage("hello")]);
+  await before.handleMessage({ conversationId: "telegram:1", text: "hi" });
+  await before.close();
+
+  const after = await createDurableAgent(station, blueprintFor(model.id), undefined, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [webSearch],
+    skills: await weeklyReportSkill(),
+  });
+  const { seen, responses } = loadSkillResponses();
+  faux.setResponses(responses);
+  await after.handleMessage({ conversationId: "telegram:1", text: "weekly report" });
+  assert.match(seen.systems[0] ?? "", /<skills>\n[^]*- weekly-report: Write my weekly report\.\n<\/skills>$/);
+  assert.deepEqual(seen.tools, [["web_search", "skill"]]);
+  assert.deepEqual(seen.results, ["List three highlights first."]);
+  await after.close();
 });
 
 test("durable: close ends waiting turns, cancels queued ones, and rejects new work", async () => {

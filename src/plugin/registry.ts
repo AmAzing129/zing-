@@ -1,4 +1,5 @@
 import { requireEnv } from "../env";
+import { SKILL_TOOL_NAME } from "../skills";
 import { conversationId } from "./ids";
 import type { Channel, ConversationHost, ConversationListener, ModelProvider, Tool, ZingPluginAPI } from "./types";
 
@@ -79,6 +80,9 @@ export function createPluginRegistry(
       const name = tool.name.trim();
       if (!TOOL_NAME.test(name)) {
         throw new Error(`Invalid tool name: ${tool.name}. Use 1-64 lowercase letters, digits, or underscores.`);
+      }
+      if (name === SKILL_TOOL_NAME) {
+        throw new Error(`Tool name ${name} is reserved: Zing provides it for the skills listed in agent.yaml`);
       }
       if (tools.has(name)) {
         throw new Error(`Tool already registered: ${name}`);

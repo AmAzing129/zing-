@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -103,6 +103,37 @@ test("createZingHost runs the durable runtime over the storage it is given", asy
   assert.deepEqual(conversations, ["telegram:9"]);
   await host.close();
   assert.throws(() => host.agent.startTurn({ threadId: "closed", text: "nope" }), /shutting down/);
+});
+
+test("createZingHost loads the blueprint's skills before it opens the capsule", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zing-host-skills-"));
+  await mkdir(join(root, "trip"));
+  await writeFile(join(root, "trip", "SKILL.md"), "---\nname: trip\ndescription: Plan trips.\n---\nPack light.\n");
+  await mkdir(join(root, "broken"));
+  await writeFile(join(root, "broken", "SKILL.md"), "no frontmatter\n");
+  const faux = fauxProvider({ models: [{ id: "host-model" }] });
+  let opened = 0;
+  const create = (skills: string[]) =>
+    createZingHost({
+      blueprint: { name: "skilled", model: "host-model", tools: [], skills },
+      capsuleFactory: async () => (opened++, createMemoryCapsule({ blueprintName: "skilled" })),
+      configureRegistry(registry) {
+        registry.api.registerProvider({ pluginId: "fake", provider: faux.provider });
+      },
+    });
+
+  await assert.rejects(create([join(root, "trip"), join(root, "broken")]), /broken\/SKILL\.md: must start with YAML frontmatter/);
+  assert.equal(opened, 0);
+
+  const host = await create([join(root, "trip")]);
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("skill", { name: "trip" })], { stopReason: "toolUse" }),
+    (context) => fauxAssistantMessage(context.messages.at(-1)?.role === "toolResult" ? "loaded" : "missing"),
+  ]);
+  assert.equal((await host.agent.handleMessage({ conversationId: "chat:trip", text: "plan" })).text, "loaded");
+  const entries = (await host.agent.readThread("chat:trip")).entries;
+  assert.deepEqual(entries[2]?.type === "toolResult" && entries[2].content, [{ type: "text", text: "Pack light." }]);
+  await host.close();
 });
 
 test("createZingHost disposes loaded plugins when construction fails", async () => {
