@@ -6,6 +6,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 COPY plugins/channels/telegram/package.json plugins/channels/telegram/package.json
 COPY plugins/tools/mcp/package.json plugins/tools/mcp/package.json
+COPY plugins/triggers/schedule/package.json plugins/triggers/schedule/package.json
 RUN npm ci
 
 COPY tsconfig.json agent.yaml station.yaml ./

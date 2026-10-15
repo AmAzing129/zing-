@@ -19,6 +19,7 @@ import type {
   ConversationListener,
   IncomingMessage,
   Tool,
+  TriggerInfo,
 } from "./plugin/types";
 import {
   RuntimeError,
@@ -35,7 +36,8 @@ import {
 } from "./runtime";
 import { composeSystemPrompt, withSkillTool, type Skill } from "./skills";
 import type { Station } from "./station";
-import { encodeMessages, type TranscriptEvent } from "./transcript";
+import { createTriggerMessage, encodeMessages, type TranscriptEvent } from "./transcript";
+import { MESSAGE_TRIGGER, normalizeTriggerInfo } from "./trigger";
 
 export const DEFAULT_SYSTEM =
   "You are a helpful, concise assistant. Reply in the user's language.";
@@ -61,7 +63,7 @@ export type {
   TurnInput,
 } from "./runtime";
 
-export type Agent = ConversationHost &
+export type Agent = Pick<ConversationHost, "handleMessage" | "resetConversation"> &
   AgentRuntime & {
     name: string;
     modelId: string;
@@ -158,6 +160,7 @@ export function createAgent(
   const startTurn = (input: TurnInput): TurnHandle => {
     ensureOpen();
     const threadId = normalizeThreadId(input.threadId);
+    const trigger = normalizeTriggerInfo(input.trigger, input.senderId);
     const turnId = createRuntimeId("turn");
     let cancelRequested = false;
     const controller = createTurnController(turnId, () => {
@@ -179,6 +182,7 @@ export function createAgent(
           type: "turn",
           conversationId: threadId,
           senderId: input.senderId,
+          trigger,
           capsule: capsuleRef,
           status,
           entries: encodeMessages(persisted).map(toThreadEntry),
@@ -207,6 +211,7 @@ export function createAgent(
         const result = await conversation.prompt(
           input.text,
           input.senderId,
+          trigger,
           createRuntimeEventCollector(threadId, turnId, controller.emit),
           (fresh) => { persisted = fresh; },
         );
@@ -366,6 +371,7 @@ class Conversation {
   private readonly limits: AgentLimits;
   private readonly context: ContextWindowPolicy;
   private senderId?: string;
+  private trigger: TriggerInfo = MESSAGE_TRIGGER;
   private activeBudget?: ActiveBudget;
   private abortFailure?: TurnBudgetExceededError;
   private persisted: number;
@@ -379,6 +385,7 @@ class Conversation {
       createAgentTool(tool, {
         conversationId: options.conversationId,
         senderId: () => this.senderId,
+        trigger: () => this.trigger,
         capsule: {
           agentId: options.capsule.identity.agentId,
           state: options.capsule.state,
@@ -453,10 +460,13 @@ class Conversation {
   async prompt(
     message: string,
     senderId?: string,
+    trigger: TriggerInfo = MESSAGE_TRIGGER,
     onEvent?: (event: AgentEvent) => void,
     onPersisted?: (fresh: AgentMessage[]) => void,
   ): Promise<AgentResult> {
     this.senderId = senderId;
+    this.trigger = trigger;
+    const input = createTriggerMessage(trigger, message, Date.now());
     const budget: ActiveBudget = { modelTurns: 0, toolCalls: 0 };
     this.activeBudget = budget;
     this.abortFailure = undefined;
@@ -464,13 +474,13 @@ class Conversation {
 
     let runError: unknown;
     try {
-      if (!this.context.userInputFits(message, this.inner.state.messages.some((entry) => entry.role !== "system"))) {
+      if (!this.context.userInputFits(contentText(input.content), this.inner.state.messages.some((entry) => entry.role !== "system"))) {
         throw new TurnBudgetExceededError(
           "context",
           `User input exceeded its ${this.context.messageBudget}-token context budget`,
         );
       }
-      await this.inner.prompt(message);
+      await this.inner.prompt(input);
     } catch (error) {
       runError = error;
     } finally {
@@ -512,6 +522,7 @@ class Conversation {
 type ToolScope = {
   conversationId: string;
   senderId: () => string | undefined;
+  trigger: () => TriggerInfo;
   capsule: CapsuleRef;
 };
 
@@ -526,6 +537,7 @@ function createAgentTool(tool: Tool, scope: ToolScope): AgentTool {
         signal: signal ?? new AbortController().signal,
         conversationId: scope.conversationId,
         senderId: scope.senderId(),
+        trigger: scope.trigger(),
         capsule: scope.capsule,
       });
       return {
@@ -795,7 +807,9 @@ export function toThreadEntry(event: TranscriptEvent): ThreadEntry {
     throw new Error("Reset marker cannot be exposed as a thread entry");
   }
   if (event.type === "user") {
-    return { type: "user", at: event.at, content: event.content };
+    return event.trigger
+      ? { type: "user", at: event.at, content: event.content, trigger: event.trigger }
+      : { type: "user", at: event.at, content: event.content };
   }
   if (event.type === "assistant") {
     return {

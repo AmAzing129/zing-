@@ -70,6 +70,7 @@ test("brave plugin normalizes untrusted input and forwards the abort signal", as
     const context: ToolContext = {
       signal: controller.signal,
       conversationId: "test:input-boundary",
+      trigger: { kind: "message" },
       capsule: capsuleRef,
     };
 
@@ -95,6 +96,7 @@ test("brave resolves BRAVE_API_KEY lazily", async () => {
   const context: ToolContext = {
     signal: new AbortController().signal,
     conversationId: "test:1",
+    trigger: { kind: "message" },
     capsule: capsuleRef,
   };
   await assert.rejects(() => tool.execute({ query: "zing" }, context), /BRAVE_API_KEY/);

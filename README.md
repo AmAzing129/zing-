@@ -36,7 +36,8 @@ That keeps Zing small and makes it yours. You can write the small piece of code 
 
 Plugins can provide:
 
-- **Channels** — where messages arrive, such as Telegram.
+- **Channels** — where messages arrive and replies leave, such as Telegram.
+- **Trigger sources** — other things that wake the agent, such as a schedule or a webhook.
 - **Model providers** — which model serves the blueprint's model ID.
 - **Tools** — explicit capabilities the model may call, from web search to your own APIs.
 - **Memory** — a projection of useful conversation facts, rather than a second transcript.
@@ -63,6 +64,25 @@ skills:
 ```
 
 The model sees each listed skill's name and description and loads the full instructions with the built-in `skill` tool only when a request needs them. A skill is text: it cannot add tools beyond the blueprint's allowlist, and Zing never runs its scripts. See [`skills/README.md`](skills/README.md) for the format and rules.
+
+## Triggers: the agent can speak first
+
+Everything that wakes the agent is a **trigger**. A user message is the trigger of kind `message`; a scheduled job (`schedule`) or an incoming webhook (`webhook`) is another kind, and a plugin can define more. Every trigger runs one turn in a conversation through the same path:
+
+```diagram
+┌────────────────┐ message  ┌──────────────┐  turn   ┌─────────┐
+│ Channel        │─────────▶│              │────────▶│ Agent   │
+│ (Telegram)     │          │  dispatcher  │◀────────│ capsule │
+└────────────────┘          │              │  reply  └─────────┘
+┌────────────────┐ schedule │ remembers a  │
+│ Trigger source │─────────▶│ route per    │────────▶ channel.send(route)
+│ schedule, hook │ webhook  │ conversation │
+└────────────────┘          └──────────────┘
+```
+
+A trigger may ask for its reply to be delivered. A user message delivers to the chat it came from, and the dispatcher remembers that route for the conversation. A schedule or webhook asks for delivery to the conversation's remembered route, so the reply reaches the user without the user speaking first. An empty reply stays silent.
+
+Automated triggers are framed for the model as `[trigger kind=… source=… at=…; automated event, not typed by the user]`, stored with their kind in the transcript, and never inherit a human sender's trust. The included [`schedule`](plugins/triggers/schedule) plugin lets the agent schedule one-shot or cron jobs for itself (`schedule_create`, `schedule_list`, `schedule_cancel`). The opt-in [`webhook`](plugins/triggers/webhook) plugin turns an authenticated `POST /hooks/<name>` into a trigger. Trigger sources run alongside the channel in a long-running station, not with `--once` or `app-server`.
 
 ## A runtime, not a UI
 
@@ -112,7 +132,7 @@ A resumed turn keeps its spent model/tool budget and its persisted deadline: dow
 
 A storage error stops the runtime: pi-durable does not retry it, so the station stops taking turns and exits non-zero for its supervisor to restart it. The restart continues from what was committed. A turn in flight is told it resumes after the restart, including a canceled one whose cancellation had not been committed yet.
 
-Turn deduplication is not exactly-once reply delivery. Telegram acknowledges an update before its handler finishes during shutdown; a crash during that drain still loses the reply, and the turn then resumes without a recipient. There is no durable reply outbox yet, and a crash after sending but before acknowledging can cause a repeated reply. Existing `update:*` request IDs from earlier preview revisions are not migrated to the new Telegram keys.
+Turn deduplication is not exactly-once reply delivery. Telegram acknowledges an update before its handler finishes during shutdown; a crash during that drain still loses the reply, and the turn then resumes without a recipient. There is no durable reply outbox yet, and a crash after sending but before acknowledging can cause a repeated reply. The same holds for schedule and webhook triggers: a trigger turn interrupted by a crash resumes and is recorded, but its reply is not delivered, and the scheduler does not fire that job again. Existing `update:*` request IDs from earlier preview revisions are not migrated to the new Telegram keys.
 
 An unreadable JSONL thread is reported and left unavailable without blocking other threads; its history is never replaced with an empty conversation. Import runs once per thread: switching back to legacy, adding messages, and switching to durable again does not merge those later JSONL messages. pi-durable is experimental upstream, so Zing pins its exact version.
 
@@ -127,11 +147,11 @@ Checked-in profiles cover:
 - A Mac mini with launchd — use [`deploy/launchd/com.zing.agent.plist`](deploy/launchd/com.zing.agent.plist).
 - Kubernetes or a similar container platform — start from the single-replica [`deploy/kubernetes/statefulset.yaml`](deploy/kubernetes/statefulset.yaml).
 
-Read the full [deployment contract](docs/deployment-contract.md) before operating a long-lived instance. In particular, do not run two processes against one Capsule. A managed cloud database is storage, not an agent execution environment: the host composition now accepts a `CapsuleFactory`, and plugins use backend-neutral Capsule state, but this repository does not yet ship a Postgres adapter, webhook channel, or serverless execution model.
+Read the full [deployment contract](docs/deployment-contract.md) before operating a long-lived instance. In particular, do not run two processes against one Capsule. A managed cloud database is storage, not an agent execution environment: the host composition now accepts a `CapsuleFactory`, and plugins use backend-neutral Capsule state, but this repository does not yet ship a Postgres adapter or serverless execution model. The webhook trigger is an opt-in plugin that opens a port inside the same single process.
 
 ## Run it with Docker
 
-The checked-in [`station.yaml`](station.yaml) enables xAI, Telegram, Brave Search, and Notes. Telegram is the default everyday door; the `zing-data` volume preserves the agent behind it.
+The checked-in [`station.yaml`](station.yaml) enables xAI, Telegram, Brave Search, Notes, and Schedule. Telegram is the default everyday door; the `zing-data` volume preserves the agent behind it.
 
 1. Create a bot with [BotFather](https://t.me/BotFather) and copy its token. Find your numeric Telegram ID with [@userinfobot](https://t.me/userinfobot).
 2. Create your local secrets file:

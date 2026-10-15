@@ -1,4 +1,4 @@
-import { Bot, type Context } from "grammy";
+import { Api, Bot, type Context } from "grammy";
 import type { ZingPluginAPI } from "zing";
 
 export const TELEGRAM_LIMIT = 4096;
@@ -6,13 +6,23 @@ export const START_TEXT =
   "直接发消息就行。需要时效或核实的信息时我会去网上查。\n/reset 开启新对话。";
 
 export default function telegram(zing: ZingPluginAPI) {
+  let api: Api | undefined;
+  const getApi = (): Api => (api ??= new Api(zing.requireEnv("TELEGRAM_BOT_TOKEN")));
+
   zing.registerChannel({
     id: "telegram",
+    async send({ to, text }) {
+      const chatId = /^-?\d+$/.test(to) ? Number(to) : to;
+      for (const chunk of splitMessage(text)) {
+        await getApi().sendMessage(chatId, chunk);
+      }
+    },
     async start(signal) {
       signal.throwIfAborted();
       const token = zing.requireEnv("TELEGRAM_BOT_TOKEN");
       const allowedUserIds = parseAllowedUserIds(zing.env.TELEGRAM_ALLOWED_USER_IDS);
       const bot = new Bot(token);
+      api = bot.api;
 
       bot.use(async (ctx, next) => {
         if (!isAllowed(ctx, allowedUserIds)) {
@@ -37,16 +47,16 @@ export default function telegram(zing: ZingPluginAPI) {
         const stopTyping = keepTyping(ctx);
 
         try {
-          const result = await zing.host.handleMessage({
+          // The reply leaves through send(); the route also lets later triggers reach this chat.
+          await zing.host.dispatch({
+            kind: "message",
             conversationId: conversation,
             text: ctx.message.text,
             senderId: ctx.from?.id !== undefined ? String(ctx.from.id) : undefined,
+            deliver: { channel: "telegram", to: String(ctx.chat.id) },
             // Message IDs are stable on redelivery; update IDs may be reused after inactivity.
             requestId: `telegram:${ctx.me.id}:${ctx.chat.id}:${ctx.message.message_id}`,
           });
-          for (const chunk of splitMessage(result.text || "(empty response)")) {
-            await ctx.reply(chunk);
-          }
         } catch (error) {
           console.error("agent run failed", { conversationId: conversation, error });
           await ctx.reply("调用失败，请稍后再试。");

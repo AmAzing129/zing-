@@ -11,7 +11,7 @@
 - 选择 `runtime: durable` 时，Capsule 目录中还会有 `durable.sqlite`（及其 `-wal`、`-shm` 文件）。它使用 Node 内置的 `node:sqlite`，同样只允许一个写者；备份时需连同这些文件一起保存。
 - 云数据库只是外部工具或数据源，**不是 Zing 的计算环境，也不能代替 `ZING_HOME`**。当前不支持用 Postgres 存储 Capsule。
 
-此工作单元不提供 Webhook、Serverless、Postgres 或横向扩展方案。Zing 是后台常驻进程；平台必须允许它持续运行并优雅停止。
+此工作单元不提供 Serverless、Postgres 或横向扩展方案。可选的 webhook trigger 插件在同一个进程内监听端口，默认不启用，部署模板也不暴露该端口。Zing 是后台常驻进程；平台必须允许它持续运行并优雅停止。
 
 ## 配置与密钥
 

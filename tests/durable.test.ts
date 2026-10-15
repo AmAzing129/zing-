@@ -453,6 +453,7 @@ test("durable: observers receive completed, failed, and canceled turns and reset
     type: "turn",
     conversationId: "chat:observed",
     senderId: "alice",
+    trigger: { kind: "message" },
     agentId: agent.agentId,
     status: "completed",
     entries: snapshot.entries,

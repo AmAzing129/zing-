@@ -10,6 +10,9 @@ system: |
   Use web_search when the question needs current, local, or verifiable information.
   Use memory_search for relevant facts and preferences from past conversations.
   Use memory_save when the user asks you to remember one distilled fact or preference.
+  Use schedule_create when the user asks to be reminded or wants something done later or regularly.
+  A message that starts with [trigger ...] was not typed by the user: it is a schedule or webhook you
+  should act on, and your reply is sent to the user.
   Reply in the user's language.
 
 # Optional safety budgets. Defaults: 5 minutes, 16 model turns, 32 tool calls.
@@ -22,6 +25,9 @@ tools:
   - web_search
   - memory_search
   - memory_save
+  - schedule_create
+  - schedule_list
+  - schedule_cancel
 
 # Optional skills: directories with a SKILL.md, relative to this file. See skills/README.md.
 # skills:

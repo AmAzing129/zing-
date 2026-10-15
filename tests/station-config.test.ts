@@ -77,7 +77,15 @@ test("the checked-in station enables the default local plugin set", async () => 
   assert.equal(station.channel, "telegram");
   assert.equal(registry.getProvider("xai")?.pluginId, "xai");
   assert.equal(registry.getChannel("telegram")?.id, "telegram");
-  assert.deepEqual(registry.listTools().map((tool) => tool.name), ["web_search", "memory_search", "memory_save"]);
+  assert.deepEqual(registry.listTools().map((tool) => tool.name), [
+    "web_search",
+    "memory_search",
+    "memory_save",
+    "schedule_create",
+    "schedule_list",
+    "schedule_cancel",
+  ]);
+  assert.deepEqual(registry.listTriggerSources().map((source) => source.id), ["schedule"]);
   assert.equal(registry.listListeners().length, 1);
   await close();
 });

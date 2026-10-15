@@ -4,6 +4,7 @@ import {
   type CapsuleState,
   type ConversationListener,
   type ToolContext,
+  type TriggerInfo,
   type ZingPluginAPI,
 } from "zing";
 
@@ -45,7 +46,7 @@ type MutationResult = { writable: boolean; changed: boolean };
 const tails = new WeakMap<CapsuleState, Promise<unknown>>();
 
 export type Notes = {
-  classify: (senderId?: string) => MemoryOrigin;
+  classify: (senderId?: string, trigger?: TriggerInfo) => MemoryOrigin;
   search: (capsule: CapsuleRef, query: string, limit?: number, signal?: AbortSignal) => Promise<MemoryRecallHit[]>;
   save: (capsule: CapsuleRef, conversationId: string, text: string, origin: MemoryOrigin, at?: number, signal?: AbortSignal) => Promise<boolean>;
   observe: ConversationListener;
@@ -53,8 +54,10 @@ export type Notes = {
 
 export function createNotes(env: NodeJS.ProcessEnv = process.env): Notes {
   const owners = new Set((env.ZING_MEMORY_OWNER_IDS ?? "").split(",").map((id) => id.trim()).filter(Boolean));
-  const classify = (senderId?: string): MemoryOrigin =>
-    owners.size ? (senderId && owners.has(senderId) ? "owner" : "untrusted") : senderId === undefined ? "owner" : "untrusted";
+  // Only a human message can come from the owner; schedules, webhooks, and other automated triggers cannot.
+  const classify = (senderId?: string, trigger?: TriggerInfo): MemoryOrigin =>
+    trigger && trigger.kind !== "message" ? "untrusted"
+      : owners.size ? (senderId && owners.has(senderId) ? "owner" : "untrusted") : senderId === undefined ? "owner" : "untrusted";
 
   const enqueue = <T>(capsule: CapsuleRef, run: () => Promise<T>, signal?: AbortSignal): Promise<T> => {
     const previous = tails.get(capsule.state) ?? Promise.resolve();
@@ -114,7 +117,7 @@ export function createNotes(env: NodeJS.ProcessEnv = process.env): Notes {
     },
     async observe(event, signal) {
       if (event.type !== "turn" || event.entries.length === 0) return;
-      const origin = classify(event.senderId);
+      const origin = classify(event.senderId, event.trigger);
       await mutate(event.capsule, (store) => {
         let changed = false;
         if (origin === "owner") for (const entry of event.entries) {
@@ -150,7 +153,7 @@ export default function notesPlugin(zing: ZingPluginAPI) {
     async execute(input, context: ToolContext) {
       context.signal.throwIfAborted();
       const text = collapse(String(input.text)).slice(0, 280);
-      const origin = notes.classify(context.senderId);
+      const origin = notes.classify(context.senderId, context.trigger);
       const saved = await notes.save(context.capsule, context.conversationId, text, origin, undefined, context.signal);
       const details: JsonValue = { saved, origin };
       return { text: saved ? `Saved: ${text}` : `Already remembered: ${text}`, details };

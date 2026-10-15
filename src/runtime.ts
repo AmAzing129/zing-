@@ -1,4 +1,4 @@
-import type { AgentResult } from "./plugin/types";
+import type { AgentResult, TriggerInfo } from "./plugin/types";
 
 export const PROTOCOL_VERSION = 1;
 
@@ -20,6 +20,8 @@ export type ThreadEntry =
       type: "user";
       at: number;
       content: string | Array<ThreadTextContent | ThreadImageContent>;
+      /** Present when an automated trigger, not a user message, started the turn. */
+      trigger?: TriggerInfo;
     }
   | {
       type: "assistant";
@@ -64,6 +66,8 @@ export type TurnInput = {
   threadId: ThreadId;
   text: string;
   senderId?: string;
+  /** Defaults to a message trigger. */
+  trigger?: TriggerInfo;
   /**
    * Client deduplication key, scoped to the thread. The durable runtime answers a repeated key with the original
    * turn's outcome instead of running it again; the legacy runtime ignores it.
