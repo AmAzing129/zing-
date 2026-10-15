@@ -35,6 +35,7 @@ import {
   type SubmissionId,
   type Submission,
   type SubmissionRecord,
+  type ToolExecutionResult,
   type ToolRegistration,
   type Tx,
 } from "@earendil-works/pi-durable";
@@ -71,6 +72,14 @@ import {
   type TurnHandle,
   type TurnInput,
 } from "./runtime";
+import {
+  composeSystemPrompt,
+  renderSkillCatalog,
+  SKILL_TOOL_NAME,
+  SKILLS_SECTION,
+  tagSection,
+  withSkillTool,
+} from "./skills";
 import type { Station } from "./station";
 import { encodeMessages, triggerOf } from "./transcript";
 import { MESSAGE_TRIGGER, normalizeTriggerInfo, renderTriggerText } from "./trigger";
@@ -82,8 +91,6 @@ const SYSTEM_SECTION = "system";
 const EVENT_DRAIN_TIMEOUT_MS = 1_000;
 const ENTRY_PAGE_SIZE = 256;
 const BUDGET_FAILURE_PREFIX = "zing:budget:";
-/** Delays before retrying a write that enforces a turn's outcome; the last one repeats until the write commits. */
-const RETRY_DELAYS_MS = [50, 250, 1_000];
 
 type ThreadRecord = { conversationId: number; updatedAt: number };
 /** Keys are threadKey(threadId): opaque IDs such as `__proto__` must not reach plain-object keys. */
@@ -151,8 +158,9 @@ export type CreateDurableAgentOptions = CreateAgentOptions & {
   /** One process owns a storage at a time; pi-durable has no cross-process locking. */
   storage: Storage;
   /**
-   * Called once when storage fails in a way pi-durable cannot recover from in this process. The agent has already
-   * stopped taking work and is closing; reopening the storage, normally by restarting the station, resumes it.
+   * Called once, with the storage error, when a storage error has failed pi-durable's Session: pi-durable retries
+   * nothing, so this process can do no more work. The agent has already stopped taking work and is closing; reopening
+   * the storage, normally by restarting the station, resumes it.
    */
   onFatal?: (error: Error) => void;
 };
@@ -190,11 +198,13 @@ export async function createDurableAgent(
   const model = station.resolveModel(blueprint.model);
   const modelRef = { provider: model.provider, modelId: model.id };
   const system = blueprint.system ?? DEFAULT_SYSTEM;
+  const skills = options.skills ?? [];
+  const catalog = renderSkillCatalog(skills);
   const limits = resolveAgentLimits(blueprint.limits, options.limits);
-  const tools = options.tools ?? [];
+  const tools = withSkillTool(options.tools ?? [], skills);
   const capsuleRef: CapsuleRef = { agentId: resolved.identity.agentId, state: resolved.state };
   const observers = createObserverQueue(options.listeners ?? [], options.observerTimeoutMs ?? OBSERVER_TIMEOUT_MS);
-  const policy = createContextWindowPolicy(model, system, tools);
+  const policy = createContextWindowPolicy(model, composeSystemPrompt(system, skills), tools);
 
   const threads = new Map<string, ConversationId>();
   const threadOf = new Map<number, string>();
@@ -209,7 +219,8 @@ export async function createDurableAgent(
   /** cancelAll() ran: no turn may run any more, including one admitted while it was canceling. */
   let canceling = false;
   let closing: Promise<void> | undefined;
-  let fatal: Error | undefined;
+  /** A storage error failed the Session, which then closed itself. */
+  let sessionFailed = false;
 
   const close = (): Promise<void> => {
     closed = true;
@@ -235,40 +246,12 @@ export async function createDurableAgent(
       try {
         await current?.close(CONTEXT);
       } catch (error) {
-        if (!fatal) throw error;
+        if (!sessionFailed) throw error;
       }
       await Promise.all([...pending.values()]);
       await observers.drain();
     })();
     return closing;
-  };
-
-  /** A poisoned Session rejects every later commit; only reopening the storage recovers it. */
-  const checkFatal = (error: unknown): void => {
-    if (fatal || !isPoisoned(error)) return;
-    fatal = toError(error);
-    console.error("Durable storage failed; the agent stops until the station restarts", fatal);
-    void close();
-    options.onFatal?.(fatal);
-  };
-
-  /** Surface a poisoned Session after a failure whose own error is the storage's, not pi-durable's. */
-  const probe = async (): Promise<void> => {
-    try {
-      await harness?.commit(() => undefined, CONTEXT);
-    } catch (error) {
-      checkFatal(error);
-    }
-  };
-
-  /** Run a public operation that touches storage, checking the Session when it fails unexpectedly. */
-  const guarded = async <T>(work: () => Promise<T>): Promise<T> => {
-    try {
-      return await work();
-    } catch (error) {
-      if (!(error instanceof RuntimeError)) await probe();
-      throw error;
-    }
   };
 
   const ensureOpen = (): void => {
@@ -285,33 +268,27 @@ export async function createDurableAgent(
   };
 
   /**
-   * Run storage work a turn depends on (its failure, its abort, its observation) until it succeeds. A run waiting in a
-   * model call or tool reaches no hook that could issue it again, a hook's error does not stop its run, and a missed
-   * observation would wait for the next start. Gives up once the Session is fatal or the agent is closing: the next
-   * start resumes the run and replays its observation.
+   * Run storage work a turn depends on: its failure, its abort, its observation. It is not retried: a storage error
+   * fails the Session, and every later call would fail the same way. The next start resumes the run and replays its
+   * observation.
    */
-  const persist = async <T>(what: string, write: () => Promise<T>): Promise<T | undefined> => {
-    for (let attempt = 0; ; attempt += 1) {
-      try {
-        return await write();
-      } catch (error) {
-        await probe();
-        if (fatal || !harness || closing) return undefined;
-        if (attempt === 0) console.warn(`durable ${what} failed; retrying`, error);
-        const delay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)];
-        await new Promise((resolve) => setTimeout(resolve, delay));
-      }
+  const attempt = async <T>(what: string, work: () => Promise<T>): Promise<T | undefined> => {
+    try {
+      return await work();
+    } catch (error) {
+      if (!closed) console.warn(`durable ${what} failed`, error);
+      return undefined;
     }
   };
 
   const stop = (budget: TurnBudget): void => {
-    budget.aborting ??= persist("conversation abort", () => budget.conversation.abort(CONTEXT));
+    budget.aborting ??= attempt("conversation abort", () => budget.conversation.abort(CONTEXT));
   };
 
   const fail = async (budget: TurnBudget, failure: TurnBudgetExceededError): Promise<void> => {
     // The submission is the only outcome authority. In particular, a deadline waiting behind an answer commit
     // must not rewrite that answer. Abort cleanup may lag this commit; startup fences it before resuming tasks.
-    const failed = await persist("turn failure", () =>
+    const failed = await attempt("turn failure", () =>
       budget.conversation.commit(async (tx) => {
         const record = await tx.submissionByRequest(budget.conversation.id, budget.requestId);
         if (!record || isSettled(record)) return false;
@@ -355,8 +332,8 @@ export async function createDurableAgent(
 
   /**
    * The budget of the run a hook fires in. Limits never depend on this process's memory alone: if it has no budget for
-   * the run (for example after a storage read failed while its caller waited), the run's request, and with it its
-   * deadline and spend, come from durable state.
+   * the run (for example one still stopping after its turn settled), the run's request, and with it its deadline and
+   * spend, come from durable state.
    */
   const budgetOf = async (id: ConversationId): Promise<TurnBudget | undefined> => {
     const known = budgets.get(id);
@@ -393,15 +370,20 @@ export async function createDurableAgent(
 
   const extension = defineExtension({
     name: EXTENSION_NAME,
-    sections: [section(SYSTEM_SECTION, () => system, { tag: false })],
-    tools: tools.map((tool) =>
-      createDurableTool(tool, {
+    sections: [
+      section(SYSTEM_SECTION, () => system, { tag: false }),
+      ...(catalog === undefined ? [] : [section(SKILLS_SECTION, () => catalog)]),
+    ],
+    tools: tools.map((tool) => {
+      const registration = createDurableTool(tool, {
         threadOf: (id) => threadOf.get(id) ?? String(id),
         senderOf: async (id, api) => (await api.snapshot(TurnDoc, id, CONTEXT))?.senderId,
         triggerOf: async (id, api) => (await api.snapshot(TurnDoc, id, CONTEXT))?.trigger ?? MESSAGE_TRIGGER,
         capsule: capsuleRef,
-      }),
-    ),
+      });
+      // Loading a skill only reads, so a call a crash interrupted runs again instead of failing.
+      return tool.name === SKILL_TOOL_NAME ? { ...registration, replay: "safe" as const } : registration;
+    }),
     hooks: [
       hook(GenerationTask, {
         beforeRequest: async ({ messages }, api, context) => {
@@ -488,7 +470,10 @@ export async function createDurableAgent(
   const baseline = (): Message => ({
     role: "system",
     content: "",
-    sections: { [SYSTEM_SECTION]: system },
+    sections: {
+      [SYSTEM_SECTION]: system,
+      ...(catalog === undefined ? {} : { [SKILLS_SECTION]: tagSection(SKILLS_SECTION, catalog) }),
+    },
     ...(tools.length === 0 ? {} : { toolsAdded: tools.map((tool) => toToolDeclaration(tool)) }),
     timestamp: Date.now(),
   });
@@ -572,9 +557,8 @@ export async function createDurableAgent(
           if (state.turns) pruneTurns(state.turns);
         }, CONTEXT),
       )
-      .catch(async (error: unknown) => {
+      .catch((error: unknown) => {
         // Left unobserved: the next start reports the turn again.
-        await probe();
         if (!closed) console.warn("durable turn observation was not recorded", error);
       });
     marking.add(marked);
@@ -619,7 +603,7 @@ export async function createDurableAgent(
    * redelivery.
    */
   const observeSettled = async (threadId: string, id: ConversationId, record: SubmissionRecord): Promise<void> => {
-    await persist("turn observation", async () => {
+    await attempt("turn observation", async () => {
       const conversation = await open().conversation(id, CONTEXT);
       if (!conversation) return;
       // A run settled by a limit may still be stopping; the rest of its transcript arrives with its abort.
@@ -640,7 +624,7 @@ export async function createDurableAgent(
     let requestId: string | undefined;
     void enqueue(threadId, async () => {
       try {
-        const record = await persist("recovered turn", async () => {
+        const record = await attempt("recovered turn", async () => {
           const submission = await open().submission(submissionId, CONTEXT);
           return submission === undefined ? null : await submission.wait(CONTEXT);
         });
@@ -668,10 +652,7 @@ export async function createDurableAgent(
         registry,
         // Zing fits model context itself; keep the original transcript and make no summarization calls.
         settings: { compaction: { enabled: false } },
-        onReport: (error) => {
-          console.warn("durable runtime report", error);
-          void probe();
-        },
+        onReport: (error) => console.warn("durable runtime report", error),
       },
       CONTEXT,
     );
@@ -742,6 +723,20 @@ export async function createDurableAgent(
         recoveries.push({ threadId, id, submissionId });
       }
     }
+    const opened = harness;
+    // Runs synchronously as the Session starts closing, before the call that hit a storage error sees it.
+    opened.subscribeClose(() => {
+      if (harness !== opened) return;
+      sessionFailed = true;
+      closed = true;
+    });
+    void opened.closed.then((end) => {
+      if (end.reason !== "failed") return;
+      const error = toError(end.error);
+      console.error("Durable storage failed; the agent stops until the station restarts", error);
+      void close();
+      options.onFatal?.(error);
+    });
     resumed = true;
     for (const { threadId, id, submissionId } of recoveries) observeRecovered(threadId, id, submissionId);
     harness.resume();
@@ -874,8 +869,12 @@ export async function createDurableAgent(
         controller.emit({ type: "turn/completed", threadId, turnId, status: "completed", result });
         controller.resolve(result);
       } catch (error) {
-        if (!(error instanceof TurnCanceledError || error instanceof TurnBudgetExceededError)) await probe();
-        const shuttingDown = closed && !settledRecord && !(error instanceof TurnCanceledError) && !turn?.canceled;
+        // After a storage failure an unsettled turn resumes on restart, even a canceled one whose abort did not commit.
+        const shuttingDown =
+          closed &&
+          !settledRecord &&
+          !(error instanceof TurnCanceledError) &&
+          (sessionFailed || turn?.canceled !== true);
         const canceled = settledRecord
           ? error instanceof TurnCanceledError
           : !shuttingDown &&
@@ -901,16 +900,7 @@ export async function createDurableAgent(
         if (active.get(threadId)?.turnId === turnId) active.delete(threadId);
         // The caller has its outcome; later events of the run are not this turn's to report.
         await stream?.stop().catch(() => undefined);
-        // A run its caller stopped waiting for (a failed read, say) goes on, keeping its budget and deadline. It is
-        // observed once it settles, before the next turn of this thread starts.
-        const detached = turn && submitted && !settledRecord ? { turn, submission: submitted } : undefined;
-        if (detached) {
-          const record = await persist("turn settlement", () => detached.submission.wait(CONTEXT));
-          if (record) {
-            settledRecord = record;
-            await observeSettled(threadId, detached.turn.conversation.id, record);
-          }
-        }
+        // A submitted turn stops waiting unsettled only when the Session closes; its run resumes on the next start.
         if (turn && (settledRecord || !submitted)) releaseBudget(turn.conversation.id, turn);
         // The next turn of this thread starts only once this one's abort is done.
         await turn?.aborting;
@@ -938,7 +928,7 @@ export async function createDurableAgent(
     canceling = true;
     closed = true;
     const stopping: TurnBudget[] = [];
-    for (const record of (await guarded(() => open().inspect(CONTEXT))).submissions) {
+    for (const record of (await open().inspect(CONTEXT)).submissions) {
       if (record.type !== "input") continue;
       let budget = budgets.get(record.conversationId);
       if (!budget) {
@@ -957,16 +947,11 @@ export async function createDurableAgent(
     ensureOpen();
     const normalized = normalizeThreadId(threadId);
     return enqueue(normalized, async () => {
-      try {
-        const { conversation } = await ensureConversation(normalized);
-        await conversation.waitForIdle(CONTEXT);
-        await conversation.reset(undefined, CONTEXT);
-        await conversation.waitForIdle(CONTEXT);
-        await touch(normalized);
-      } catch (error) {
-        await probe();
-        throw error;
-      }
+      const { conversation } = await ensureConversation(normalized);
+      await conversation.waitForIdle(CONTEXT);
+      await conversation.reset(undefined, CONTEXT);
+      await conversation.waitForIdle(CONTEXT);
+      await touch(normalized);
       observers.notify({ type: "reset", conversationId: normalized, capsule: capsuleRef });
     });
   };
@@ -992,18 +977,18 @@ export async function createDurableAgent(
     async openThread(threadId) {
       ensureOpen();
       const normalized = normalizeThreadId(threadId ?? createRuntimeId("thr"));
-      const { created } = await guarded(() => ensureConversation(normalized));
+      const { created } = await ensureConversation(normalized);
       return { threadId: normalized, created };
     },
     async readThread(threadId) {
       const normalized = normalizeThreadId(threadId);
-      const conversation = await guarded(() => findConversation(normalized));
+      const conversation = await findConversation(normalized);
       if (!conversation) {
         throw new RuntimeError("THREAD_NOT_FOUND", `Thread not found: ${normalized}`);
       }
-      const view = await guarded(() => conversation.context(CONTEXT));
-      const live = await guarded(() => open().snapshot(LiveDoc, conversation.id, CONTEXT));
-      const triggers = await guarded(() => open().snapshot(TriggerDoc, conversation.id, CONTEXT));
+      const view = await conversation.context(CONTEXT);
+      const live = await open().snapshot(LiveDoc, conversation.id, CONTEXT);
+      const triggers = await open().snapshot(TriggerDoc, conversation.id, CONTEXT);
       return {
         threadId: normalized,
         status: live?.run ? "active" : "idle",
@@ -1011,7 +996,7 @@ export async function createDurableAgent(
       };
     },
     async listThreads(options?: ListThreadsOptions) {
-      const snapshot = await guarded(() => open().snapshot(ThreadsDoc, CONTEXT));
+      const snapshot = await open().snapshot(ThreadsDoc, CONTEXT);
       const all = Object.entries(snapshot?.threads ?? {}).flatMap(([key, record]) => {
         const threadId = threadIdOf(key);
         return threadId === undefined ? [] : [{ threadId, updatedAt: record.updatedAt }];
@@ -1044,7 +1029,8 @@ export function createDurableTool(tool: Tool, scope: ToolScope): ToolRegistratio
     parameters: tool.parameters,
     // Zing's context policy bounds model input; don't silently truncate the durable transcript a second time.
     outputLimits: { maxBytes: Number.MAX_SAFE_INTEGER, maxLines: Number.MAX_SAFE_INTEGER },
-    execute: async (input, api, context) => {
+    // Typed so a renamed result field fails to compile: pi-durable ignores unknown fields, and its fields are optional.
+    execute: async (input, api, context): Promise<ToolExecutionResult> => {
       const signal = context.abortSignal ?? new AbortController().signal;
       const work = (async () =>
         tool.execute(input as Record<string, unknown>, {
@@ -1056,7 +1042,7 @@ export function createDurableTool(tool: Tool, scope: ToolScope): ToolRegistratio
         }))();
       const result = await raceWithAbort(work, signal, `${tool.name} aborted`);
       return {
-        content: [{ type: "text", text: result.text }],
+        output: [{ type: "text", text: result.text }],
         // Match JSONL serialization: omit undefined properties and apply toJSON (for example Date).
         details: JSON.parse(JSON.stringify(result.details ?? null)) as JsonValue,
       };
@@ -1276,13 +1262,6 @@ async function outcome(conversation: Conversation, record: SubmissionRecord): Pr
     throw new Error(`Turn was not answered: ${record.reason}`);
   }
   throw new Error(`Turn ended in unexpected state: ${record.status}`);
-}
-
-function isPoisoned(error: unknown): boolean {
-  for (let current = error; current instanceof Error; current = current.cause) {
-    if (current.message.startsWith("Session is poisoned")) return true;
-  }
-  return false;
 }
 
 function isSettled(record: SubmissionRecord): boolean {

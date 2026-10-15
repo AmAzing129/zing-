@@ -12,7 +12,7 @@ const fixtures = fileURLToPath(new URL("./fixtures/agents", import.meta.url));
 
 test("parseBlueprint reads identity, model, system, and tools", () => {
   assert.deepEqual(parseBlueprint({ name: "alice", description: "A researcher", model: "grok", system: "Brief.", tools: ["web_search"] }, "memory"), {
-    name: "alice", description: "A researcher", model: "grok", system: "Brief.", source: "memory", limits: undefined, tools: ["web_search"],
+    name: "alice", description: "A researcher", model: "grok", system: "Brief.", source: "memory", limits: undefined, tools: ["web_search"], skills: [],
   });
 });
 
@@ -33,6 +33,27 @@ test("tools must be a unique list of exact valid strings", () => {
   assert.throws(() => parseBlueprint({ name: "a", tools: ["market__*"] }), /invalid tool name/);
   assert.throws(() => parseBlueprint({ name: "a", tools: { ["web" + ".search@1"]: "brave" } }), message);
   assert.throws(() => parseBlueprint({ name: "a", tools: { allow: ["web_search"] } }), message);
+});
+
+test("skills are local paths resolved from the blueprint file's directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zing-blueprint-skills-"));
+  const path = join(root, "agents", "agent.yaml");
+  await mkdir(join(root, "agents"));
+  await writeFile(path, "name: skilled\nskills:\n  - ./skills/weekly-report\n  - ../shared/trip-planner\n  - /opt/skills/tax\n");
+  assert.deepEqual((await loadBlueprint(path, "/elsewhere")).skills, [
+    join(root, "agents", "skills", "weekly-report"),
+    join(root, "shared", "trip-planner"),
+    "/opt/skills/tax",
+  ]);
+  assert.deepEqual(parseBlueprint({ name: "plain" }).skills, []);
+  assert.throws(() => parseBlueprint({ name: "a", skills: "./skills/x" }), /skills must be a list of skill directory paths/);
+  assert.throws(() => parseBlueprint({ name: "a", skills: ["weekly-report"] }), /must be a path starting with \.\/, \.\.\/, or \//);
+  assert.throws(() => parseBlueprint({ name: "a", skills: ["./skills/x", "skills/../skills/x/"] }), /must be a path/);
+  assert.throws(() => parseBlueprint({ name: "a", skills: ["./skills/x", "./skills/../skills/x/"] }, "agent.yaml", "/base"), /duplicate skill path/);
+});
+
+test("the skill tool is reserved and cannot be listed", () => {
+  assert.throws(() => parseBlueprint({ name: "a", tools: ["skill"] }), /tool "skill" is reserved/);
 });
 
 test("name is required", () => assert.throws(() => parseBlueprint({ tools: [] }, "x.yaml"), /name is required/));

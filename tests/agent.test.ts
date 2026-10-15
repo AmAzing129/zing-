@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -14,6 +14,7 @@ import {
   Type,
   type Context,
 } from "@earendil-works/pi-ai";
+import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 
 import { createAgent } from "../src/agent";
 import type { Blueprint } from "../src/blueprint";
@@ -21,6 +22,7 @@ import { createMemoryCapsule, openCapsule } from "../src/capsule";
 import { CONTEXT_OMISSION_TEXT } from "../src/context";
 import { createPluginRegistry } from "../src/plugin/index";
 import type { ConversationEvent, ConversationListener, Tool, ToolContext } from "../src/plugin/index";
+import { loadSkills } from "../src/skills";
 import type { Station } from "../src/station";
 
 const WEB_SEARCH_TOOL_NAME = "web_search";
@@ -88,6 +90,40 @@ test("an agent can run with no tools", async () => {
   assert.equal((await agent.handleMessage({ conversationId: "stdio:none", text: "hello" })).text, "plain answer");
 });
 
+
+test("listed skills reach the system prompt and load through the skill tool", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zing-agent-skills-"));
+  await mkdir(join(root, "weekly-report"));
+  await writeFile(
+    join(root, "weekly-report", "SKILL.md"),
+    "---\nname: weekly-report\ndescription: Write my weekly report.\n---\nList three highlights first.\n",
+  );
+  const { faux, model, station } = createTestHarness();
+  const agent = createAgent(station, testBlueprint(model.id), undefined, {
+    tools: [webSearch],
+    skills: await loadSkills([join(root, "weekly-report")]),
+  });
+  const systems: string[] = [];
+  const offered: string[][] = [];
+  const results: string[] = [];
+  faux.setResponses([
+    (context: Context) => {
+      systems.push(getCurrentSystemPrompt(context.messages));
+      offered.push(getCurrentTools(context.messages).map((tool) => tool.name));
+      return fauxAssistantMessage([fauxToolCall("skill", { name: "weekly-report" })], { stopReason: "toolUse" });
+    },
+    (context: Context) => {
+      const last = context.messages.at(-1);
+      results.push(last?.role === "toolResult" ? contentText(last.content, "") : "");
+      return fauxAssistantMessage("report");
+    },
+  ]);
+
+  assert.equal((await agent.handleMessage({ conversationId: "chat:skills", text: "weekly report please" })).text, "report");
+  assert.match(systems[0] ?? "", /^be brief\n\n<skills>\n[^]*\n- weekly-report: Write my weekly report\.\n<\/skills>$/);
+  assert.deepEqual(offered, [["web_search", "skill"]]);
+  assert.deepEqual(results, ["List three highlights first."]);
+});
 
 test("an agent requires an explicit model id", () => {
   const { station } = createTestHarness();

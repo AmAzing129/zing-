@@ -34,6 +34,7 @@ import {
   type TurnHandle,
   type TurnInput,
 } from "./runtime";
+import { composeSystemPrompt, withSkillTool, type Skill } from "./skills";
 import type { Station } from "./station";
 import { createTriggerMessage, encodeMessages, type TranscriptEvent } from "./transcript";
 import { MESSAGE_TRIGGER, normalizeTriggerInfo } from "./trigger";
@@ -75,6 +76,8 @@ export type Agent = Pick<ConversationHost, "handleMessage" | "resetConversation"
 
 export type CreateAgentOptions = {
   tools?: readonly Tool[];
+  /** Skills the blueprint lists, loaded. They add a prompt section and the skill tool. */
+  skills?: readonly Skill[];
   limits?: Partial<AgentLimits>;
   listeners?: readonly ConversationListener[];
   observerTimeoutMs?: number;
@@ -91,7 +94,9 @@ export function createAgent(
   }
   const resolved = capsule ?? createMemoryCapsule({ blueprintName: blueprint.name });
   const model = station.resolveModel(blueprint.model);
-  const system = blueprint.system ?? DEFAULT_SYSTEM;
+  const skills = options?.skills ?? [];
+  const system = composeSystemPrompt(blueprint.system ?? DEFAULT_SYSTEM, skills);
+  const tools = withSkillTool(options?.tools ?? [], skills);
   const limits = resolveAgentLimits(blueprint.limits, options?.limits);
   const conversations = new Map<string, Conversation>();
   const pending = new Map<string, Promise<void>>();
@@ -114,7 +119,7 @@ export function createAgent(
       conversation = new Conversation({
         station,
         modelId: model.id,
-        tools: options?.tools ?? [],
+        tools,
         limits,
         system,
         capsule: resolved,

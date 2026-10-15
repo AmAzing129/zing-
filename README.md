@@ -54,6 +54,17 @@ tools:
 
 See [`plugins/README.md`](plugins/README.md) for the local plugin contract, activation rules, and included implementations.
 
+### Skills
+
+Plugins give an agent capabilities; skills teach it how to use them for one kind of task, such as writing your weekly report. A skill is a directory with a `SKILL.md` in the [Agent Skills](https://agentskills.io) format, listed by path in the blueprint:
+
+```yaml
+skills:
+  - ./skills/weekly-report
+```
+
+The model sees each listed skill's name and description and loads the full instructions with the built-in `skill` tool only when a request needs them. A skill is text: it cannot add tools beyond the blueprint's allowlist, and Zing never runs its scripts. See [`skills/README.md`](skills/README.md) for the format and rules.
+
 ## Triggers: the agent can speak first
 
 Everything that wakes the agent is a **trigger**. A user message is the trigger of kind `message`; a scheduled job (`schedule`) or an incoming webhook (`webhook`) is another kind, and a plugin can define more. Every trigger runs one turn in a conversation through the same path:
@@ -117,7 +128,9 @@ By default the capsule keeps each thread as a JSONL transcript, written when a t
 
 A graceful station stop first stops intake and drains the channel. Telegram finishes in-flight replies; App Server protocol v1 cancels its connection's turns and waits for cancellation before the runtime closes. The drain lasts at most 50 seconds: turns still running then are canceled, as the legacy runtime does at a stop, and their callers are told (Telegram replies with its failure message). None of them resumes after the restart for a caller that is gone, and the rest of the 60-second forced-exit limit records the cancellation. Directly closing the runtime leaves unfinished, uncanceled turns pending for restart.
 
-A resumed turn keeps its spent model/tool budget and its persisted deadline: downtime counts toward the timeout. A budget failure is stored in the submission itself, and startup cancels any leftover execution before resuming tasks. The first committed terminal outcome wins; a timeout queued behind an admitted answer commit cannot retroactively turn that answer into a failure. Observers use one settlement path for live turns, recovery, and redelivery, with durable per-turn acknowledgments rather than a global settlement watermark (pi-durable 1.1.0 does not expose a settlement-ordered replay log).
+A resumed turn keeps its spent model/tool budget and its persisted deadline: downtime counts toward the timeout. A budget failure is stored in the submission itself, and startup cancels any leftover execution before resuming tasks. The first committed terminal outcome wins; a timeout queued behind an admitted answer commit cannot retroactively turn that answer into a failure. Observers use one settlement path for live turns, recovery, and redelivery, with durable per-turn acknowledgments rather than a global settlement watermark (pi-durable 1.2.0 does not expose a settlement-ordered replay log).
+
+A storage error stops the runtime: pi-durable does not retry it, so the station stops taking turns and exits non-zero for its supervisor to restart it. The restart continues from what was committed. A turn in flight is told it resumes after the restart, including a canceled one whose cancellation had not been committed yet.
 
 Turn deduplication is not exactly-once reply delivery. Telegram acknowledges an update before its handler finishes during shutdown; a crash during that drain still loses the reply, and the turn then resumes without a recipient. There is no durable reply outbox yet, and a crash after sending but before acknowledging can cause a repeated reply. The same holds for schedule and webhook triggers: a trigger turn interrupted by a crash resumes and is recorded, but its reply is not delivered, and the scheduler does not fire that job again. Existing `update:*` request IDs from earlier preview revisions are not migrated to the new Telegram keys.
 
@@ -164,4 +177,4 @@ The checked-in [`station.yaml`](station.yaml) enables xAI, Telegram, Brave Searc
    docker compose run --rm zing --once "Hello"
    ```
 
-Edit [`agent.yaml`](agent.yaml) to change the agent's instructions, model, limits, or tool allowlist. Add or edit local source under [`plugins/`](plugins/README.md), then explicitly add its path to [`station.yaml`](station.yaml). Compose mounts both files and the plugin source into the container, so a restart is enough; no image rebuild is needed. Stop the station with `docker compose down`; the volume remains, so the same agent returns on the next `up`.
+Edit [`agent.yaml`](agent.yaml) to change the agent's instructions, model, limits, tool allowlist, or skills. Add or edit local source under [`plugins/`](plugins/README.md), then explicitly add its path to [`station.yaml`](station.yaml); add skills under [`skills/`](skills/README.md) and list them in `agent.yaml`. Compose mounts both files, the plugin source, and the skills into the container, so a restart is enough; no image rebuild is needed. Stop the station with `docker compose down`; the volume remains, so the same agent returns on the next `up`.

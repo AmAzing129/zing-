@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,16 +15,19 @@ import {
   getCurrentSystemPrompt,
   Type,
   type Context,
+  type FauxResponseStep,
 } from "@earendil-works/pi-ai";
-import { MemoryStorage, StorageRejected, type StorageWrite } from "@earendil-works/pi-durable";
+import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
+import { MemoryStorage, type StorageWrite } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 
-import { createAgent } from "../src/agent";
-import type { Blueprint } from "../src/blueprint";
+import { createAgent, type Agent } from "../src/agent";
+import type { AgentLimits, Blueprint } from "../src/blueprint";
 import { createMemoryCapsule, openFileCapsule, type Capsule } from "../src/capsule";
 import { CONTEXT_OMISSION_TEXT } from "../src/context";
 import { createDurableAgent, type CreateDurableAgentOptions } from "../src/durable";
-import type { ConversationEvent, Tool, ToolContext } from "../src/plugin/index";
+import type { ConversationEvent, IncomingMessage, Tool, ToolContext } from "../src/plugin/index";
+import { loadSkills } from "../src/skills";
 import type { Station } from "../src/station";
 
 const WEB_SEARCH = "web_search";
@@ -947,7 +950,7 @@ test("durable: every budget failure stays reportable to its redelivery", async (
   await agent.close();
 });
 
-test("durable: a storage failure that poisons the session stops the agent and reports it once", async () => {
+test("durable: a storage failure stops the agent and reports it once", async () => {
   let failing = false;
   const memory = new MemoryStorage();
   const storage = new Proxy(memory, {
@@ -962,15 +965,17 @@ test("durable: a storage failure that poisons the session stops the agent and re
     },
   });
   const fatal: Error[] = [];
-  const { agent, faux } = await createTestAgent({ storage, onFatal: (error) => fatal.push(error) });
+  const reported = deferred();
+  const { agent, faux } = await createTestAgent({ storage, onFatal: (error) => { fatal.push(error); reported.resolve(); } });
   faux.setResponses([fauxAssistantMessage("fine"), fauxAssistantMessage("never")]);
   assert.equal((await agent.handleMessage({ conversationId: "chat:disk", text: "one" })).text, "fine");
 
   failing = true;
   await assert.rejects(agent.handleMessage({ conversationId: "chat:disk", text: "two" }));
-  assert.equal(fatal.length, 1);
-  assert.match(fatal[0]?.message ?? "", /Session is poisoned/);
   assert.throws(() => agent.startTurn({ threadId: "chat:disk", text: "three" }), /shutting down/);
+  await reported.promise;
+  assert.equal(fatal.length, 1);
+  assert.match(fatal[0]?.message ?? "", /disk is gone/);
   await agent.close();
   assert.equal(fatal.length, 1);
 });
@@ -1138,12 +1143,15 @@ test("durable: a storage failure while opening a thread also stops the agent", a
     },
   });
   const fatal: Error[] = [];
-  const { agent } = await createTestAgent({ storage, onFatal: (error) => fatal.push(error) });
+  const reported = deferred();
+  const { agent } = await createTestAgent({ storage, onFatal: (error) => { fatal.push(error); reported.resolve(); } });
   failing = true;
   await assert.rejects(agent.openThread("web:new"), /disk is gone/);
-  assert.equal(fatal.length, 1);
-  assert.match(fatal[0]?.message ?? "", /Session is poisoned/);
+  // New work is refused at once; the report follows once the Session has closed.
   await assert.rejects(agent.openThread("web:other"), /shutting down/);
+  await reported.promise;
+  assert.equal(fatal.length, 1);
+  assert.match(fatal[0]?.message ?? "", /disk is gone/);
   await agent.close();
 });
 
@@ -1300,6 +1308,88 @@ test("durable: threads from a file capsule continue with their live history", as
   });
   assert.equal((await reopened.readThread("telegram:1")).entries.length, 6);
   await reopened.close();
+});
+
+async function weeklyReportSkill() {
+  const root = await mkdtemp(join(tmpdir(), "zing-durable-skills-"));
+  await mkdir(join(root, "weekly-report"));
+  await writeFile(
+    join(root, "weekly-report", "SKILL.md"),
+    "---\nname: weekly-report\ndescription: Write my weekly report.\n---\nList three highlights first.\n",
+  );
+  return loadSkills([join(root, "weekly-report")]);
+}
+
+/** Responses that load the weekly-report skill and record what each request offered. */
+function loadSkillResponses() {
+  const seen = { systems: [] as string[], systemMessages: [] as number[], tools: [] as string[][], results: [] as string[] };
+  const responses = [
+    (context: Context) => {
+      seen.systems.push(getCurrentSystemPrompt(context.messages));
+      seen.systemMessages.push(context.messages.filter((message) => message.role === "system").length);
+      seen.tools.push(getCurrentTools(context.messages).map((tool) => tool.name));
+      return fauxAssistantMessage([fauxToolCall("skill", { name: "weekly-report" })], { stopReason: "toolUse" });
+    },
+    (context: Context) => {
+      const last = context.messages.at(-1);
+      seen.results.push(last?.role === "toolResult" ? contentText(last.content, "") : "");
+      return fauxAssistantMessage("report");
+    },
+  ];
+  return { seen, responses };
+}
+
+test("durable: skills give the same prompt and tools as the legacy runtime, also in an imported thread", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-skills-import-"));
+  const skills = await weeklyReportSkill();
+  const { faux, model, station } = createTestStation();
+  const blueprint = blueprintFor(model.id);
+  const legacy = createAgent(station, blueprint, await openFileCapsule({ blueprint, path: dir }), { tools: [webSearch], skills });
+  const before = loadSkillResponses();
+  faux.setResponses(before.responses);
+  await legacy.handleMessage({ conversationId: "telegram:1", text: "weekly report" });
+  await legacy.close();
+
+  const agent = await createDurableAgent(station, blueprint, await openFileCapsule({ blueprint, path: dir }), {
+    storage: await openNodeSqliteStorage(join(dir, "durable.sqlite")),
+    tools: [webSearch],
+    skills,
+  });
+  const after = loadSkillResponses();
+  faux.setResponses(after.responses);
+  assert.equal((await agent.handleMessage({ conversationId: "telegram:1", text: "again" })).text, "report");
+  assert.match(before.seen.systems[0] ?? "", /^be brief\n\n<skills>\n[^]*\n- weekly-report: Write my weekly report\.\n<\/skills>$/);
+  assert.deepEqual(after.seen.systems, before.seen.systems);
+  assert.deepEqual(after.seen.systemMessages, [1], "the imported baseline already matches the skills section");
+  assert.deepEqual(after.seen.tools, [["web_search", "skill"]]);
+  assert.deepEqual(after.seen.results, ["List three highlights first."]);
+  await agent.close();
+});
+
+test("durable: skills listed after a thread started reach it on the next start", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "zing-durable-skills-later-"));
+  const file = join(dir, "durable.sqlite");
+  const { faux, model, station } = createTestStation();
+  const before = await createDurableAgent(station, blueprintFor(model.id), undefined, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [webSearch],
+  });
+  faux.setResponses([fauxAssistantMessage("hello")]);
+  await before.handleMessage({ conversationId: "telegram:1", text: "hi" });
+  await before.close();
+
+  const after = await createDurableAgent(station, blueprintFor(model.id), undefined, {
+    storage: await openNodeSqliteStorage(file),
+    tools: [webSearch],
+    skills: await weeklyReportSkill(),
+  });
+  const { seen, responses } = loadSkillResponses();
+  faux.setResponses(responses);
+  await after.handleMessage({ conversationId: "telegram:1", text: "weekly report" });
+  assert.match(seen.systems[0] ?? "", /<skills>\n[^]*- weekly-report: Write my weekly report\.\n<\/skills>$/);
+  assert.deepEqual(seen.tools, [["web_search", "skill"]]);
+  assert.deepEqual(seen.results, ["List three highlights first."]);
+  await after.close();
 });
 
 test("durable: close ends waiting turns, cancels queued ones, and rejects new work", async () => {
@@ -1487,227 +1577,151 @@ test("durable: cancelAll ends live, queued, and recovered turns so none resumes 
 const isAbortMark = (write: StorageWrite) => write.type === "task" && write.value.abortRequested === true;
 const isTurnFailure = (write: StorageWrite) =>
   write.type === "submission" && write.value.status === "unanswered" && write.value.reason === "faulted";
+const committing = (match: (write: StorageWrite) => boolean) => (method: string, args: unknown[]) =>
+  method === "commit" && (args[0] as StorageWrite[]).some(match);
 
-/** Storage that rejects commits with a `match`ing write, without effect, while `reject()` allows it. */
-function rejectingCommits(match: (write: StorageWrite) => boolean, reject: () => boolean) {
-  let rejected = 0;
-  const memory = new MemoryStorage();
-  const storage = new Proxy(memory, {
-    get(target, property) {
-      const value: unknown = Reflect.get(target, property, target);
-      if (property === "commit" && typeof value === "function") {
-        return async (writes: StorageWrite[], ...rest: unknown[]) => {
-          if (writes.some(match) && reject()) {
-            rejected += 1;
-            throw new StorageRejected("commit rejected");
-          }
-          return value.call(target, writes, ...rest);
-        };
+const hangUntilAborted: FauxResponseStep = async (_context, options) => {
+  await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+  return fauxAssistantMessage("", { stopReason: "aborted" });
+};
+
+type StorageFailure = {
+  /** The first storage call this matches throws, without effect. */
+  fails: (method: string, args: unknown[]) => boolean;
+  tools?: Tool[];
+  limits?: Partial<AgentLimits>;
+  responses: FauxResponseStep[];
+  /** Runs the turn while storage fails; `request` is its redelivery. */
+  run: (agent: Agent, request: IncomingMessage) => Promise<unknown>;
+  restartResponses: FauxResponseStep[];
+  /** What the redelivery after the restart reports. */
+  outcome: string | RegExp;
+  status: "completed" | "failed";
+};
+
+const storageFailures: Record<string, StorageFailure> = {
+  "the abort after a limit": {
+    fails: committing(isAbortMark),
+    limits: { maxModelTurns: 1 },
+    responses: [fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "loop" })], { stopReason: "toolUse" })],
+    // The limit's settlement has committed; whether the caller sees it before the Session fails is a race.
+    run: (agent, request) => agent.handleMessage(request).catch(() => undefined),
+    restartResponses: [],
+    outcome: /1 model-turn limit/,
+    status: "failed",
+  },
+  "the abort of a cancel": (() => {
+    let started = deferred();
+    return {
+      fails: committing(isAbortMark),
+      tools: [{ ...webSearch, execute: async (_input, { signal }) => (started.resolve(), waitForAbort(signal)) }],
+      responses: [fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "wait" })], { stopReason: "toolUse" })],
+      run: async (agent, request) => {
+        started = deferred();
+        const turn = agent.startTurn({ threadId: request.conversationId, ...request });
+        await started.promise;
+        await agent.cancelTurn(request.conversationId, turn.turnId);
+        // The cancel never became durable, so it must not be reported: the turn resumes after the restart.
+        await assert.rejects(turn.completed, /resumes when the station restarts/);
+      },
+      restartResponses: [fauxAssistantMessage("answered after the restart")],
+      outcome: "answered after the restart",
+      status: "completed",
+    } satisfies StorageFailure;
+  })(),
+  "the settlement of a timeout": {
+    fails: committing(isTurnFailure),
+    tools: [{ ...webSearch, execute: async (_input, { signal }) => waitForAbort(signal) }],
+    limits: { turnTimeoutMs: 200 },
+    responses: [fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "wait" })], { stopReason: "toolUse" })],
+    run: (agent, request) => assert.rejects(agent.handleMessage(request), /resumes when the station restarts/),
+    restartResponses: [],
+    outcome: /200ms timeout/,
+    status: "failed",
+  },
+  "a read while the caller waits": {
+    fails: (method) => method === "submission",
+    responses: [hangUntilAborted],
+    run: (agent, request) => assert.rejects(agent.handleMessage(request), /resumes when the station restarts/),
+    restartResponses: [fauxAssistantMessage("answered after the restart")],
+    outcome: "answered after the restart",
+    status: "completed",
+  },
+  "the observation of a settled turn": (() => {
+    let settled = false;
+    return {
+      // After the answer commits, the first commit of only document changes (the thread's touch) fails.
+      fails: (method, args) => {
+        if (method !== "commit") return false;
+        const writes = args[0] as StorageWrite[];
+        const fails = settled && writes.length > 0 && writes.every((write) => write.type === "document.change");
+        if (writes.some((write) => write.type === "submission" && write.value.status === "done")) settled = true;
+        return fails;
+      },
+      tools: [],
+      responses: [fauxAssistantMessage("answered before the failure")],
+      // The answer has committed; reading it back for the caller races the Session's failure.
+      run: (agent, request) => agent.handleMessage(request).catch(() => undefined),
+      restartResponses: [],
+      outcome: "answered before the failure",
+      status: "completed",
+    } satisfies StorageFailure;
+  })(),
+};
+
+test("durable: a storage failure stops the agent once and the restart finishes the turn from what was committed", { timeout: 15_000 }, async (t) => {
+  for (const [name, scenario] of Object.entries(storageFailures)) {
+    await t.test(name, async (t) => {
+      const directory = await mkdtemp(join(tmpdir(), "zing-storage-failure-"));
+      t.after(() => rm(directory, { recursive: true, force: true }));
+      const file = join(directory, "durable.sqlite");
+      const tools = scenario.tools ?? [webSearch];
+      const request = { conversationId: "chat:failure", text: "go", senderId: "alice", requestId: "update:failure" };
+      const observed: ConversationEvent[] = [];
+      const listeners = [(event: ConversationEvent) => { observed.push(event); }];
+
+      const sqlite = await openNodeSqliteStorage(file);
+      let failed = false;
+      const storage = new Proxy(sqlite, {
+        get(target, property) {
+          const value: unknown = Reflect.get(target, property, target);
+          if (typeof value !== "function") return value;
+          return (...args: unknown[]) => {
+            if (!failed && scenario.fails(String(property), args)) {
+              failed = true;
+              return Promise.reject(new Error("disk is gone"));
+            }
+            return value.apply(target, args);
+          };
+        },
+      });
+      const fatal: Error[] = [];
+      const reported = deferred();
+      const first = await createTestAgent({
+        storage, tools, limits: scenario.limits, listeners,
+        onFatal: (error) => { fatal.push(error); reported.resolve(); },
+      });
+      first.faux.setResponses(scenario.responses);
+      await scenario.run(first.agent, request);
+      await reported.promise;
+      await first.agent.close();
+      assert.equal(failed, true);
+      assert.deepEqual(fatal.map((error) => error.message), ["disk is gone"]);
+
+      const second = createTestStation();
+      second.faux.setResponses(scenario.restartResponses);
+      const restarted = await createDurableAgent(second.station, blueprintFor(second.model.id, tools), undefined, {
+        storage: await openNodeSqliteStorage(file), tools, limits: scenario.limits, listeners,
+      });
+      t.after(() => restarted.close());
+      if (typeof scenario.outcome === "string") {
+        assert.equal((await restarted.handleMessage(request)).text, scenario.outcome);
+      } else {
+        await assert.rejects(restarted.handleMessage(request), scenario.outcome);
       }
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-  return { storage, rejected: () => rejected };
-}
-
-test("durable: a run whose abort keeps failing is held until a retry lands", { timeout: 10_000 }, async (t) => {
-  const { storage, rejected } = rejectingCommits(isAbortMark, () => rejected() < 4);
-  const { agent, faux } = await createTestAgent({ storage, limits: { maxModelTurns: 1 } });
-  t.after(() => agent.close());
-  faux.setResponses([
-    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "loop" })], { stopReason: "toolUse" }),
-    fauxAssistantMessage("next turn"),
-  ]);
-  await assert.rejects(agent.handleMessage({ conversationId: "chat:abort", text: "loop" }), /1 model-turn limit/);
-  assert.equal(rejected(), 4);
-  assert.equal(faux.state.callCount, 1, "the held run made no further model request");
-  assert.equal((await agent.handleMessage({ conversationId: "chat:abort", text: "again" })).text, "next turn");
+      assert.equal(second.faux.state.callCount, scenario.restartResponses.length);
+      await restarted.drainObservers();
+      assert.deepEqual(observed.map((event) => event.type === "turn" && [event.status, event.senderId]), [[scenario.status, "alice"]]);
+    });
+  }
 });
-
-/**
- * Storage whose second submission read fails once. A live turn reads its submission twice, in status() and wait(), so
- * its waiting call fails while the run itself goes on.
- */
-function failingWaitRead() {
-  let reads = 0;
-  return new Proxy(new MemoryStorage(), {
-    get(target, property) {
-      const value: unknown = Reflect.get(target, property, target);
-      if (property === "submission" && typeof value === "function") {
-        return async (...args: unknown[]) => {
-          reads += 1;
-          if (reads === 2) throw new Error("transient read failure");
-          return value.apply(target, args);
-        };
-      }
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-}
-
-test("durable: a run keeps its limits after this process lost its budget", async (t) => {
-  // The waiting call fails while the run itself goes on.
-  const storage = failingWaitRead();
-  const started = deferred();
-  const release = deferred();
-  let executions = 0;
-  const tool: Tool = {
-    ...webSearch,
-    execute: async () => {
-      executions += 1;
-      if (executions === 1) {
-        started.resolve();
-        await release.promise;
-      }
-      return { text: "results" };
-    },
-  };
-  const { agent, faux } = await createTestAgent({ storage, tools: [tool], limits: { maxToolCalls: 1 } });
-  t.after(() => agent.close());
-  faux.setResponses([
-    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" }),
-    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "two" })], { stopReason: "toolUse" }),
-    fauxAssistantMessage("should not be reached"),
-  ]);
-  const request = { conversationId: "chat:lost-budget", text: "search", requestId: "update:lost" };
-  await assert.rejects(agent.handleMessage(request), /transient read failure/);
-  await started.promise;
-  release.resolve();
-  // The redelivery waits for the run and reports its durable outcome.
-  await assert.rejects(agent.handleMessage(request), /1 tool-call limit/);
-  assert.equal(executions, 1, "the call over the limit is blocked");
-  assert.equal(faux.state.callCount, 2);
-});
-
-test("durable: a run that outlives its caller still ends at its deadline and frees its thread", { timeout: 10_000 }, async (t) => {
-  // The waiting call fails; then the run's next model request hangs until it is aborted.
-  const storage = failingWaitRead();
-  const { agent, faux } = await createTestAgent({ storage, limits: { turnTimeoutMs: 300 } });
-  t.after(() => agent.close());
-  faux.setResponses([
-    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" }),
-    async (_context, options) => {
-      await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
-      return fauxAssistantMessage("", { stopReason: "aborted" });
-    },
-    fauxAssistantMessage("next turn"),
-  ]);
-  const request = { conversationId: "chat:outlived", text: "search", requestId: "update:outlived" };
-  await assert.rejects(agent.handleMessage(request), /transient read failure/);
-  await assert.rejects(agent.handleMessage(request), /300ms timeout/);
-  assert.equal((await agent.handleMessage({ conversationId: "chat:outlived", text: "again" })).text, "next turn");
-});
-
-test("durable: a cancel is retried until its abort commits", { timeout: 10_000 }, async (t) => {
-  let remaining = 1;
-  const { storage, rejected } = rejectingCommits(isAbortMark, () => remaining-- > 0);
-  let started = deferred();
-  // Waits for its abort; no hook runs while it does, so only a retry can deliver the cancel.
-  const tool: Tool = { ...webSearch, execute: async (_input, { signal }) => (started.resolve(), waitForAbort(signal)) };
-  const { agent, faux } = await createTestAgent({ storage, tools: [tool] });
-  t.after(() => agent.close());
-  const call = () => fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "wait" })], { stopReason: "toolUse" });
-  faux.setResponses([call(), call()]);
-
-  const canceled = agent.startTurn({ threadId: "chat:retry", text: "one" });
-  await started.promise;
-  await agent.cancelTurn("chat:retry", canceled.turnId);
-  await assert.rejects(canceled.completed, /canceled/i);
-  assert.equal(rejected(), 1);
-
-  // More rejections than the backoff has steps: cancelAll must still not return before the abort commits.
-  remaining = 5;
-  started = deferred();
-  const stopped = agent.startTurn({ threadId: "chat:retry", text: "two" });
-  await started.promise;
-  await agent.cancelAll();
-  assert.equal(rejected(), 6);
-  await assert.rejects(stopped.completed, /canceled/i);
-});
-
-test("durable: a timeout whose settlement is rejected is retried while its tool hangs", { timeout: 10_000 }, async (t) => {
-  let remaining = 2;
-  const { storage, rejected } = rejectingCommits(isTurnFailure, () => remaining-- > 0);
-  // Waits for its abort; no hook runs while it does, so only the deadline can end the turn.
-  const tool: Tool = { ...webSearch, execute: async (_input, { signal }) => waitForAbort(signal) };
-  const { agent, faux } = await createTestAgent({ storage, tools: [tool], limits: { turnTimeoutMs: 200 } });
-  t.after(() => agent.close());
-  faux.setResponses([fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "wait" })], { stopReason: "toolUse" })]);
-  await assert.rejects(agent.handleMessage({ conversationId: "chat:deadline-retry", text: "wait" }), /200ms timeout/);
-  assert.equal(rejected(), 2);
-});
-
-test("durable: a limit whose settlement is rejected still stops the run before another model call", async (t) => {
-  let remaining = 1;
-  const { storage, rejected } = rejectingCommits(isTurnFailure, () => remaining-- > 0);
-  let executions = 0;
-  const tool: Tool = { ...webSearch, execute: async () => ({ text: String(++executions) }) };
-  const { agent, faux } = await createTestAgent({ storage, tools: [tool], limits: { maxToolCalls: 1 } });
-  t.after(() => agent.close());
-  faux.setResponses([
-    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "a" }), fauxToolCall(WEB_SEARCH, { query: "b" })], {
-      stopReason: "toolUse",
-    }),
-    fauxAssistantMessage("should not be reached"),
-  ]);
-  await assert.rejects(agent.handleMessage({ conversationId: "chat:limit-retry", text: "twice" }), /1 tool-call limit/);
-  assert.equal(rejected(), 1);
-  assert.equal(executions, 1);
-  assert.equal(faux.state.callCount, 1);
-});
-
-test("durable: a run that outlives its caller is observed once it settles", { timeout: 5_000 }, async (t) => {
-  const observed: ConversationEvent[] = [];
-  const seen = deferred();
-  const { agent, faux } = await createTestAgent({
-    storage: failingWaitRead(),
-    listeners: [(event) => { observed.push(event); seen.resolve(); }],
-  });
-  t.after(() => agent.close());
-  faux.setResponses([
-    fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "one" })], { stopReason: "toolUse" }),
-    fauxAssistantMessage("answered after the caller left"),
-  ]);
-  await assert.rejects(
-    agent.handleMessage({ conversationId: "chat:detached", text: "search", senderId: "alice" }),
-    /transient read failure/,
-  );
-  await seen.promise;
-  assert.deepEqual(
-    observed.map((event) => event.type === "turn" && [event.status, event.senderId, event.entries.map((entry) => entry.type)]),
-    [["completed", "alice", ["user", "assistant", "toolResult", "assistant"]]],
-  );
-});
-
-test("durable: a settled turn's observation is retried after a transient write failure", async (t) => {
-  // After the answer commits, the first commit of only document changes (the thread's touch) is rejected once.
-  let settled = false;
-  let rejected = 0;
-  const memory = new MemoryStorage();
-  const storage = new Proxy(memory, {
-    get(target, property) {
-      const value: unknown = Reflect.get(target, property, target);
-      if (property === "commit" && typeof value === "function") {
-        return async (writes: StorageWrite[], ...rest: unknown[]) => {
-          if (settled && rejected === 0 && writes.length > 0 && writes.every((write) => write.type === "document.change")) {
-            rejected += 1;
-            throw new StorageRejected("commit rejected");
-          }
-          const result = await value.call(target, writes, ...rest);
-          if (writes.some((write) => write.type === "submission" && write.value.status === "done")) settled = true;
-          return result;
-        };
-      }
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
-  const observed: ConversationEvent[] = [];
-  const { agent, faux } = await createTestAgent({ storage, tools: [], listeners: [(event) => { observed.push(event); }] });
-  t.after(() => agent.close());
-  faux.setResponses([fauxAssistantMessage("answer")]);
-  assert.equal((await agent.handleMessage({ conversationId: "chat:observe-retry", text: "hi", senderId: "alice" })).text, "answer");
-  await agent.drainObservers();
-  assert.equal(rejected, 1);
-  assert.deepEqual(observed.map((event) => event.type === "turn" && [event.status, event.senderId]), [["completed", "alice"]]);
-});
-
