@@ -1,13 +1,15 @@
 import { readFile, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import { zingHome } from "./env";
 import type { PluginRegistry } from "./plugin/registry";
+import { SKILL_TOOL_NAME } from "./skills";
 
 const BLUEPRINT_NAMES = ["agent.yaml", "agent.yml", "blueprint.yaml", "blueprint.yml"] as const;
 const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const TOOLS_ERROR = "tools must be a list of exact tool names, for example [market__quote]";
+const SKILLS_ERROR = "skills must be a list of skill directory paths, for example [./skills/weekly-report]";
 
 export type AgentLimits = { turnTimeoutMs: number; maxModelTurns: number; maxToolCalls: number };
 
@@ -21,11 +23,14 @@ export type Blueprint = {
   limits?: Partial<AgentLimits>;
   /** Exact names of tools exposed to the model. */
   tools: string[];
+  /** Absolute paths of the skill directories the model may load, in order. */
+  skills?: string[];
 };
 
 export type FindBlueprintOptions = { cwd?: string; home?: string; explicit?: string; env?: NodeJS.ProcessEnv };
 
-export function parseBlueprint(raw: unknown, source = "<blueprint>"): Blueprint {
+/** Skill paths resolve against baseDir, normally the blueprint file's directory. */
+export function parseBlueprint(raw: unknown, source = "<blueprint>", baseDir = process.cwd()): Blueprint {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${source}: blueprint must be a mapping`);
   const record = raw as Record<string, unknown>;
   return {
@@ -36,6 +41,7 @@ export function parseBlueprint(raw: unknown, source = "<blueprint>"): Blueprint 
     source,
     limits: parseLimits(record.limits, source),
     tools: parseTools(record.tools, source),
+    skills: parseSkills(record.skills, source, baseDir),
   };
 }
 
@@ -47,7 +53,7 @@ export async function loadBlueprint(path: string, cwd = process.cwd()): Promise<
   } catch (error) {
     throw new Error(`Blueprint not found: ${resolved}`, { cause: error });
   }
-  return parseBlueprint(parseYaml(contents), resolved);
+  return parseBlueprint(parseYaml(contents), resolved, dirname(resolved));
 }
 
 export async function findBlueprint(options: FindBlueprintOptions = {}): Promise<string | undefined> {
@@ -87,10 +93,27 @@ function parseTools(raw: unknown, source: string): string[] {
     if (typeof value !== "string") throw new Error(`${source}: ${TOOLS_ERROR}`);
     const name = value.trim();
     if (!TOOL_NAME.test(name)) throw new Error(`${source}: invalid tool name "${value}"`);
+    if (name === SKILL_TOOL_NAME) throw new Error(`${source}: tool "${name}" is reserved; Zing provides it when skills are listed`);
     if (names.includes(name)) throw new Error(`${source}: duplicate tool name "${name}"`);
     names.push(name);
   }
   return names;
+}
+
+function parseSkills(raw: unknown, source: string, baseDir: string): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error(`${source}: ${SKILLS_ERROR}`);
+  const paths: string[] = [];
+  for (const value of raw) {
+    if (typeof value !== "string") throw new Error(`${source}: ${SKILLS_ERROR}`);
+    const path = value.trim();
+    // A bare name is reserved for skills that plugins may provide later.
+    if (!/^(\.{1,2})?\//.test(path)) throw new Error(`${source}: skill "${value}" must be a path starting with ./, ../, or /`);
+    const resolved = resolve(baseDir, path);
+    if (paths.includes(resolved)) throw new Error(`${source}: duplicate skill path "${path}"`);
+    paths.push(resolved);
+  }
+  return paths;
 }
 
 function parseLimits(raw: unknown, source: string): Partial<AgentLimits> | undefined {

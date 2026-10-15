@@ -17,7 +17,7 @@
 
 模型、Channel 和插件所需的密钥通过环境变量注入；可参考 `.env.example`。不要把生产密钥提交到仓库或镜像。
 
-`agent.yaml`、`station.yaml` 以及 `station.yaml` 引用的本地插件必须：
+`agent.yaml`、`station.yaml`、`station.yaml` 引用的本地插件以及 `agent.yaml` 引用的技能目录必须：
 
 1. 打包进部署制品/镜像；或
 2. 通过进程可读的只读挂载提供。

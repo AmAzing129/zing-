@@ -53,6 +53,17 @@ tools:
 
 See [`plugins/README.md`](plugins/README.md) for the local plugin contract, activation rules, and included implementations.
 
+### Skills
+
+Plugins give an agent capabilities; skills teach it how to use them for one kind of task, such as writing your weekly report. A skill is a directory with a `SKILL.md` in the [Agent Skills](https://agentskills.io) format, listed by path in the blueprint:
+
+```yaml
+skills:
+  - ./skills/weekly-report
+```
+
+The model sees each listed skill's name and description and loads the full instructions with the built-in `skill` tool only when a request needs them. A skill is text: it cannot add tools beyond the blueprint's allowlist, and Zing never runs its scripts. See [`skills/README.md`](skills/README.md) for the format and rules.
+
 ## A runtime, not a UI
 
 Zing owns the agent's identity, threads, turns, persistence, tool execution, cancellation, and recovery. A client owns the interaction experience. This separation means one agent can be reached through Telegram today and a web or desktop client tomorrow without moving its life into a UI framework.
@@ -146,4 +157,4 @@ The checked-in [`station.yaml`](station.yaml) enables xAI, Telegram, Brave Searc
    docker compose run --rm zing --once "Hello"
    ```
 
-Edit [`agent.yaml`](agent.yaml) to change the agent's instructions, model, limits, or tool allowlist. Add or edit local source under [`plugins/`](plugins/README.md), then explicitly add its path to [`station.yaml`](station.yaml). Compose mounts both files and the plugin source into the container, so a restart is enough; no image rebuild is needed. Stop the station with `docker compose down`; the volume remains, so the same agent returns on the next `up`.
+Edit [`agent.yaml`](agent.yaml) to change the agent's instructions, model, limits, tool allowlist, or skills. Add or edit local source under [`plugins/`](plugins/README.md), then explicitly add its path to [`station.yaml`](station.yaml); add skills under [`skills/`](skills/README.md) and list them in `agent.yaml`. Compose mounts both files, the plugin source, and the skills into the container, so a restart is enough; no image rebuild is needed. Stop the station with `docker compose down`; the volume remains, so the same agent returns on the next `up`.

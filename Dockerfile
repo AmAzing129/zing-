@@ -11,6 +11,7 @@ RUN npm ci
 COPY tsconfig.json agent.yaml station.yaml ./
 COPY src ./src
 COPY plugins ./plugins
+COPY skills ./skills
 COPY examples ./examples
 COPY docker-entrypoint.sh /usr/local/bin/zing-entrypoint
 RUN chmod +x /usr/local/bin/zing-entrypoint \

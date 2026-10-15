@@ -23,5 +23,9 @@ tools:
   - memory_search
   - memory_save
 
+# Optional skills: directories with a SKILL.md, relative to this file. See skills/README.md.
+# skills:
+#   - ./skills/weekly-report
+
 # Set ZING_MEMORY_OWNER_IDS to trusted sender ids (normally the same ids as
 # TELEGRAM_ALLOWED_USER_IDS). With no owners configured, only senderless stdio is trusted.

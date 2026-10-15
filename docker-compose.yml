@@ -16,6 +16,7 @@ services:
       - ./agent.yaml:/app/agent.yaml:ro
       - ./station.yaml:/app/station.yaml:ro
       - ./plugins:/app/plugins:ro
+      - ./skills:/app/skills:ro
     logging:
       driver: json-file
       options:

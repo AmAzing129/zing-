@@ -70,6 +70,14 @@ import {
   type TurnHandle,
   type TurnInput,
 } from "./runtime";
+import {
+  composeSystemPrompt,
+  renderSkillCatalog,
+  SKILL_TOOL_NAME,
+  SKILLS_SECTION,
+  tagSection,
+  withSkillTool,
+} from "./skills";
 import type { Station } from "./station";
 import { encodeMessages } from "./transcript";
 
@@ -165,11 +173,13 @@ export async function createDurableAgent(
   const model = station.resolveModel(blueprint.model);
   const modelRef = { provider: model.provider, modelId: model.id };
   const system = blueprint.system ?? DEFAULT_SYSTEM;
+  const skills = options.skills ?? [];
+  const catalog = renderSkillCatalog(skills);
   const limits = resolveAgentLimits(blueprint.limits, options.limits);
-  const tools = options.tools ?? [];
+  const tools = withSkillTool(options.tools ?? [], skills);
   const capsuleRef: CapsuleRef = { agentId: resolved.identity.agentId, state: resolved.state };
   const observers = createObserverQueue(options.listeners ?? [], options.observerTimeoutMs ?? OBSERVER_TIMEOUT_MS);
-  const policy = createContextWindowPolicy(model, system, tools);
+  const policy = createContextWindowPolicy(model, composeSystemPrompt(system, skills), tools);
 
   const threads = new Map<string, ConversationId>();
   const threadOf = new Map<number, string>();
@@ -335,14 +345,19 @@ export async function createDurableAgent(
 
   const extension = defineExtension({
     name: EXTENSION_NAME,
-    sections: [section(SYSTEM_SECTION, () => system, { tag: false })],
-    tools: tools.map((tool) =>
-      createDurableTool(tool, {
+    sections: [
+      section(SYSTEM_SECTION, () => system, { tag: false }),
+      ...(catalog === undefined ? [] : [section(SKILLS_SECTION, () => catalog)]),
+    ],
+    tools: tools.map((tool) => {
+      const registration = createDurableTool(tool, {
         threadOf: (id) => threadOf.get(id) ?? String(id),
         senderOf: async (id, api) => (await api.snapshot(TurnDoc, id, CONTEXT))?.senderId,
         capsule: capsuleRef,
-      }),
-    ),
+      });
+      // Loading a skill only reads, so a call a crash interrupted runs again instead of failing.
+      return tool.name === SKILL_TOOL_NAME ? { ...registration, replay: "safe" as const } : registration;
+    }),
     hooks: [
       hook(GenerationTask, {
         beforeRequest: async ({ messages }, api, context) => {
@@ -429,7 +444,10 @@ export async function createDurableAgent(
   const baseline = (): Message => ({
     role: "system",
     content: "",
-    sections: { [SYSTEM_SECTION]: system },
+    sections: {
+      [SYSTEM_SECTION]: system,
+      ...(catalog === undefined ? {} : { [SKILLS_SECTION]: tagSection(SKILLS_SECTION, catalog) }),
+    },
     ...(tools.length === 0 ? {} : { toolsAdded: tools.map((tool) => toToolDeclaration(tool)) }),
     timestamp: Date.now(),
   });

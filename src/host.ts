@@ -9,6 +9,7 @@ import {
   resolvePluginPaths,
   type PluginRegistry,
 } from "./plugin/index";
+import { loadSkills } from "./skills";
 import { createStation } from "./station";
 
 export type CapsuleFactory = (blueprint: Blueprint) => Promise<Capsule>;
@@ -45,9 +46,11 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
   let closeStorage: (() => Promise<void>) | undefined;
   try {
     const station = createStation({ providers: registry.listProviders(), provider: options.provider });
+    // Before the capsule opens, so an invalid skill does not create an agent.
+    const skills = await loadSkills(options.blueprint.skills ?? []);
     const capsule = await options.capsuleFactory(options.blueprint);
     const tools = resolveBlueprintTools(options.blueprint, registry);
-    const agentOptions = { tools, listeners: registry.listListeners() };
+    const agentOptions = { tools, skills, listeners: registry.listListeners() };
     // pi-durable loads TypeBox and Chord; a legacy station never imports it.
     let agent: Agent;
     if (options.durableStorage) {
