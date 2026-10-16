@@ -14,7 +14,10 @@ export type ApprovalTransport = {
   edit: (chatId: number, messageId: number, text: string) => Promise<void>;
 };
 
-type Pending = { chatId: number; finish: (approved: boolean, note: string) => void };
+type Pending = { chatId: number; userId: number; finish: (approved: boolean, note: string) => void };
+
+/** What a tap did: decided the question, came from someone other than the asker, or found no open question. */
+export type TapOutcome = "answered" | "not-asker" | "expired";
 
 /** Approvals asked with inline buttons and answered by the button's callback query. */
 export function createApprovals(transport: ApprovalTransport) {
@@ -38,28 +41,32 @@ export function createApprovals(transport: ApprovalTransport) {
       return { asking, dispose: () => waiters.delete(wake) };
     },
 
-    /** Ask in the chat, and wait for a tap. The end of the turn or of the channel declines. */
-    async ask(chatId: number, request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
+    /**
+     * Ask userId in the chat, and wait for their tap. In a group everyone sees the buttons, but only the person who
+     * started the turn decides. The end of the turn or of the channel declines.
+     */
+    async ask(chatId: number, userId: number, request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
       if (signal.aborted) return false;
       open += 1;
       for (const wake of [...waiters]) wake();
       waiters.clear();
       try {
-        return await question(chatId, request, signal);
+        return await question(chatId, userId, request, signal);
       } finally {
         open -= 1;
       }
     },
 
-    /** Apply a tapped button. False when it belongs to no open question in that chat. */
-    answer(data: string, chatId: number): boolean {
+    /** Apply a button tapped by userId in chatId. */
+    answer(data: string, chatId: number, userId: number): TapOutcome {
       const approved = data.startsWith(APPROVE);
-      if (!approved && !data.startsWith(DECLINE)) return false;
+      if (!approved && !data.startsWith(DECLINE)) return "expired";
       const id = data.slice((approved ? APPROVE : DECLINE).length);
       const entry = pending.get(id);
-      if (!entry || entry.chatId !== chatId) return false;
+      if (!entry || entry.chatId !== chatId) return "expired";
+      if (entry.userId !== userId) return "not-asker";
       entry.finish(approved, approved ? "已允许。" : "已拒绝。");
-      return true;
+      return "answered";
     },
 
     /** Decline every open question, as the channel stops. */
@@ -68,7 +75,7 @@ export function createApprovals(transport: ApprovalTransport) {
     },
   };
 
-  async function question(chatId: number, request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
+  async function question(chatId: number, userId: number, request: ApprovalRequest, signal: AbortSignal): Promise<boolean> {
     const id = randomBytes(8).toString("base64url");
     const text = describe(request);
     const messageId = await transport.send(chatId, text, [
@@ -83,7 +90,7 @@ export function createApprovals(transport: ApprovalTransport) {
         transport.edit(chatId, messageId, `${text}\n\n${note}`).catch(() => undefined);
       };
       const expire = (): void => finish(false, "已失效：这轮对话已结束。");
-      pending.set(id, { chatId, finish });
+      pending.set(id, { chatId, userId, finish });
       signal.addEventListener("abort", expire, { once: true });
       if (signal.aborted) expire();
     });

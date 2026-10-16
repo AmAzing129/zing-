@@ -252,7 +252,8 @@ export function toolVisibility(tool: Pick<RemoteTool, "_meta">): { model: boolea
 
 /**
  * The methods a client needs to render MCP Apps: which tools have an app, the app's ui:// resource, and the calls
- * the app makes to its own server. They act for the user in the client, so blueprint approval does not apply.
+ * the app makes to its own server. Blueprint approval does not cover the app's calls; the client asks the user before
+ * a tool that is not read-only runs, since the view can call without the user doing anything.
  */
 function registerAppMethods(zing: ZingPluginAPI, connections: readonly Connection[]): void {
   const byAlias = new Map(connections.map((connection) => [connection.server.alias, connection]));

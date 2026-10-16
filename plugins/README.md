@@ -259,7 +259,7 @@ Servers built for ChatGPT can attach an interactive view to a tool: [MCP Apps](h
 
 - A tool whose `_meta.ui.visibility` leaves out `model` is for its view only, and is not registered as a Zing tool.
 - A tool's `details` are the whole MCP result, `structuredContent` and `_meta` included, and reach App Server clients on `tool/completed`.
-- `mcp/servers/list`, `mcp/resources/read`, and `mcp/tools/call` let a client find a tool's view, read its HTML, and pass on the view's own tool calls. `mcp/tools/call` only calls tools whose visibility includes `app`. Those calls are the user's actions in the client, so the blueprint's approval does not apply.
+- `mcp/servers/list`, `mcp/resources/read`, and `mcp/tools/call` let a client find a tool's view, read its HTML, and pass on the view's own tool calls. `mcp/tools/call` only calls tools whose visibility includes `app`. The blueprint's approval does not cover these calls, and a view can make them without the user doing anything: a client should ask the user, outside the view, before a tool the server does not annotate `readOnlyHint` runs. The reference client does.
 - `MCP_APPS=1` tells servers that the Station's clients render views (`io.modelcontextprotocol/ui` with `text/html;profile=mcp-app`). Leave it unset for a Station that only talks over Telegram, which shows the text the server returns for the model.
 
 Rendering is the client's job; [`examples/clients/web`](../examples/clients/web) is a reference client. ChatGPT-only `window.openai` features, such as checkout, are not supported.

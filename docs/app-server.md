@@ -333,7 +333,7 @@ MCP 插件用它支持 [MCP Apps](https://github.com/modelcontextprotocol/ext-ap
 | `mcp/resources/read { server, uri }` | 读取 server 的资源，例如 app 的 `ui://` HTML |
 | `mcp/tools/call { server, name, arguments }` | 替 app 调用它自己 server 上的工具；只允许 visibility 含 `app` 的工具 |
 
-客户端看到 `tool/started` 的工具名对应一个带 `resourceUri` 的工具时，读取 HTML 放进沙箱 iframe，把 `tool/started.input` 和 `tool/completed.details` 交给 app。app 发起的工具调用是用户在客户端里的操作，不经过 blueprint 的审批；需要确认的客户端自己确认。参考实现见 [`examples/clients/web`](../examples/clients/web)。
+客户端看到 `tool/started` 的工具名对应一个带 `resourceUri` 的工具时，读取 HTML 放进沙箱 iframe，把 `tool/started.input` 和 `tool/completed.details` 交给 app。app 发起的工具调用不经过 blueprint 的审批，而 view 不需要用户操作就能发起调用，所以客户端应当在 view 之外先问用户，再执行没有标 `readOnlyHint` 的工具。参考实现见 [`examples/clients/web`](../examples/clients/web)。
 
 ### 版本策略
 

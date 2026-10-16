@@ -1,5 +1,5 @@
 import { Bot, type Context, type Filter } from "grammy";
-import type { ZingPluginAPI } from "zing";
+import type { Approver, ZingPluginAPI } from "zing";
 
 import { createApprovals } from "./approvals";
 
@@ -47,12 +47,19 @@ export default function telegram(zing: ZingPluginAPI) {
 
       bot.on("callback_query:data", async (ctx) => {
         const chatId = ctx.callbackQuery.message?.chat.id;
-        const answered = chatId !== undefined && approvals.answer(ctx.callbackQuery.data, chatId);
-        await ctx.answerCallbackQuery(answered ? undefined : { text: "这个确认已失效。" });
+        const outcome = chatId === undefined ? "expired" : approvals.answer(ctx.callbackQuery.data, chatId, ctx.from.id);
+        if (outcome === "answered") await ctx.answerCallbackQuery();
+        else if (outcome === "not-asker") await ctx.answerCallbackQuery({ text: "只有发起这次请求的人能确认。" });
+        else await ctx.answerCallbackQuery({ text: "这个确认已失效。" });
       });
 
       const respond = async (ctx: Filter<Context, "message:text">): Promise<void> => {
         const conversation = zing.conversationId("telegram", String(ctx.chat.id));
+        const sender = ctx.from;
+        // Without a sender there is nobody to ask, so calls that need approval are declined.
+        const approve: Approver | undefined = sender
+          ? (request, signal) => approvals.ask(ctx.chat.id, sender.id, request, signal)
+          : undefined;
         const stopTyping = keepTyping(ctx);
 
         try {
@@ -62,7 +69,7 @@ export default function telegram(zing: ZingPluginAPI) {
             senderId: ctx.from?.id !== undefined ? String(ctx.from.id) : undefined,
             // Message IDs are stable on redelivery; update IDs may be reused after inactivity.
             requestId: `telegram:${ctx.me.id}:${ctx.chat.id}:${ctx.message.message_id}`,
-            approve: (request, signal) => approvals.ask(ctx.chat.id, request, signal),
+            ...(approve ? { approve } : {}),
           });
           for (const chunk of splitMessage(result.text || "(empty response)")) {
             await ctx.reply(chunk);

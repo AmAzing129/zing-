@@ -77,20 +77,25 @@ class Rpc {
   }
 }
 
-/** Which Zing tools have a view, from the MCP plugin's methods, when the station has them. */
-async function loadApps(methods: readonly string[]): Promise<Map<string, App>> {
-  const found = new Map<string, App>();
-  if (!methods.includes("mcp/servers/list")) return found;
+/**
+ * Which Zing tools have a view, and every server's tool definitions for the calls views make, from the MCP plugin's
+ * methods when the station has them.
+ */
+async function loadApps(methods: readonly string[]): Promise<{ apps: Map<string, App>; tools: Map<string, Tool> }> {
+  const apps = new Map<string, App>();
+  const tools = new Map<string, Tool>();
+  if (!methods.includes("mcp/servers/list")) return { apps, tools };
   const { servers } = await rpc.call<{
     servers: Array<{ server: string; tools: Array<{ definition: Tool; zingTool?: string }> }>;
   }>("mcp/servers/list");
-  for (const { server, tools } of servers) {
-    for (const { definition, zingTool } of tools) {
+  for (const { server, tools: listed } of servers) {
+    for (const { definition, zingTool } of listed) {
+      tools.set(`${server}/${definition.name}`, definition);
       const uri = getToolUiResourceUri(definition);
-      if (zingTool && uri) found.set(zingTool, { server, tool: definition, uri });
+      if (zingTool && uri) apps.set(zingTool, { server, tool: definition, uri });
     }
   }
-  return found;
+  return { apps, tools };
 }
 
 async function openThread(requested: string | undefined): Promise<string> {
@@ -160,34 +165,49 @@ function toolCompleted(callId: string, isError: boolean, details: unknown): void
 
 function askApproval(params: Params): void {
   const turnId = String(params.turnId);
-  const card = add("div", "card");
+  const card = confirmation(
+    `需要你确认才会执行：${String(params.tool)}`,
+    String(params.description ?? ""),
+    params.input,
+    (approved) => {
+      approvals.get(turnId)?.delete(card);
+      void rpc.call("approval/respond", { approvalId: params.approvalId, approved }).catch(() => undefined);
+    },
+  );
+  log.append(card);
+  card.scrollIntoView({ block: "end" });
+  approvals.set(turnId, (approvals.get(turnId) ?? new Set()).add(card));
+}
+
+/** A card asking the user, answered by its buttons. The page draws it, outside every view, so no view can tap it. */
+function confirmation(heading: string, about: string, shownInput: unknown, answer: (approved: boolean) => void): HTMLElement {
+  const card = document.createElement("div");
+  card.className = "card";
   const body = document.createElement("div");
   body.className = "approval";
   const title = document.createElement("strong");
-  title.textContent = `需要你确认才会执行：${String(params.tool)}`;
+  title.textContent = heading;
   const description = document.createElement("div");
   description.className = "tool";
-  description.textContent = String(params.description ?? "");
+  description.textContent = about;
   const shown = document.createElement("pre");
-  shown.textContent = JSON.stringify(params.input, null, 2);
+  shown.textContent = JSON.stringify(shownInput ?? {}, null, 2);
   const actions = document.createElement("div");
   actions.className = "actions";
-  const answer = (approved: boolean) => {
-    approvals.get(turnId)?.delete(card);
-    retire(card, approved ? "已允许。" : "已拒绝。");
-    void rpc.call("approval/respond", { approvalId: params.approvalId, approved }).catch(() => undefined);
-  };
   for (const [label, approved] of [["允许", true], ["拒绝", false]] as const) {
     const button = document.createElement("button");
     button.type = "button";
     button.textContent = label;
     if (approved) button.className = "primary";
-    button.addEventListener("click", () => answer(approved));
+    button.addEventListener("click", () => {
+      retire(card, approved ? "已允许。" : "已拒绝。");
+      answer(approved);
+    });
     actions.append(button);
   }
   body.append(title, description, shown, actions);
   card.append(body);
-  approvals.set(turnId, (approvals.get(turnId) ?? new Set()).add(card));
+  return card;
 }
 
 function retire(card: HTMLElement, note: string): void {
@@ -231,6 +251,20 @@ class AppView {
     this.#queue = this.#queue.then(async (bridge) => {
       if (bridge) await step(bridge).catch((error: unknown) => console.warn("MCP App", error));
       return bridge;
+    });
+  }
+
+  /**
+   * A view can call tools without the user doing anything, so a tool its server does not mark read-only runs only
+   * after the user allows it, on a card the page draws below the view.
+   */
+  #allowed(name: string, args: Params): Promise<boolean> {
+    const { server } = this.#app;
+    if (tools.get(`${server}/${name}`)?.annotations?.readOnlyHint === true) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const card = confirmation(`${server} 的界面想调用：${name}`, tools.get(`${server}/${name}`)?.description ?? "", args, resolve);
+      this.card.after(card);
+      card.scrollIntoView({ block: "nearest" });
     });
   }
 
@@ -279,8 +313,12 @@ class AppView {
       },
     );
     // The view reaches only its own server, through the station.
-    bridge.oncalltool = (params) =>
-      rpc.call<CallToolResult>("mcp/tools/call", { server, name: params.name, arguments: params.arguments ?? {} });
+    bridge.oncalltool = async (params) => {
+      if (!(await this.#allowed(params.name, params.arguments ?? {}))) {
+        return { isError: true, content: [{ type: "text", text: `The user declined ${params.name}. It did not run.` }] };
+      }
+      return rpc.call<CallToolResult>("mcp/tools/call", { server, name: params.name, arguments: params.arguments ?? {} });
+    };
     bridge.onreadresource = (params) => rpc.call<ReadResourceResult>("mcp/resources/read", { server, uri: params.uri });
     bridge.onmessage = async (params) => {
       const text = textOf(params.content);
@@ -362,7 +400,7 @@ const initialized = await rpc.call<{ agent: { name: string }; capabilities: { me
   capabilities: { approvals: true },
 });
 element("agent").textContent = initialized.agent.name;
-const apps = await loadApps(initialized.capabilities.methods ?? []);
+const { apps, tools } = await loadApps(initialized.capabilities.methods ?? []);
 
 let threadId = await openThread(localStorage.getItem(THREAD_KEY) ?? undefined);
 const turns = new Set<string>();
