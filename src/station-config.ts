@@ -4,13 +4,15 @@ import { dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 const STATION_NAMES = ["station.yaml", "station.yml"] as const;
-const STATION_FIELDS = new Set(["plugins", "channel", "provider", "runtime"]);
+const STATION_FIELDS = new Set(["plugins", "bundles", "channel", "provider", "runtime"]);
 export const RUNTIME_KINDS = ["legacy", "durable"] as const;
 export type RuntimeKind = (typeof RUNTIME_KINDS)[number];
 
 export type StationConfig = {
   /** Ordered local modules trusted to run inside this station process. */
   plugins: string[];
+  /** Agent Plugins packages (ChatGPT and Codex plugins) whose parts the enabled plugins may use. Data, not code. */
+  bundles?: string[];
   channel?: string;
   provider?: string;
   /** Which agent runtime runs the capsule. Default: legacy. */
@@ -44,8 +46,10 @@ export function parseStationConfig(
   }
 
   const runtime = parseRuntimeKind(optionalString(record.runtime, `${source}: runtime`), `${source}: runtime`);
+  const bundles = parsePaths(record.bundles, "bundles", source, baseDir);
   return {
-    plugins: parsePluginPaths(record.plugins, source, baseDir),
+    plugins: parsePaths(record.plugins, "plugins", source, baseDir),
+    ...(bundles.length === 0 ? {} : { bundles }),
     channel: optionalString(record.channel, `${source}: channel`),
     provider: optionalString(record.provider, `${source}: provider`),
     ...(runtime === undefined ? {} : { runtime }),
@@ -94,22 +98,22 @@ export async function findStationConfig(options: FindStationOptions = {}): Promi
   return undefined;
 }
 
-function parsePluginPaths(raw: unknown, source: string, baseDir: string): string[] {
+function parsePaths(raw: unknown, field: "plugins" | "bundles", source: string, baseDir: string): string[] {
   if (raw === undefined || raw === null) {
     return [];
   }
   if (!Array.isArray(raw)) {
-    throw new Error(`${source}: plugins must be a list of local paths`);
+    throw new Error(`${source}: ${field} must be a list of local paths`);
   }
   const paths: string[] = [];
   const seen = new Set<string>();
   for (const value of raw) {
     if (typeof value !== "string" || !value.trim()) {
-      throw new Error(`${source}: plugins must be a list of local paths`);
+      throw new Error(`${source}: ${field} must be a list of local paths`);
     }
     const path = resolve(baseDir, value.trim());
     if (seen.has(path)) {
-      throw new Error(`${source}: duplicate plugin path ${value.trim()}`);
+      throw new Error(`${source}: duplicate ${field === "plugins" ? "plugin" : "bundle"} path ${value.trim()}`);
     }
     seen.add(path);
     paths.push(path);

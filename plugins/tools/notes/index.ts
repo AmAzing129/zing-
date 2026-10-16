@@ -135,6 +135,7 @@ export default function notesPlugin(zing: ZingPluginAPI) {
     name: MEMORY_SEARCH_TOOL_NAME,
     description: MEMORY_SEARCH_DESCRIPTION,
     parameters: memorySearchParameters,
+    readOnly: true,
     async execute(input, context) {
       context.signal.throwIfAborted();
       const limit = typeof input.limit === "number" ? input.limit : undefined;

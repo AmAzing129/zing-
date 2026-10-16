@@ -1,9 +1,22 @@
+import type { Bundle } from "../bundle";
 import { requireEnv } from "../env";
 import { SKILL_TOOL_NAME } from "../skills";
 import { conversationId } from "./ids";
-import type { Channel, ConversationHost, ConversationListener, ModelProvider, Tool, ZingPluginAPI } from "./types";
+import type {
+  Channel,
+  ClientMethod,
+  ConversationHost,
+  ConversationListener,
+  ModelProvider,
+  Tool,
+  ZingPluginAPI,
+} from "./types";
 
 const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+const METHOD_NAME = /^[a-z][a-z0-9_-]*(?:\/[a-z][a-z0-9_-]*)+$/;
+const MAX_METHOD_LENGTH = 128;
+/** The App Server's own methods and notifications live here. */
+const RESERVED_NAMESPACES = new Set(["approval", "message", "thread", "tool", "turn", "zing"]);
 
 export type PluginRegistry = {
   readonly api: ZingPluginAPI;
@@ -15,12 +28,14 @@ export type PluginRegistry = {
   listProviders: () => ModelProvider[];
   getTool: (name: string) => Tool | undefined;
   listTools: () => Tool[];
+  listMethods: () => ClientMethod[];
 };
 
 export function createPluginRegistry(
   options: {
     host?: ConversationHost;
     env?: NodeJS.ProcessEnv;
+    bundles?: readonly Bundle[];
   } = {},
 ): PluginRegistry {
   const env = options.env ?? process.env;
@@ -28,6 +43,7 @@ export function createPluginRegistry(
   const channels = new Map<string, Channel>();
   const providers = new Map<string, ModelProvider>();
   const tools = new Map<string, Tool>();
+  const methods = new Map<string, ClientMethod>();
   const listeners: ConversationListener[] = [];
 
   const api: ZingPluginAPI = {
@@ -38,6 +54,7 @@ export function createPluginRegistry(
       return host;
     },
     env,
+    bundles: options.bundles ?? [],
     requireEnv: (name) => requireEnv(env, name),
     conversationId,
     onConversation(listener) {
@@ -89,6 +106,22 @@ export function createPluginRegistry(
       }
       tools.set(name, { ...tool, name });
     },
+    registerMethod(method) {
+      const name = method.name.trim();
+      if (name.length > MAX_METHOD_LENGTH || !METHOD_NAME.test(name)) {
+        throw new Error(
+          `Invalid method name: ${method.name}. Use <namespace>/<name> with lowercase letters, digits, _ and -, such as mcp/tools/call.`,
+        );
+      }
+      const namespace = name.slice(0, name.indexOf("/"));
+      if (RESERVED_NAMESPACES.has(namespace)) {
+        throw new Error(`Method namespace ${namespace}/ is reserved for the App Server`);
+      }
+      if (methods.has(name)) {
+        throw new Error(`Method already registered: ${name}`);
+      }
+      methods.set(name, { ...method, name });
+    },
   };
 
   return {
@@ -103,6 +136,7 @@ export function createPluginRegistry(
     listProviders: () => [...providers.values()],
     getTool: (name) => tools.get(name),
     listTools: () => [...tools.values()],
+    listMethods: () => [...methods.values()],
   };
 }
 

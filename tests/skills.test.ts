@@ -72,6 +72,28 @@ test("an invalid skill fails loading with its file", async () => {
   assert.equal((await loadSkills([first])).length, 1, "the duplicates are each valid alone");
 });
 
+test("a bundle's skills are named after the bundle, whether listed together or one by one", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zing-skills-bundle-"));
+  const bundle = join(root, "notion");
+  await mkdir(join(bundle, ".codex-plugin"), { recursive: true });
+  await writeFile(join(bundle, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "notion", skills: "./skills/" }));
+  const skills = join(bundle, "skills");
+  // Published plugins name skills in frontmatter regardless of their directory.
+  await writeSkill(skills, "capture", "---\nname: knowledge-capture\ndescription: Capture notes.\n---\nCapture.");
+  await writeSkill(skills, "agenda", "---\nname: agenda\ndescription: Prep meetings.\n---\nPrep.");
+  await writeSkill(join(skills, "agenda"), "ios", "---\nname: ios\ndescription: Part of agenda.\n---\nNested.");
+  await mkdir(join(skills, "assets"));
+
+  assert.deepEqual((await loadSkills([bundle])).map((skill) => skill.name), ["notion:agenda", "notion:knowledge-capture"]);
+  assert.deepEqual((await loadSkills([join(skills, "capture")])).map((skill) => skill.name), ["notion:knowledge-capture"]);
+  await assert.rejects(loadSkills([bundle, join(skills, "agenda")]), /Duplicate skill name notion:agenda/);
+
+  const empty = join(root, "empty");
+  await mkdir(join(empty, ".codex-plugin"), { recursive: true });
+  await writeFile(join(empty, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "empty" }));
+  await assert.rejects(loadSkills([empty]), /Bundle empty has no skills/);
+});
+
 test("the skill tool loads instructions and only files inside the skill", async () => {
   const root = await mkdtemp(join(tmpdir(), "zing-skill-tool-"));
   const dir = await writeSkill(root, "weekly-report", "---\nname: weekly-report\ndescription: d\n---\nFollow references/format.md.");

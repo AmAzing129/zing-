@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zing</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --text: #1d1d1f;
+        --muted: #6e6e73;
+        --line: #e5e5ea;
+        --surface: #f5f5f7;
+        --accent: #0a66ff;
+        --danger: #c62828;
+        font: 15px/1.55 system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+        color: var(--text);
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; height: 100vh; display: flex; flex-direction: column; background: #fff; }
+      header {
+        display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+        border-bottom: 1px solid var(--line);
+      }
+      header h1 { font-size: 16px; margin: 0; }
+      header .status { color: var(--muted); font-size: 13px; flex: 1; }
+      button {
+        font: inherit; border: 1px solid var(--line); background: #fff; border-radius: 8px;
+        padding: 6px 14px; cursor: pointer;
+      }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      button:disabled { opacity: 0.5; cursor: default; }
+      main { flex: 1; overflow-y: auto; }
+      #log { max-width: 760px; margin: 0 auto; padding: 24px 20px 40px; display: flex; flex-direction: column; gap: 12px; }
+      .user {
+        align-self: flex-end; max-width: 80%; background: var(--surface); border-radius: 16px;
+        padding: 8px 14px; white-space: pre-wrap;
+      }
+      .assistant { white-space: pre-wrap; }
+      .tool { color: var(--muted); font-size: 13px; }
+      .tool.error { color: var(--danger); }
+      .card { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+      .card iframe { display: block; width: 100%; height: 160px; border: 0; }
+      .card .note { padding: 10px 14px; color: var(--muted); font-size: 13px; }
+      .approval { padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+      .approval pre {
+        margin: 0; background: var(--surface); border-radius: 8px; padding: 8px 10px; font-size: 12px;
+        max-height: 200px; overflow: auto;
+      }
+      .approval .actions { display: flex; gap: 8px; }
+      .error { color: var(--danger); }
+      form {
+        max-width: 760px; width: 100%; margin: 0 auto; padding: 12px 20px 20px; display: flex; gap: 8px;
+      }
+      textarea {
+        flex: 1; font: inherit; resize: none; border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px;
+        min-height: 46px; max-height: 200px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1 id="agent">Zing</h1>
+      <span class="status" id="status">连接中…</span>
+      <button id="new-thread" type="button">新对话</button>
+    </header>
+    <main><div id="log"></div></main>
+    <form id="composer">
+      <textarea id="input" rows="1" placeholder="发消息…" disabled></textarea>
+      <button class="primary" id="send" type="submit" disabled>发送</button>
+      <button id="stop" type="button" hidden>停止</button>
+    </form>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

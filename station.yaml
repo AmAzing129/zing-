@@ -6,6 +6,11 @@ plugins:
   - ./plugins/tools/brave
   - ./plugins/tools/notes
 
+# Optional. ChatGPT/Codex plugin directories (Agent Plugins format) whose skills and MCP servers
+# this station may use. Data only; see plugins/README.md#bundles-chatgpt-and-codex-plugins.
+# bundles:
+#   - ./plugins/bundles/notion
+
 channel: telegram
 # Optional. durable resumes interrupted turns after a restart; see README.
 # runtime: durable

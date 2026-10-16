@@ -8,7 +8,7 @@ Zing 负责 agent 的身份、会话、记忆、工具和运行；客户端只�
 
 v1 必须做到：
 
-- 没有 UI 依赖，也不传输组件、布局或样式。
+- 没有 UI 依赖，协议本身不定义组件、布局或样式。插件可以通过插件方法把自己的界面资源原样交给客户端，例如 MCP Apps 的 `ui://` HTML（见下文），渲染完全由客户端负责。
 - 进程内 Channel 和进程外客户端共用同一个 runtime 行为。
 - 客户端能收到文本增量、工具状态和 turn 最终状态。
 - 会话持久化、同会话串行执行、取消和 reset 有确定语义。
@@ -131,6 +131,7 @@ type RuntimeEvent =
       callId: string;
       name: string;
       isError: boolean;
+      details?: unknown;
     }
   | {
       type: "turn/completed";
@@ -245,6 +246,8 @@ Capsule 已增加 ensure/read/list 能力；Pi 恢复仍使用现有 `loadConver
 | `thread/reset` | 按同 thread 操作顺序追加 reset marker |
 | `turn/start` | 创建 turn，立即返回 `turnId` 和排队状态 |
 | `turn/cancel` | 取消指定 thread 当前正在执行的 turn |
+| `approval/respond` | 回答 `approval/requested`（可选 capability，见下文） |
+| `<namespace>/<name>` | 插件注册的方法，例如 `mcp/tools/call`，列在 `initialize` 结果的 `capabilities.methods` 中 |
 
 `turn/start` 不能等待模型完成后才响应，否则客户端无法可靠建立 turn 状态。响应示例：
 
@@ -281,6 +284,56 @@ Runtime event 直接映射为同名 JSON-RPC notification：
 ```
 
 v1 的事件只发送给发起该 turn 的连接。断线后不重放 delta，客户端通过 `thread/read` 获取最终权威状态。
+
+`tool/completed` 在工具成功且返回了 details 时带上 `details`，内容与 `thread/read` 里对应 toolResult 的 `details` 相同。details 的形状属于注册该工具的插件，例如 MCP 插件返回完整的 MCP `CallToolResult`（含 `structuredContent` 和 `_meta`）。客户端可以据此实时渲染，不必等 turn 结束后再读 thread。
+
+### 工具审批
+
+blueprint 的 `approval`（`writes` 或精确的工具名列表）决定哪些工具调用要先得到用户同意。这是 v1 内新增的可选 capability：
+
+- 客户端在 `initialize` 的 `params.capabilities.approvals: true` 中声明自己会回答审批。服务端在结果的 `capabilities` 中返回 `approvals: true`。
+- 声明了的连接，在它发起的 turn 需要审批时收到 notification，同样排在 `turn/start` 的响应之后：
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "approval/requested",
+  "params": {
+    "type": "approval/requested",
+    "threadId": "thr_123",
+    "turnId": "turn_abc",
+    "approvalId": "apr_…",
+    "tool": "notion__notion_create_pages",
+    "description": "…",
+    "input": { "pages": [] }
+  }
+}
+```
+
+- 客户端用 `approval/respond { approvalId, approved }` 回答。未在等待的 `approvalId` 返回错误码 `-32012`。
+- turn 被取消、超时或连接关闭时，等待中的审批按拒绝处理，客户端从 `turn/completed` 得知结束。
+- 没有声明的客户端（包括旧客户端）不会收到审批请求：需要审批的调用直接被拒绝并告知模型，turn 不会卡住。
+- 审批只在内存中等待。durable runtime 重启后恢复的 turn 没有人可问，同样拒绝。
+
+### 插件方法
+
+插件可以用 `zing.registerMethod({ name, handle })` 向 App Server 客户端提供方法。核心只负责路由，不理解方法的含义：
+
+- 名字必须是 `<namespace>/<name>`，只用小写字母、数字、`_` 和 `-`，例如 `mcp/resources/read`。`approval`、`message`、`thread`、`tool`、`turn`、`zing` 这几个 namespace 保留给 App Server 自己。
+- 有插件方法时，`initialize` 结果的 `capabilities.methods` 列出它们的名字；没有时不出现这个字段。
+- params 原样交给插件，插件的返回值原样作为 result。插件抛错时返回错误码 `-32020`，message 是插件给出的说明。
+- 方法收到的 `signal` 在连接关闭时中止。
+- 只有 App Server 客户端能调用插件方法，Channel 不经过这里。
+
+MCP 插件用它支持 [MCP Apps](https://github.com/modelcontextprotocol/ext-apps)（交互式卡片），核心里没有任何 MCP 概念：
+
+| 方法 | 作用 |
+| --- | --- |
+| `mcp/servers/list` | 每个 server 的 capabilities 和工具定义（含 `_meta.ui.resourceUri`、`_meta.ui.visibility`）；模型可见的工具带上它在 Zing 里的名字 `zingTool` |
+| `mcp/resources/read { server, uri }` | 读取 server 的资源，例如 app 的 `ui://` HTML |
+| `mcp/tools/call { server, name, arguments }` | 替 app 调用它自己 server 上的工具；只允许 visibility 含 `app` 的工具 |
+
+客户端看到 `tool/started` 的工具名对应一个带 `resourceUri` 的工具时，读取 HTML 放进沙箱 iframe，把 `tool/started.input` 和 `tool/completed.details` 交给 app。app 发起的工具调用是用户在客户端里的操作，不经过 blueprint 的审批；需要确认的客户端自己确认。参考实现见 [`examples/clients/web`](../examples/clients/web)。
 
 ### 版本策略
 
@@ -441,11 +494,11 @@ zing app-server           # 新增 JSON-RPC stdio 模式
 ## v1 明确不做
 
 - UI 组件、布局、主题或 generative UI 描述。
-- AG-UI、ACP、MCP UI 等协议兼容层。
+- AG-UI、ACP 等协议兼容层。MCP Apps 不进核心：MCP 插件通过插件方法提供 `ui://` 资源和 app 的工具调用，渲染由客户端负责。
 - event replay、offset、resume token 和 exactly-once delivery。
 - thread 实时订阅和多客户端广播。
 - turn steering、排队 turn 取消和 turn 重试。
-- 工具审批、用户表单和 server-to-client request；JSON-RPC 保留未来增加它们的能力。
+- 用户表单和 server-to-client request。工具审批已作为可选 capability 加入（notification + method，见上文）。
 - thread fork、archive、pin、title、tag、全文搜索。
 - 图片和附件作为协议输入；现有 transcript 的图片存储能力保持不变。
 - 多 agent / 多 capsule 的单进程托管。

@@ -2,6 +2,7 @@ import { readFile, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 
+import type { ApprovalPolicy } from "./approval";
 import { zingHome } from "./env";
 import type { PluginRegistry } from "./plugin/registry";
 import { SKILL_TOOL_NAME } from "./skills";
@@ -9,6 +10,7 @@ import { SKILL_TOOL_NAME } from "./skills";
 const BLUEPRINT_NAMES = ["agent.yaml", "agent.yml", "blueprint.yaml", "blueprint.yml"] as const;
 const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const TOOLS_ERROR = "tools must be a list of exact tool names, for example [market__quote]";
+const APPROVAL_ERROR = 'approval must be "writes" or a list of tool names from tools';
 const SKILLS_ERROR = "skills must be a list of skill directory paths, for example [./skills/weekly-report]";
 
 export type AgentLimits = { turnTimeoutMs: number; maxModelTurns: number; maxToolCalls: number };
@@ -23,6 +25,8 @@ export type Blueprint = {
   limits?: Partial<AgentLimits>;
   /** Exact names of tools exposed to the model. */
   tools: string[];
+  /** Which of those tools ask the user before each call. */
+  approval?: ApprovalPolicy;
   /** Absolute paths of the skill directories the model may load, in order. */
   skills?: string[];
 };
@@ -33,6 +37,8 @@ export type FindBlueprintOptions = { cwd?: string; home?: string; explicit?: str
 export function parseBlueprint(raw: unknown, source = "<blueprint>", baseDir = process.cwd()): Blueprint {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${source}: blueprint must be a mapping`);
   const record = raw as Record<string, unknown>;
+  const tools = parseTools(record.tools, source);
+  const approval = parseApproval(record.approval, tools, source);
   return {
     name: requiredString(record.name, `${source}: name`),
     description: optionalString(record.description, `${source}: description`),
@@ -40,7 +46,8 @@ export function parseBlueprint(raw: unknown, source = "<blueprint>", baseDir = p
     system: optionalString(record.system, `${source}: system`),
     source,
     limits: parseLimits(record.limits, source),
-    tools: parseTools(record.tools, source),
+    tools,
+    ...(approval === undefined ? {} : { approval }),
     skills: parseSkills(record.skills, source, baseDir),
   };
 }
@@ -95,6 +102,20 @@ function parseTools(raw: unknown, source: string): string[] {
     if (!TOOL_NAME.test(name)) throw new Error(`${source}: invalid tool name "${value}"`);
     if (name === SKILL_TOOL_NAME) throw new Error(`${source}: tool "${name}" is reserved; Zing provides it when skills are listed`);
     if (names.includes(name)) throw new Error(`${source}: duplicate tool name "${name}"`);
+    names.push(name);
+  }
+  return names;
+}
+
+function parseApproval(raw: unknown, tools: readonly string[], source: string): ApprovalPolicy | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (raw === "writes") return raw;
+  if (!Array.isArray(raw)) throw new Error(`${source}: ${APPROVAL_ERROR}`);
+  const names: string[] = [];
+  for (const value of raw) {
+    const name = typeof value === "string" ? value.trim() : "";
+    if (!tools.includes(name)) throw new Error(`${source}: approval lists "${String(value)}", which is not in tools`);
+    if (names.includes(name)) throw new Error(`${source}: duplicate approval tool "${name}"`);
     names.push(name);
   }
   return names;

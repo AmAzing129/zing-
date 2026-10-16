@@ -86,6 +86,7 @@ async function main(): Promise<void> {
       // Exit non-zero so the supervisor restarts the station; reopening the storage resumes the agent.
       onFatal: () => stop(1),
       pluginPaths: config.pluginPaths,
+      bundlePaths: config.bundlePaths,
       provider: config.provider,
       env: process.env,
       configureRegistry: once
@@ -106,7 +107,7 @@ async function main(): Promise<void> {
           name: host.agent.name,
           modelId: host.agent.modelId,
         },
-        { signal: shutdown.signal },
+        { signal: shutdown.signal, methods: host.registry.listMethods() },
       );
       return;
     }

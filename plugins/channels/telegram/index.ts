@@ -1,5 +1,7 @@
-import { Bot, type Context } from "grammy";
+import { Bot, type Context, type Filter } from "grammy";
 import type { ZingPluginAPI } from "zing";
+
+import { createApprovals } from "./approvals";
 
 export const TELEGRAM_LIMIT = 4096;
 export const START_TEXT =
@@ -13,6 +15,17 @@ export default function telegram(zing: ZingPluginAPI) {
       const token = zing.requireEnv("TELEGRAM_BOT_TOKEN");
       const allowedUserIds = parseAllowedUserIds(zing.env.TELEGRAM_ALLOWED_USER_IDS);
       const bot = new Bot(token);
+      const approvals = createApprovals({
+        send: async (chatId, text, buttons) => {
+          const keyboard = [buttons.map((button) => ({ text: button.text, callback_data: button.data }))];
+          return (await bot.api.sendMessage(chatId, text, { reply_markup: { inline_keyboard: keyboard } })).message_id;
+        },
+        edit: async (chatId, messageId, text) => {
+          await bot.api.editMessageText(chatId, messageId, text);
+        },
+      });
+      /** Turns that let go of their update to wait for a tap. The channel ends after they settle. */
+      const detached = new Set<Promise<void>>();
 
       bot.use(async (ctx, next) => {
         if (!isAllowed(ctx, allowedUserIds)) {
@@ -32,7 +45,13 @@ export default function telegram(zing: ZingPluginAPI) {
         await ctx.reply("已开始新对话。");
       });
 
-      bot.on("message:text", async (ctx) => {
+      bot.on("callback_query:data", async (ctx) => {
+        const chatId = ctx.callbackQuery.message?.chat.id;
+        const answered = chatId !== undefined && approvals.answer(ctx.callbackQuery.data, chatId);
+        await ctx.answerCallbackQuery(answered ? undefined : { text: "这个确认已失效。" });
+      });
+
+      const respond = async (ctx: Filter<Context, "message:text">): Promise<void> => {
         const conversation = zing.conversationId("telegram", String(ctx.chat.id));
         const stopTyping = keepTyping(ctx);
 
@@ -43,20 +62,39 @@ export default function telegram(zing: ZingPluginAPI) {
             senderId: ctx.from?.id !== undefined ? String(ctx.from.id) : undefined,
             // Message IDs are stable on redelivery; update IDs may be reused after inactivity.
             requestId: `telegram:${ctx.me.id}:${ctx.chat.id}:${ctx.message.message_id}`,
+            approve: (request, signal) => approvals.ask(ctx.chat.id, request, signal),
           });
           for (const chunk of splitMessage(result.text || "(empty response)")) {
             await ctx.reply(chunk);
           }
         } catch (error) {
           console.error("agent run failed", { conversationId: conversation, error });
-          await ctx.reply("调用失败，请稍后再试。");
+          await ctx.reply("调用失败，请稍后再试。").catch(() => undefined);
         } finally {
           stopTyping();
+        }
+      };
+
+      bot.on("message:text", async (ctx) => {
+        const untilAsking = approvals.untilAsking();
+        let replied = false;
+        const reply = respond(ctx).finally(() => {
+          replied = true;
+        });
+        // grammY handles one update at a time. While any question waits for a tap, this handler lets go of its
+        // update, or the tap could never arrive. That turn is acknowledged before its reply, as during shutdown.
+        await Promise.race([reply, untilAsking.asking]);
+        untilAsking.dispose();
+        if (!replied) {
+          detached.add(reply);
+          void reply.finally(() => detached.delete(reply));
         }
       });
 
       let stopping: Promise<void> | undefined;
       const stop = () => {
+        // No tap can arrive once polling stops, so open questions are declined and their turns can finish.
+        approvals.declineAll();
         stopping ??= bot.stop().catch((error) => console.error("Telegram channel cleanup failed", error));
       };
       signal.addEventListener("abort", stop, { once: true });
@@ -71,6 +109,8 @@ export default function telegram(zing: ZingPluginAPI) {
       } finally {
         signal.removeEventListener("abort", stop);
         await stopping;
+        approvals.declineAll();
+        await Promise.allSettled([...detached]);
       }
     },
   });
@@ -139,6 +179,7 @@ function keepTyping(ctx: Context): () => void {
   const timer = setInterval(() => {
     void tick();
   }, 4000);
+  timer.unref();
 
   return () => {
     stopped = true;

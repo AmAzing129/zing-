@@ -273,7 +273,10 @@ test("concurrent messages in the same conversation run in arrival order", async 
 });
 
 test("startTurn streams stable message and tool events", async () => {
-  const { agent, faux } = createTestHarness();
+  const { agent, faux } = createTestHarness({
+    ...webSearch,
+    execute: async () => ({ text: "One", details: { results: [{ title: "One" }] } }),
+  });
   faux.setResponses([
     fauxAssistantMessage([fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "zing" })], { stopReason: "toolUse" }),
     fauxAssistantMessage("streamed answer"),
@@ -289,6 +292,8 @@ test("startTurn streams stable message and tool events", async () => {
   const toolStart = events.find((event) => event.type === "tool/started");
   const toolEnd = events.find((event) => event.type === "tool/completed");
   assert.equal(toolStart?.callId, toolEnd?.callId);
+  // A client renders from the details the tool returned, without reading the thread.
+  assert.deepEqual(toolEnd?.details, { results: [{ title: "One" }] });
   assert.deepEqual(events.at(-1), {
     type: "turn/completed",
     threadId: "web:1",
