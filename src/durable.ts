@@ -58,7 +58,7 @@ import {
 import type { AgentLimits, Blueprint } from "./blueprint";
 import { createMemoryCapsule, type Capsule } from "./capsule";
 import { createContextWindowPolicy } from "./context";
-import type { AgentResult, CapsuleRef, IncomingMessage, Tool } from "./plugin/types";
+import type { AgentResult, Approver, CapsuleRef, IncomingMessage, Tool } from "./plugin/types";
 import {
   RuntimeError,
   TurnBudgetExceededError,
@@ -153,6 +153,8 @@ type TurnBudget = {
 type ActiveTurn = TurnBudget & {
   turnId: string;
   threadId: string;
+  /** In memory only: a turn resumed after a restart has no one to ask. */
+  approve?: Approver;
 };
 
 /**
@@ -353,6 +355,7 @@ export async function createDurableAgent(
       const registration = createDurableTool(tool, {
         threadOf: (id) => threadOf.get(id) ?? String(id),
         senderOf: async (id, api) => (await api.snapshot(TurnDoc, id, CONTEXT))?.senderId,
+        approverOf: (id) => active.get(threadOf.get(id) ?? String(id))?.approve,
         capsule: capsuleRef,
       });
       // Loading a skill only reads, so a call a crash interrupted runs again instead of failing.
@@ -786,7 +789,11 @@ export async function createDurableAgent(
           timeoutMs: limits.turnTimeoutMs,
         };
         await prepareConversation(conversation, modelRef, metadata);
-        turn = Object.assign(createRecoveredBudget(conversation, metadata), { turnId, threadId });
+        turn = Object.assign(createRecoveredBudget(conversation, metadata), {
+          turnId,
+          threadId,
+          ...(input.approve ? { approve: input.approve } : {}),
+        });
         const current = turn;
         active.set(threadId, current);
 
@@ -937,6 +944,7 @@ export async function createDurableAgent(
         text: message.text,
         senderId: message.senderId,
         requestId: message.requestId,
+        approve: message.approve,
       }).completed;
     },
     resetConversation: resetThread,
@@ -982,6 +990,7 @@ export async function createDurableAgent(
 type ToolScope = {
   threadOf: (id: ConversationId) => string;
   senderOf: (id: ConversationId, api: { snapshot: Harness["snapshot"] }) => Promise<string | undefined>;
+  approverOf: (id: ConversationId) => Approver | undefined;
   capsule: CapsuleRef;
 };
 
@@ -996,12 +1005,14 @@ export function createDurableTool(tool: Tool, scope: ToolScope): ToolRegistratio
     // Typed so a renamed result field fails to compile: pi-durable ignores unknown fields, and its fields are optional.
     execute: async (input, api, context): Promise<ToolExecutionResult> => {
       const signal = context.abortSignal ?? new AbortController().signal;
+      const approve = scope.approverOf(api.conversationId);
       const work = (async () =>
         tool.execute(input as Record<string, unknown>, {
           signal,
           conversationId: scope.threadOf(api.conversationId),
           senderId: await scope.senderOf(api.conversationId, api),
           capsule: scope.capsule,
+          ...(approve ? { approve } : {}),
         }))();
       const result = await raceWithAbort(work, signal, `${tool.name} aborted`);
       return {
@@ -1279,13 +1290,16 @@ function createEventTranslator(
     }
     if (event.type === "tool_execution_end") {
       const result = event.entry?.model?.[0];
+      const isError = result?.role === "toolResult" ? result.isError : true;
+      const details: unknown = result?.role === "toolResult" && !isError ? result.details : undefined;
       emit({
         type: "tool/completed",
         threadId,
         turnId,
         callId: event.toolCallId,
         name: event.toolName,
-        isError: result?.role === "toolResult" ? result.isError : true,
+        isError,
+        ...(details !== undefined && details !== null ? { details } : {}),
       });
     }
   };

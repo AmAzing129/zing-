@@ -7,6 +7,7 @@ export type Config = {
   provider?: string;
   capsulePath?: string;
   pluginPaths: string[];
+  bundlePaths: string[];
   runtime: RuntimeKind;
 };
 
@@ -26,6 +27,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env, options: LoadCo
     provider: options.provider ?? emptyToUndefined(env.PROVIDER) ?? station?.provider,
     capsulePath: options.capsulePath ?? emptyToUndefined(env.ZING_CAPSULE),
     pluginPaths: [...(station?.plugins ?? []), ...splitList(env.ZING_PLUGINS), ...(options.pluginPaths ?? [])],
+    bundlePaths: [...(station?.bundles ?? []), ...splitList(env.ZING_BUNDLES)],
     runtime: parseRuntimeKind(emptyToUndefined(env.ZING_RUNTIME), "ZING_RUNTIME") ?? station?.runtime ?? "legacy",
   };
 }

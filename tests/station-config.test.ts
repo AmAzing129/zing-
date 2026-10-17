@@ -12,18 +12,19 @@ import {
   parseStationConfig,
 } from "../src/station-config";
 
-test("station config resolves ordered plugin paths relative to its own file", async () => {
+test("station config resolves ordered plugin and bundle paths relative to its own file", async () => {
   const root = await mkdtemp(join(tmpdir(), "zing-station-"));
   const configDir = join(root, "config");
   await mkdir(configDir);
   const path = join(configDir, "station.yaml");
   await writeFile(
     path,
-    "plugins:\n  - ../plugins/xai\n  - ../plugins/telegram\nchannel: telegram\nprovider: xai\n",
+    "plugins:\n  - ../plugins/xai\n  - ../plugins/telegram\nbundles:\n  - ../bundles/notion\nchannel: telegram\nprovider: xai\n",
   );
 
   assert.deepEqual(await loadStationConfig(path), {
     plugins: [join(root, "plugins", "xai"), join(root, "plugins", "telegram")],
+    bundles: [join(root, "bundles", "notion")],
     channel: "telegram",
     provider: "xai",
   });
@@ -41,6 +42,10 @@ test("station config rejects unknown fields, invalid lists, and duplicate resolv
   assert.throws(
     () => parseStationConfig({ plugins: ["./one", "one"] }, "station.yaml", "/tmp/config"),
     /duplicate plugin path/,
+  );
+  assert.throws(
+    () => parseStationConfig({ bundles: ["./notion", "notion/"] }, "station.yaml", "/tmp/config"),
+    /duplicate bundle path/,
   );
 });
 

@@ -163,6 +163,7 @@ export function usage(): string {
     "  --help, -h              Show this help",
     "",
     "ZING_PLUGINS and repeatable --plugin flags append temporary local plugin paths.",
+    "ZING_BUNDLES appends ChatGPT/Codex plugin bundles to station.yaml bundles.",
     "Blueprint is the kind. Capsule is this one. Station is where it docks.",
   ].join("\n");
 }

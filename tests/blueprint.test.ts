@@ -122,3 +122,13 @@ test("resolveBlueprintTools exposes exact listed tools and reports missing names
   assert.deepEqual(resolveBlueprintTools(parseBlueprint({ name: "a", tools: ["market__quote"] }), registry).map((tool) => tool.name), ["market__quote"]);
   assert.throws(() => resolveBlueprintTools(parseBlueprint({ name: "a", tools: ["news__latest"] }), registry), /Tools are not registered: news__latest\. Registered: market__quote, market__trade/);
 });
+
+test("approval is writes or a list of the blueprint's own tools", () => {
+  const tools = ["notion__search", "notion__create"];
+  assert.equal(parseBlueprint({ name: "a", tools }).approval, undefined);
+  assert.equal(parseBlueprint({ name: "a", tools, approval: "writes" }).approval, "writes");
+  assert.deepEqual(parseBlueprint({ name: "a", tools, approval: ["notion__create"] }).approval, ["notion__create"]);
+  assert.throws(() => parseBlueprint({ name: "a", tools, approval: ["slack__post"] }), /approval lists "slack__post", which is not in tools/);
+  assert.throws(() => parseBlueprint({ name: "a", tools, approval: ["notion__create", "notion__create"] }), /duplicate approval/);
+  assert.throws(() => parseBlueprint({ name: "a", tools, approval: "all" }), /approval must be "writes" or a list/);
+});

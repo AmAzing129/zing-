@@ -145,7 +145,7 @@ test("protocol requires one supported initialize call", async () => {
     result: {
       protocolVersion: 1,
       agent: info,
-      capabilities: { streaming: true, cancel: true, threadRead: true, threadList: true },
+      capabilities: { streaming: true, cancel: true, threadRead: true, threadList: true, approvals: true },
     },
   });
   assert.equal((messages[2]?.error as Message).code, -32002);
@@ -181,6 +181,106 @@ test("protocol exposes thread methods and streams turn events after its response
   assert.equal((turnCompleted?.params as Message).status, "completed");
   assert.deepEqual(runtime.resetCalls, ["telegram:1"]);
   assert.deepEqual(runtime.cancelCalls, [["telegram:1", "turn_1"]]);
+});
+
+/** Each turn asks its approver once and answers with the decision. */
+class ApprovingRuntime extends FakeRuntime {
+  readonly approvers: Array<TurnInput["approve"]> = [];
+  readonly results: Array<Promise<{ text: string }>> = [];
+
+  override startTurn(input: TurnInput): TurnHandle {
+    this.approvers.push(input.approve);
+    const controller = new AbortController();
+    const request = { tool: "notion__create", description: "Create a page", input: { title: "x" } };
+    const completed = (async () => ({ text: `approved: ${String(await input.approve?.(request, controller.signal))}` }))();
+    this.results.push(completed);
+    return { turnId: "turn_a", completed, cancel: () => controller.abort(), subscribe: () => () => {} };
+  }
+}
+
+test("a client that declares approvals answers approval/requested; other clients get no approver", async () => {
+  const silent = new ApprovingRuntime();
+  const ignored = new ProtocolSession({ runtime: silent, info, write: () => {} });
+  await ignored.handleMessage(initialize());
+  await ignored.handleMessage(request(2, "turn/start", { threadId: "web:1", input: { type: "text", text: "go" } }));
+  assert.equal(silent.approvers[0], undefined);
+
+  const runtime = new ApprovingRuntime();
+  const messages: Message[] = [];
+  const session = new ProtocolSession({ runtime, info, write: (message) => void messages.push(message) });
+  await session.handleMessage(
+    request(1, "initialize", {
+      protocolVersion: 1,
+      clientInfo: { name: "web", version: "1" },
+      capabilities: { approvals: true },
+    }),
+  );
+  await session.handleMessage(request(2, "turn/start", { threadId: "web:1", input: { type: "text", text: "go" } }));
+  const asked = messages.find((message) => message.method === "approval/requested");
+  assert.ok(messages.indexOf(asked as Message) > messages.findIndex((message) => message.id === 2), "after turn/start's response");
+  const params = asked?.params as Message;
+  assert.deepEqual({ ...params, approvalId: "…" }, {
+    type: "approval/requested",
+    threadId: "web:1",
+    turnId: "turn_a",
+    approvalId: "…",
+    tool: "notion__create",
+    description: "Create a page",
+    input: { title: "x" },
+  });
+
+  await session.handleMessage(request(3, "approval/respond", { approvalId: params.approvalId, approved: true }));
+  assert.deepEqual(messages.find((message) => message.id === 3)?.result, {});
+  assert.deepEqual(await runtime.results[0], { text: "approved: true" });
+  await session.handleMessage(request(4, "approval/respond", { approvalId: params.approvalId, approved: false }));
+  assert.equal((messages.find((message) => message.id === 4)?.error as Message).code, -32012);
+  await session.close();
+});
+
+test("plugin methods are listed at initialize and routed by name; their errors carry the plugin's message", async () => {
+  const messages: Message[] = [];
+  let signal: AbortSignal | undefined;
+  const session = new ProtocolSession({
+    runtime: new FakeRuntime(),
+    info,
+    write: (message) => void messages.push(message),
+    methods: [
+      {
+        name: "demo/echo",
+        handle: async (params, context) => {
+          signal = context.signal;
+          return { echoed: params as string };
+        },
+      },
+      {
+        name: "demo/fail",
+        handle: async () => {
+          throw new Error("server demo is not connected");
+        },
+      },
+    ],
+  });
+  await session.handleMessage(request(1, "demo/echo", "early"));
+  await session.handleMessage(initialize(2));
+  await session.handleMessage(request(3, "demo/echo", "hi"));
+  await session.handleMessage(request(4, "demo/fail", {}));
+  await session.handleMessage(request(5, "demo/missing", {}));
+
+  assert.equal((messages[0]?.error as Message).code, -32001);
+  assert.deepEqual((messages[1]?.result as Message).capabilities, {
+    streaming: true,
+    cancel: true,
+    threadRead: true,
+    threadList: true,
+    approvals: true,
+    methods: ["demo/echo", "demo/fail"],
+  });
+  assert.deepEqual(messages[2], { jsonrpc: "2.0", id: 3, result: { echoed: "hi" } });
+  assert.deepEqual(messages[3]?.error, { code: -32020, message: "server demo is not connected" });
+  assert.equal((messages[4]?.error as Message).code, -32601);
+  assert.equal(signal?.aborted, false);
+  await session.close();
+  assert.equal(signal?.aborted, true);
 });
 
 test("closing a protocol session cancels every turn handle before waiting", async () => {
@@ -271,6 +371,8 @@ test("the checked-in v1 schema is valid JSON and names every method and event", 
     "tool/started",
     "tool/completed",
     "turn/completed",
+    "approval/requested",
+    "approval/respond",
   ]) {
     assert.match(text, new RegExp(name.replace("/", "\\/")));
   }
