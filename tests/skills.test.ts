@@ -88,6 +88,13 @@ test("a bundle's skills are named after the bundle, whether listed together or o
   assert.deepEqual((await loadSkills([join(skills, "capture")])).map((skill) => skill.name), ["notion:knowledge-capture"]);
   await assert.rejects(loadSkills([bundle, join(skills, "agenda")]), /Duplicate skill name notion:agenda/);
 
+  // A Codex manifest may put its skills deeper than <bundle>/skills.
+  const nested = join(root, "linear");
+  await mkdir(join(nested, ".codex-plugin"), { recursive: true });
+  await writeFile(join(nested, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "linear", skills: "./src/skills" }));
+  const triage = await writeSkill(join(nested, "src", "skills"), "triage-dir", "---\nname: triage\ndescription: Triage.\n---\nTriage.");
+  assert.deepEqual((await loadSkills([triage])).map((skill) => skill.name), ["linear:triage"]);
+
   const empty = join(root, "empty");
   await mkdir(join(empty, ".codex-plugin"), { recursive: true });
   await writeFile(join(empty, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "empty" }));

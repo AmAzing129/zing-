@@ -125,13 +125,20 @@ async function renderHistory(): Promise<void> {
 
 async function startTurn(text: string): Promise<void> {
   add("div", "user", text);
+  const thread = threadId;
   try {
-    const { turn } = await rpc.call<{ turn: { id: string } }>("turn/start", { threadId, input: { type: "text", text } });
-    turns.add(turn.id);
+    const { turn } = await rpc.call<{ turn: { id: string } }>("turn/start", { threadId: thread, input: { type: "text", text } });
+    // The user opened another conversation while this one was starting: stop it, as switching stops the others.
+    if (thread !== threadId) return cancelTurn(thread, turn.id);
+    turns.set(turn.id, thread);
     setIdle();
   } catch (error) {
     add("div", "error", `没有发出去：${(error as Error).message}`);
   }
+}
+
+function cancelTurn(thread: string, turnId: string): void {
+  void rpc.call("turn/cancel", { threadId: thread, turnId }).catch(() => undefined);
 }
 
 function turnCompleted(params: Params): void {
@@ -403,7 +410,8 @@ element("agent").textContent = initialized.agent.name;
 const { apps, tools } = await loadApps(initialized.capabilities.methods ?? []);
 
 let threadId = await openThread(localStorage.getItem(THREAD_KEY) ?? undefined);
-const turns = new Set<string>();
+/** Turns still running, with the thread each belongs to. */
+const turns = new Map<string, string>();
 /** Per tool call: its status line, and its view when the tool has one. */
 const calls = new Map<string, { line: HTMLElement; view?: AppView }>();
 const bubbles = new Map<string, HTMLElement>();
@@ -411,6 +419,8 @@ const bubbles = new Map<string, HTMLElement>();
 const approvals = new Map<string, Set<HTMLElement>>();
 
 rpc.onNotification = (method, params) => {
+  // Events of a conversation the user has left belong to no part of the page.
+  if (params.threadId !== threadId) return;
   if (method === "message/delta") bubble(String(params.messageId)).textContent += String(params.delta);
   else if (method === "message/completed") bubble(String(params.messageId)).textContent = String(params.text);
   else if (method === "tool/started") toolStarted(String(params.callId), String(params.name), (params.input ?? {}) as Params);
@@ -437,10 +447,31 @@ input.addEventListener("keydown", (event) => {
   }
 });
 stop.addEventListener("click", () => {
-  for (const turnId of turns) void rpc.call("turn/cancel", { threadId, turnId }).catch(() => undefined);
+  for (const [turnId, thread] of turns) cancelTurn(thread, turnId);
 });
-element("new-thread").addEventListener("click", async () => {
-  localStorage.removeItem(THREAD_KEY);
-  threadId = await openThread(undefined);
+const newThread = element("new-thread") as HTMLButtonElement;
+newThread.addEventListener("click", async () => {
+  // Running turns would keep writing into the new conversation, so they stop with the old one. Canceling also
+  // declines their open approvals on the station.
+  for (const [turnId, thread] of turns) cancelTurn(thread, turnId);
+  turns.clear();
+  calls.clear();
+  bubbles.clear();
+  approvals.clear();
   log.replaceChildren();
+  // No thread while the new one opens, so nothing the old one still sends gets through.
+  const previous = threadId;
+  threadId = "";
+  newThread.disabled = input.disabled = send.disabled = true;
+  try {
+    localStorage.removeItem(THREAD_KEY);
+    threadId = await openThread(undefined);
+  } catch (error) {
+    threadId = previous;
+    localStorage.setItem(THREAD_KEY, previous);
+    add("div", "error", `没有开始新对话：${(error as Error).message}`);
+  } finally {
+    newThread.disabled = false;
+    setIdle();
+  }
 });

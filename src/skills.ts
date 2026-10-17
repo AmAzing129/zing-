@@ -87,13 +87,20 @@ async function skillDirectories(skillsDir: string): Promise<string[]> {
   return dirs;
 }
 
-/** The bundle whose skills directory holds this skill directory, if any. Any other manifest leaves it standalone. */
+/**
+ * The bundle whose skills directory holds this skill directory, if any. A Codex manifest may put that directory at
+ * any depth, so the nearest manifest above the skill decides; one whose skills live elsewhere leaves it standalone.
+ */
 async function enclosingBundle(path: string): Promise<Bundle | undefined> {
-  const root = dirname(dirname(resolve(path)));
-  if (!(await findBundleManifest(root))) return undefined;
-  const bundle = await loadBundle(root).catch(() => undefined);
   const parent = await realpath(dirname(resolve(path))).catch(() => undefined);
-  return bundle && parent === bundle.skillsDir ? bundle : undefined;
+  if (!parent) return undefined;
+  for (let dir = parent; ; dir = dirname(dir)) {
+    if (await findBundleManifest(dir)) {
+      const bundle = await loadBundle(dir).catch(() => undefined);
+      return bundle && parent === bundle.skillsDir ? bundle : undefined;
+    }
+    if (dirname(dir) === dir) return undefined;
+  }
 }
 
 /**
