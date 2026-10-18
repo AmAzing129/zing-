@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import type { JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
@@ -30,6 +28,7 @@ import {
   type AgentEvent as DurableEvent,
   type Conversation,
   type ConversationId,
+  type EntryId,
   type EntryRecord,
   type Storage,
   type SubmissionId,
@@ -81,7 +80,7 @@ import {
   withSkillTool,
 } from "./skills";
 import type { Station } from "./station";
-import { encodeMessages, triggerOf } from "./transcript";
+import { createTriggerMessage, encodeMessages, triggerOf } from "./transcript";
 import { MESSAGE_TRIGGER, normalizeTriggerInfo, renderTriggerText } from "./trigger";
 
 const CONTEXT = BACKGROUND_CONTEXT;
@@ -111,10 +110,11 @@ type TurnRecord = {
 /** `senderId` and `trigger` are the latest turn's, for tools. `turns` keeps the turns observers have not finished. */
 type TurnState = { senderId?: string; trigger?: TriggerInfo; turns?: TurnRecord[] };
 /**
- * Automated triggers by the hash of the framed text the model saw. pi-durable stores only that text, so this is what
- * turns a user entry back into its raw trigger text and kind; a user typing the same frame is not labelled.
+ * Automated triggers by the ID of the user entry they submitted. pi-durable stores only the framed text the model saw,
+ * so this is what turns that entry back into its raw trigger text and kind; text alone never labels an entry, so a user
+ * typing the same frame stays a user message. Entries that left the active context are dropped.
  */
-type TriggerState = { entries?: { [key: string]: TriggerInfo } };
+type TriggerState = { entries?: { [entryId: string]: TriggerInfo } };
 type TurnFailure = { budget: string; message: string };
 
 /** Zing thread IDs, which the runtime treats as opaque, mapped to durable conversations. */
@@ -555,6 +555,10 @@ export async function createDurableAgent(
           const turn = findTurn(state.turns, requestId);
           if (turn) turn.observed = true;
           if (state.turns) pruneTurns(state.turns);
+          // Observed turns leave TurnDoc, so the entry their trigger submitted is recorded here, in the same commit.
+          const entry = turn?.trigger && (await tx.submissionByRequest(id, requestId))?.entry;
+          if (turn?.trigger && entry !== undefined) await rememberTrigger(tx, id, entry, turn.trigger);
+          await pruneTriggers(tx, id);
         }, CONTEXT),
       )
       .catch((error: unknown) => {
@@ -571,9 +575,9 @@ export async function createDurableAgent(
   const observeTurn = async (threadId: string, conversation: Conversation, record: SubmissionRecord): Promise<void> => {
     const turn = findTurn((await open().snapshot(TurnDoc, conversation.id, CONTEXT))?.turns, record.requestId);
     if (!turn || turn.observed || observing.has(record.id)) return;
-    const entries = labelTriggers(
-      await readTurnEntries(conversation, record),
-      await open().snapshot(TriggerDoc, conversation.id, CONTEXT),
+    const entries = toThreadEntries(
+      await readTurnRecords(conversation, record),
+      turn.trigger && record.entry !== undefined ? new Map([[record.entry, turn.trigger]]) : undefined,
     );
     await touch(threadId);
     observing.add(record.id);
@@ -819,7 +823,7 @@ export async function createDurableAgent(
           deadlineAt: Date.now() + limits.turnTimeoutMs,
           timeoutMs: limits.turnTimeoutMs,
         };
-        await prepareConversation(conversation, modelRef, metadata, content);
+        await prepareConversation(conversation, modelRef, metadata);
         turn = Object.assign(createRecoveredBudget(conversation, metadata), { turnId, threadId });
         const current = turn;
         active.set(threadId, current);
@@ -951,6 +955,7 @@ export async function createDurableAgent(
       await conversation.waitForIdle(CONTEXT);
       await conversation.reset(undefined, CONTEXT);
       await conversation.waitForIdle(CONTEXT);
+      await conversation.commit((tx) => pruneTriggers(tx, conversation.id), CONTEXT);
       await touch(normalized);
       observers.notify({ type: "reset", conversationId: normalized, capsule: capsuleRef });
     });
@@ -988,11 +993,10 @@ export async function createDurableAgent(
       }
       const view = await conversation.context(CONTEXT);
       const live = await open().snapshot(LiveDoc, conversation.id, CONTEXT);
-      const triggers = await open().snapshot(TriggerDoc, conversation.id, CONTEXT);
       return {
         threadId: normalized,
         status: live?.run ? "active" : "idle",
-        entries: labelTriggers(toThreadEntries(view.entries), triggers),
+        entries: toThreadEntries(view.entries, await triggerEntries(open(), conversation.id)),
       };
     },
     async listThreads(options?: ListThreadsOptions) {
@@ -1083,7 +1087,6 @@ async function prepareConversation(
   conversation: Conversation,
   model: { provider: string; modelId: string },
   metadata: TurnRecord,
-  content: string,
 ): Promise<void> {
   const { senderId, requestId, trigger } = metadata;
   const agent = await conversation.agent(CONTEXT);
@@ -1098,7 +1101,6 @@ async function prepareConversation(
       delete turn.trigger;
     } else {
       turn.trigger = trigger;
-      await rememberTrigger(tx, conversation.id, content, trigger);
     }
     turn.turns ??= [];
     const index = turn.turns.findIndex((record) => record.requestId === requestId);
@@ -1117,9 +1119,9 @@ async function importMessages(tx: Tx, id: ConversationId, messages: readonly Mes
     if (message.role === "system") {
       await tx.appendEntry(SystemEntry, id, { model: [message] });
     } else if (message.role === "user") {
-      await tx.appendEntry(UserEntry, id, { model: [message] });
+      const entry = await tx.appendEntry(UserEntry, id, { model: [message] });
       const trigger = triggerOf(message);
-      if (trigger) await rememberTrigger(tx, id, contentText(message.content, ""), trigger);
+      if (trigger) await rememberTrigger(tx, id, entry.id, trigger);
     } else if (message.role === "assistant") {
       await tx.appendEntry(AssistantEntry, id, { model: [message] });
     } else {
@@ -1128,32 +1130,45 @@ async function importMessages(tx: Tx, id: ConversationId, messages: readonly Mes
   }
 }
 
-async function rememberTrigger(tx: Tx, id: ConversationId, framed: string, trigger: TriggerInfo): Promise<void> {
+async function rememberTrigger(tx: Tx, id: ConversationId, entry: EntryId, trigger: TriggerInfo): Promise<void> {
   const doc = await tx.doc(TriggerDoc, id);
   doc.entries ??= {};
-  doc.entries[triggerKey(framed)] = trigger;
+  doc.entries[String(entry)] = trigger;
 }
 
-function triggerKey(framed: string): string {
-  return `h:${createHash("sha256").update(framed).digest("hex")}`;
+/** Drop triggers whose entries a reset, handoff, or compaction moved out of the active context. */
+async function pruneTriggers(tx: Tx, id: ConversationId): Promise<void> {
+  const doc = await tx.doc(TriggerDoc, id);
+  if (!doc.entries) return;
+  const head = (await tx.latestHeadMarker(id))?.head;
+  for (const key of Object.keys(doc.entries)) {
+    const entry = Number(key);
+    if (!Number.isSafeInteger(entry) || (head !== undefined && entry < head)) delete doc.entries[key];
+  }
 }
 
-/** Give user entries that an automated trigger submitted the same shape as the legacy runtime: raw text plus kind. */
-function labelTriggers(entries: ThreadEntry[], triggers: TriggerState | undefined): ThreadEntry[] {
-  const known = triggers?.entries;
-  if (!known) return entries;
-  return entries.map((entry) => {
-    if (entry.type !== "user") return entry;
-    const framed =
-      typeof entry.content === "string"
-        ? entry.content
-        : entry.content.every((block) => block.type === "text")
-          ? entry.content.map((block) => (block.type === "text" ? block.text : "")).join("")
-          : undefined;
-    const trigger = framed === undefined ? undefined : known[triggerKey(framed)];
-    if (!framed || !trigger) return entry;
-    return { type: "user", at: entry.at, content: framed.slice(framed.indexOf("\n") + 1), trigger };
-  });
+/** Every automated trigger entry: those observed turns recorded, and those of turns still waiting for observers. */
+async function triggerEntries(harness: Harness, id: ConversationId): Promise<Map<number, TriggerInfo>> {
+  const known = new Map<number, TriggerInfo>();
+  for (const [key, trigger] of Object.entries((await harness.snapshot(TriggerDoc, id, CONTEXT))?.entries ?? {})) {
+    known.set(Number(key), trigger);
+  }
+  for (const turn of (await harness.snapshot(TurnDoc, id, CONTEXT))?.turns ?? []) {
+    if (turn.observed || !turn.trigger) continue;
+    const entry = (await requestRecord(harness, id, turn.requestId))?.entry;
+    if (entry !== undefined) known.set(entry, turn.trigger);
+  }
+  return known;
+}
+
+/** A user message an automated trigger submitted, given the raw text and kind the legacy transcript stores. */
+function labelTrigger(message: Message, trigger: TriggerInfo): Message {
+  if (message.role !== "user") return message;
+  const framed =
+    typeof message.content === "string"
+      ? message.content
+      : message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+  return createTriggerMessage(trigger, framed.slice(framed.indexOf("\n") + 1), message.timestamp);
 }
 
 function findTurn<T extends TurnRecord>(
@@ -1186,10 +1201,6 @@ function requestRecord(harness: Harness, id: ConversationId, requestId: string):
  * The entries one settled input added: its user entry through its answer, or, when unanswered, up to the next user
  * entry. Zing submits one input at a time per thread, so the next user entry starts the next turn.
  */
-async function readTurnEntries(conversation: Conversation, record: SubmissionRecord): Promise<ThreadEntry[]> {
-  return toThreadEntries(await readTurnRecords(conversation, record));
-}
-
 async function readTurnRecords(conversation: Conversation, record: SubmissionRecord): Promise<EntryRecord[]> {
   if (record.entry === undefined) return [];
   const last = record.status === "done" && record.type === "input" ? record.answer : undefined;
@@ -1229,10 +1240,14 @@ function spentBudget(records: readonly EntryRecord[]): { modelTurns: number; too
   return { modelTurns, toolCalls };
 }
 
-function toThreadEntries(records: readonly EntryRecord[]): ThreadEntry[] {
+/** `triggers` labels the user entries automated triggers submitted, by entry ID. */
+function toThreadEntries(records: readonly EntryRecord[], triggers?: ReadonlyMap<number, TriggerInfo>): ThreadEntry[] {
   const messages = records
     .filter((record) => UserEntry.is(record) || AssistantEntry.is(record) || ToolResultEntry.is(record))
-    .flatMap((record) => record.model ?? []);
+    .flatMap((record) => {
+      const trigger = UserEntry.is(record) ? triggers?.get(record.id) : undefined;
+      return trigger ? (record.model ?? []).map((message) => labelTrigger(message, trigger)) : (record.model ?? []);
+    });
   return encodeMessages(messages).map(toThreadEntry);
 }
 
