@@ -63,6 +63,7 @@ test("registry validates and de-duplicates generic tool names", () => {
   assert.throws(() => registry.api.registerTool(tool), /already registered/);
   assert.throws(() => registry.api.registerTool({ ...tool, name: "Market.quote" }), /Invalid tool name/);
   assert.throws(() => registry.api.registerTool({ ...tool, name: "skill" }), /Tool name skill is reserved/);
+  assert.throws(() => registry.api.registerTool({ ...tool, name: "subagent" }), /Tool name subagent is reserved/);
   registry.api.registerTool({ ...tool, name: "web_search" });
   assert.equal(registry.getTool("web_search")?.name, "web_search");
 });

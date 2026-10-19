@@ -6,7 +6,7 @@ import {
   type AgentMessage,
   type AgentTool,
 } from "@earendil-works/pi-agent-core";
-import { contentText } from "@earendil-works/pi-ai";
+import { contentText, type JsonValue } from "@earendil-works/pi-ai";
 
 import type { AgentLimits, Blueprint } from "./blueprint";
 import { createMemoryCapsule, type Capsule } from "./capsule";
@@ -34,8 +34,10 @@ import {
   type TurnHandle,
   type TurnInput,
 } from "./runtime";
-import { composeSystemPrompt, withSkillTool, type Skill } from "./skills";
+import { composeSystemPrompt } from "./prompt";
+import { withSkillTool, type Skill } from "./skills";
 import type { Station } from "./station";
+import { withSubagentTool, type Subagent, type SubagentRun } from "./subagents";
 import { createTriggerMessage, encodeMessages, type TranscriptEvent } from "./transcript";
 import { MESSAGE_TRIGGER, normalizeTriggerInfo } from "./trigger";
 
@@ -78,6 +80,8 @@ export type CreateAgentOptions = {
   tools?: readonly Tool[];
   /** Skills the blueprint lists, loaded. They add a prompt section and the skill tool. */
   skills?: readonly Skill[];
+  /** Subagents the blueprint lists, loaded. They add a prompt section and the subagent tool. */
+  subagents?: readonly Subagent[];
   limits?: Partial<AgentLimits>;
   listeners?: readonly ConversationListener[];
   observerTimeoutMs?: number;
@@ -95,8 +99,9 @@ export function createAgent(
   const resolved = capsule ?? createMemoryCapsule({ blueprintName: blueprint.name });
   const model = station.resolveModel(blueprint.model);
   const skills = options?.skills ?? [];
-  const system = composeSystemPrompt(blueprint.system ?? DEFAULT_SYSTEM, skills);
-  const tools = withSkillTool(options?.tools ?? [], skills);
+  const subagents = options?.subagents ?? [];
+  const system = composeSystemPrompt(blueprint.system ?? DEFAULT_SYSTEM, skills, subagents);
+  const tools = withBuiltinTools(station, model.id, options?.tools ?? [], skills, subagents);
   const limits = resolveAgentLimits(blueprint.limits, options?.limits);
   const conversations = new Map<string, Conversation>();
   const pending = new Map<string, Promise<void>>();
@@ -122,9 +127,10 @@ export function createAgent(
         tools,
         limits,
         system,
-        capsule: resolved,
+        capsule: capsuleRef,
         conversationId: threadId,
         messages: await resolved.loadConversation(threadId),
+        persist: (fresh) => resolved.appendConversation(threadId, fresh),
       });
       conversations.set(threadId, conversation);
     }
@@ -353,9 +359,11 @@ type ConversationOptions = {
   tools: readonly Tool[];
   limits: AgentLimits;
   system: string;
-  capsule: Capsule;
+  capsule: CapsuleRef;
   conversationId: string;
   messages: AgentMessage[];
+  /** Store the messages a prompt added. Absent: they live only in memory, as a subagent's do. */
+  persist?: (fresh: AgentMessage[]) => Promise<void>;
 };
 
 type ActiveBudget = {
@@ -366,8 +374,7 @@ type ActiveBudget = {
 
 class Conversation {
   private readonly inner: PiAgent;
-  private readonly capsule: Capsule;
-  private readonly conversationId: string;
+  private readonly persist?: (fresh: AgentMessage[]) => Promise<void>;
   private readonly limits: AgentLimits;
   private readonly context: ContextWindowPolicy;
   private senderId?: string;
@@ -377,8 +384,7 @@ class Conversation {
   private persisted: number;
 
   constructor(options: ConversationOptions) {
-    this.capsule = options.capsule;
-    this.conversationId = options.conversationId;
+    this.persist = options.persist;
     this.limits = options.limits;
     const model = options.station.resolveModel(options.modelId);
     const tools = options.tools.map((tool) =>
@@ -386,10 +392,7 @@ class Conversation {
         conversationId: options.conversationId,
         senderId: () => this.senderId,
         trigger: () => this.trigger,
-        capsule: {
-          agentId: options.capsule.identity.agentId,
-          state: options.capsule.state,
-        },
+        capsule: options.capsule,
       }),
     ).map(createAbortableAgentTool);
     this.context = createContextWindowPolicy(model, options.system, tools);
@@ -489,7 +492,7 @@ class Conversation {
         const messages = this.inner.state.messages;
         const fresh = messages.slice(this.persisted);
         if (fresh.length > 0) {
-          await this.capsule.appendConversation(this.conversationId, fresh);
+          await this.persist?.(fresh);
           this.persisted = messages.length;
           onPersisted?.(fresh);
         }
@@ -517,6 +520,87 @@ class Conversation {
 
     return { text: last ? contentText(last.content).trim() : "" };
   }
+}
+
+/**
+ * The tools a runtime offers: the plugins' tools, then the skill tool when there are skills, then the subagent tool
+ * when there are subagents. Each subagent's model resolves here, so an unknown model fails startup.
+ */
+export function withBuiltinTools(
+  station: Station,
+  modelId: string,
+  tools: readonly Tool[],
+  skills: readonly Skill[],
+  subagents: readonly Subagent[],
+): Tool[] {
+  return withSubagentTool(withSkillTool(tools, skills), subagents, createSubagentRunner(station, modelId, tools, subagents));
+}
+
+/**
+ * Runs a subagent inside the tool call that delegated to it: a fresh conversation with its own instructions, model,
+ * tools, and limits, which never reaches the capsule's threads or conversation observers. Its tools see the calling
+ * turn's conversation, sender, and trigger, and the calling turn's cancellation and deadline stop it.
+ */
+function createSubagentRunner(
+  station: Station,
+  modelId: string,
+  tools: readonly Tool[],
+  subagents: readonly Subagent[],
+): SubagentRun {
+  const available = new Map(tools.map((tool) => [tool.name, tool]));
+  const prepared = new Map(
+    subagents.map(({ blueprint, skills }) => {
+      const own = blueprint.tools.map((name) => {
+        const tool = available.get(name);
+        if (!tool) throw new Error(`Subagent ${blueprint.name} lists tool ${name}, which the main agent does not have`);
+        return tool;
+      });
+      return [
+        blueprint.name,
+        {
+          modelId: station.resolveModel(blueprint.model ?? modelId).id,
+          system: composeSystemPrompt(blueprint.system, skills),
+          tools: withSkillTool(own, skills),
+          limits: resolveAgentLimits(blueprint.limits, undefined),
+        },
+      ] as const;
+    }),
+  );
+
+  return async ({ blueprint }, task, context) => {
+    const setup = prepared.get(blueprint.name);
+    if (!setup) throw new Error(`Unknown subagent: ${blueprint.name}`);
+    context.signal.throwIfAborted();
+    const conversation = new Conversation({
+      station,
+      ...setup,
+      capsule: context.capsule,
+      conversationId: context.conversationId,
+      messages: [],
+    });
+    const cancel = () => conversation.abort();
+    context.signal.addEventListener("abort", cancel, { once: true });
+    const deadline = setTimeout(() => {
+      conversation.abort(
+        new TurnBudgetExceededError("timeout", `Turn exceeded the ${setup.limits.turnTimeoutMs}ms timeout`),
+      );
+    }, setup.limits.turnTimeoutMs);
+    deadline.unref();
+    let entries: ThreadEntry[] = [];
+    try {
+      const result = await conversation.prompt(task, context.senderId, context.trigger, undefined, (fresh) => {
+        entries = encodeMessages(fresh).map(toThreadEntry);
+      });
+      // Thread entries are JSON: the capsule stores them the same way.
+      return { text: result.text, details: { subagent: blueprint.name, entries } as unknown as JsonValue };
+    } catch (error) {
+      if (context.signal.aborted) throw error;
+      throw new Error(`Subagent ${blueprint.name} failed: ${toError(error).message}`, { cause: error });
+    } finally {
+      clearTimeout(deadline);
+      context.signal.removeEventListener("abort", cancel);
+    }
+  };
 }
 
 type ToolScope = {

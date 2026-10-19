@@ -33,5 +33,9 @@ tools:
 # skills:
 #   - ./skills/weekly-report
 
+# Optional subagents: Markdown blueprints to delegate tasks to, relative to this file. See agents/README.md.
+# agents:
+#   - ./agents/researcher.md
+
 # Set ZING_MEMORY_OWNER_IDS to trusted sender ids (normally the same ids as
 # TELEGRAM_ALLOWED_USER_IDS). With no owners configured, only senderless stdio is trusted.

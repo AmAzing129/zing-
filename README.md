@@ -65,6 +65,17 @@ skills:
 
 The model sees each listed skill's name and description and loads the full instructions with the built-in `skill` tool only when a request needs them. A skill is text: it cannot add tools beyond the blueprint's allowlist, and Zing never runs its scripts. See [`skills/README.md`](skills/README.md) for the format and rules.
 
+### Subagents
+
+A subagent is a specialist the agent can delegate one self-contained task to, such as research that takes many searches. It is a blueprint written as Markdown, with its own instructions, model, tools, and limits, and it is listed by path like a skill:
+
+```yaml
+agents:
+  - ./agents/researcher.md
+```
+
+The model sees each listed subagent's name and description and delegates with the built-in `subagent` tool. The subagent works in a fresh context inside that tool call and returns only its final answer. Its tools must be a subset of the blueprint's, so delegating never grants a capability. See [`agents/README.md`](agents/README.md) for the format and rules.
+
 ## Triggers: the agent can speak first
 
 Everything that wakes the agent is a **trigger**. A user message is the trigger of kind `message`; a scheduled job (`schedule`) or an incoming webhook (`webhook`) is another kind, and a plugin can define more. Every trigger runs one turn in a conversation through the same path:
@@ -177,4 +188,4 @@ The checked-in [`station.yaml`](station.yaml) enables xAI, Telegram, Brave Searc
    docker compose run --rm zing --once "Hello"
    ```
 
-Edit [`agent.yaml`](agent.yaml) to change the agent's instructions, model, limits, tool allowlist, or skills. Add or edit local source under [`plugins/`](plugins/README.md), then explicitly add its path to [`station.yaml`](station.yaml); add skills under [`skills/`](skills/README.md) and list them in `agent.yaml`. Compose mounts both files, the plugin source, and the skills into the container, so a restart is enough; no image rebuild is needed. Stop the station with `docker compose down`; the volume remains, so the same agent returns on the next `up`.
+Edit [`agent.yaml`](agent.yaml) to change the agent's instructions, model, limits, tool allowlist, skills, or subagents. Add or edit local source under [`plugins/`](plugins/README.md), then explicitly add its path to [`station.yaml`](station.yaml); add skills under [`skills/`](skills/README.md) and subagents under [`agents/`](agents/README.md) and list them in `agent.yaml`. Compose mounts both files, the plugin source, the skills, and the subagents into the container, so a restart is enough; no image rebuild is needed. Stop the station with `docker compose down`; the volume remains, so the same agent returns on the next `up`.

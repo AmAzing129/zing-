@@ -13,6 +13,7 @@ COPY tsconfig.json agent.yaml station.yaml ./
 COPY src ./src
 COPY plugins ./plugins
 COPY skills ./skills
+COPY agents ./agents
 COPY examples ./examples
 COPY docker-entrypoint.sh /usr/local/bin/zing-entrypoint
 RUN chmod +x /usr/local/bin/zing-entrypoint \
