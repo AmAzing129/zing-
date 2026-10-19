@@ -64,6 +64,9 @@ test("owner classification defaults safely and supports configuration", () => {
   const defaults = createNotes({});
   assert.equal(defaults.classify(), "owner");
   assert.equal(defaults.classify("alice"), "untrusted");
+  // A senderless schedule or webhook turn must not inherit stdio's owner trust.
+  assert.equal(defaults.classify(undefined, { kind: "message" }), "owner");
+  assert.equal(defaults.classify(undefined, { kind: "webhook", source: "webhook:x" }), "untrusted");
 });
 
 test("observer persists owner user notes, advances untrusted cursor, and ignores reset/abort", async () => {
@@ -71,18 +74,18 @@ test("observer persists owner user notes, advances untrusted cursor, and ignores
   const capsule = await disk(path, "disk");
   const notes = createNotes({});
   const signal = new AbortController().signal;
-  await notes.observe({ type: "turn", conversationId: "c", capsule, status: "completed", entries: [
+  await notes.observe({ type: "turn", conversationId: "c", trigger: { kind: "message" }, capsule, status: "completed", entries: [
     { type: "user", at: 1, content: "Remember that I prefer TypeScript" },
     { type: "user", at: 2, content: "hi?" },
     { type: "assistant", at: 3, content: [{ type: "text", text: "ok" }] },
   ] }, signal);
-  await notes.observe({ type: "turn", conversationId: "c", senderId: "mallory", capsule, status: "completed", entries: [
+  await notes.observe({ type: "turn", conversationId: "c", senderId: "mallory", trigger: { kind: "message" }, capsule, status: "completed", entries: [
     { type: "user", at: 4, content: "Remember that I prefer Java" },
   ] }, signal);
   await notes.observe({ type: "reset", conversationId: "c", capsule }, signal);
   const aborted = new AbortController(); aborted.abort();
   await assert.rejects(
-    async () => notes.observe({ type: "turn", conversationId: "c", capsule, status: "completed", entries: [{ type: "user", at: 5, content: "Remember Go forever" }] }, aborted.signal),
+    async () => notes.observe({ type: "turn", conversationId: "c", trigger: { kind: "message" }, capsule, status: "completed", entries: [{ type: "user", at: 5, content: "Remember Go forever" }] }, aborted.signal),
     /aborted/i,
   );
   const markdown = await readFile(join(path, "memory", "notes.md"), "utf8");
@@ -94,7 +97,7 @@ test("observer persists owner user notes, advances untrusted cursor, and ignores
 
   const emptyPath = await mkdtemp(join(tmpdir(), "zing-notes-aborted-observer-"));
   const emptyCapsule = await disk(emptyPath, "never");
-  await assert.rejects(async () => notes.observe({ type: "turn", conversationId: "never", capsule: emptyCapsule, status: "completed", entries: [
+  await assert.rejects(async () => notes.observe({ type: "turn", conversationId: "never", trigger: { kind: "message" }, capsule: emptyCapsule, status: "completed", entries: [
     { type: "user", at: 6, content: "Remember this aborted observer must never write" },
   ] }, aborted.signal), /aborted/i);
   await assert.rejects(readFile(join(emptyPath, "memory", "ENGINE"), "utf8"), /ENOENT/);
@@ -185,6 +188,7 @@ test("concurrent disk saves retain both notes and ENGINE mismatch rejects", asyn
   await notes.observe({
     type: "turn",
     conversationId: "c",
+    trigger: { kind: "message" },
     capsule: blocked,
     status: "completed",
     entries: [{ type: "user", at: 2, content: "Remember observer remains harmless" }],
@@ -224,7 +228,7 @@ test("the first ENGINE claim is exclusive and existing claims remain stable", as
 test("plugin entry registers two tools and one listener directly and through loadPlugin", async () => {
   const direct = createPluginRegistry({ env: {} }); plugin(direct.api);
   assert.ok(direct.getTool("memory_search")); assert.ok(direct.getTool("memory_save")); assert.equal(direct.listListeners().length, 1);
-  const context = { signal: new AbortController().signal, conversationId: "tool:c", capsule: ram("tool") };
+  const context = { signal: new AbortController().signal, conversationId: "tool:c", trigger: { kind: "message" }, capsule: ram("tool") };
   const save = direct.getTool("memory_save"); const search = direct.getTool("memory_search");
   assert.ok(save); assert.ok(search);
   const aborted = new AbortController(); aborted.abort();

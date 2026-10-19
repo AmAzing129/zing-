@@ -28,6 +28,7 @@ import {
   type AgentEvent as DurableEvent,
   type Conversation,
   type ConversationId,
+  type EntryId,
   type EntryRecord,
   type Storage,
   type SubmissionId,
@@ -59,7 +60,7 @@ import {
 import type { AgentLimits, Blueprint } from "./blueprint";
 import { createMemoryCapsule, type Capsule } from "./capsule";
 import { createContextWindowPolicy } from "./context";
-import type { AgentResult, CapsuleRef, IncomingMessage, Tool } from "./plugin/types";
+import type { AgentResult, CapsuleRef, IncomingMessage, Tool, TriggerInfo } from "./plugin/types";
 import {
   RuntimeError,
   TurnBudgetExceededError,
@@ -74,7 +75,8 @@ import {
 import { composeSystemPrompt, promptSections, tagSection } from "./prompt";
 import { SKILL_TOOL_NAME } from "./skills";
 import type { Station } from "./station";
-import { encodeMessages } from "./transcript";
+import { createTriggerMessage, encodeMessages, triggerOf } from "./transcript";
+import { MESSAGE_TRIGGER, normalizeTriggerInfo, renderTriggerText } from "./trigger";
 
 const CONTEXT = BACKGROUND_CONTEXT;
 const EXTENSION_NAME = "zing";
@@ -91,9 +93,23 @@ type ThreadsState = { threads: { [key: string]: ThreadRecord } };
  * One submitted turn: who sent it and whether observers have handled it. A turn whose observers did not finish before a
  * crash is observed again on the next start.
  */
-type TurnRecord = { requestId: string; senderId?: string; observed: boolean; deadlineAt?: number; timeoutMs?: number };
-/** `senderId` is the latest turn's, for tools. `turns` keeps the turns observers have not finished. */
-type TurnState = { senderId?: string; turns?: TurnRecord[] };
+type TurnRecord = {
+  requestId: string;
+  senderId?: string;
+  /** Absent for a message trigger. */
+  trigger?: TriggerInfo;
+  observed: boolean;
+  deadlineAt?: number;
+  timeoutMs?: number;
+};
+/** `senderId` and `trigger` are the latest turn's, for tools. `turns` keeps the turns observers have not finished. */
+type TurnState = { senderId?: string; trigger?: TriggerInfo; turns?: TurnRecord[] };
+/**
+ * Automated triggers by the ID of the user entry they submitted. pi-durable stores only the framed text the model saw,
+ * so this is what turns that entry back into its raw trigger text and kind; text alone never labels an entry, so a user
+ * typing the same frame stays a user message. Entries that left the active context are dropped.
+ */
+type TriggerState = { entries?: { [entryId: string]: TriggerInfo } };
 type TurnFailure = { budget: string; message: string };
 
 /** Zing thread IDs, which the runtime treats as opaque, mapped to durable conversations. */
@@ -117,6 +133,15 @@ function threadIdOf(key: string): string | undefined {
 /** Each conversation's turns, so recovered tools keep their sender's trust and observers see every turn. */
 const TurnDoc = defineDoc<TurnState>({
   kind: "zing.turn",
+  version: 1,
+  scope: "conversation",
+  history: "latest",
+  fork: "initial",
+  initial: () => ({}),
+});
+
+const TriggerDoc = defineDoc<TriggerState>({
+  kind: "zing.trigger",
   version: 1,
   scope: "conversation",
   history: "latest",
@@ -349,6 +374,7 @@ export async function createDurableAgent(
       const registration = createDurableTool(tool, {
         threadOf: (id) => threadOf.get(id) ?? String(id),
         senderOf: async (id, api) => (await api.snapshot(TurnDoc, id, CONTEXT))?.senderId,
+        triggerOf: async (id, api) => (await api.snapshot(TurnDoc, id, CONTEXT))?.trigger ?? MESSAGE_TRIGGER,
         capsule: capsuleRef,
       });
       // Loading a skill only reads, so a call a crash interrupted runs again instead of failing.
@@ -525,6 +551,10 @@ export async function createDurableAgent(
           const turn = findTurn(state.turns, requestId);
           if (turn) turn.observed = true;
           if (state.turns) pruneTurns(state.turns);
+          // Observed turns leave TurnDoc, so the entry their trigger submitted is recorded here, in the same commit.
+          const entry = turn?.trigger && (await tx.submissionByRequest(id, requestId))?.entry;
+          if (turn?.trigger && entry !== undefined) await rememberTrigger(tx, id, entry, turn.trigger);
+          await pruneTriggers(tx, id);
         }, CONTEXT),
       )
       .catch((error: unknown) => {
@@ -541,7 +571,10 @@ export async function createDurableAgent(
   const observeTurn = async (threadId: string, conversation: Conversation, record: SubmissionRecord): Promise<void> => {
     const turn = findTurn((await open().snapshot(TurnDoc, conversation.id, CONTEXT))?.turns, record.requestId);
     if (!turn || turn.observed || observing.has(record.id)) return;
-    const entries = await readTurnEntries(conversation, record);
+    const entries = toThreadEntries(
+      await readTurnRecords(conversation, record),
+      turn.trigger && record.entry !== undefined ? new Map([[record.entry, turn.trigger]]) : undefined,
+    );
     await touch(threadId);
     observing.add(record.id);
     const status =
@@ -557,6 +590,7 @@ export async function createDurableAgent(
             type: "turn",
             conversationId: threadId,
             senderId: turn.senderId,
+            trigger: turn.trigger ?? MESSAGE_TRIGGER,
             capsule: capsuleRef,
             status,
             entries,
@@ -723,6 +757,7 @@ export async function createDurableAgent(
   const startTurn = (input: TurnInput): TurnHandle => {
     ensureOpen();
     const threadId = normalizeThreadId(input.threadId);
+    const trigger = normalizeTriggerInfo(input.trigger, input.senderId);
     const turnId = createRuntimeId("turn");
     let cancelRequested = false;
     const controller = createTurnController(turnId, () => {
@@ -763,9 +798,11 @@ export async function createDurableAgent(
         }
 
         const history = await conversation.entries({ order: "descending" }, 1, undefined, CONTEXT);
+        // pi-durable keeps only the submitted text, so the frame is rendered once here and replayed as stored.
+        const content = renderTriggerText(trigger, input.text, Date.now());
         if (
           !policy.userInputFits(
-            input.text,
+            content,
             history.items.some((entry) => entry.model?.some((message) => message.role !== "system")),
           )
         ) {
@@ -777,6 +814,7 @@ export async function createDurableAgent(
         const metadata: TurnRecord = {
           requestId,
           ...(input.senderId === undefined ? {} : { senderId: input.senderId }),
+          ...(trigger.kind === "message" ? {} : { trigger }),
           observed: false,
           deadlineAt: Date.now() + limits.turnTimeoutMs,
           timeoutMs: limits.turnTimeoutMs,
@@ -807,7 +845,7 @@ export async function createDurableAgent(
 
         controller.emit({ type: "turn/started", threadId, turnId });
         if (cancelRequested || canceling) throw new TurnCanceledError();
-        const submission = await conversation.submit({ type: "input", content: input.text, requestId }, CONTEXT);
+        const submission = await conversation.submit({ type: "input", content, requestId }, CONTEXT);
         submitted = submission;
         target = submission.id;
         if (canceling) {
@@ -913,6 +951,7 @@ export async function createDurableAgent(
       await conversation.waitForIdle(CONTEXT);
       await conversation.reset(undefined, CONTEXT);
       await conversation.waitForIdle(CONTEXT);
+      await conversation.commit((tx) => pruneTriggers(tx, conversation.id), CONTEXT);
       await touch(normalized);
       observers.notify({ type: "reset", conversationId: normalized, capsule: capsuleRef });
     });
@@ -953,7 +992,7 @@ export async function createDurableAgent(
       return {
         threadId: normalized,
         status: live?.run ? "active" : "idle",
-        entries: toThreadEntries(view.entries),
+        entries: toThreadEntries(view.entries, await triggerEntries(open(), conversation.id)),
       };
     },
     async listThreads(options?: ListThreadsOptions) {
@@ -978,6 +1017,7 @@ export async function createDurableAgent(
 type ToolScope = {
   threadOf: (id: ConversationId) => string;
   senderOf: (id: ConversationId, api: { snapshot: Harness["snapshot"] }) => Promise<string | undefined>;
+  triggerOf: (id: ConversationId, api: { snapshot: Harness["snapshot"] }) => Promise<TriggerInfo>;
   capsule: CapsuleRef;
 };
 
@@ -997,6 +1037,7 @@ export function createDurableTool(tool: Tool, scope: ToolScope): ToolRegistratio
           signal,
           conversationId: scope.threadOf(api.conversationId),
           senderId: await scope.senderOf(api.conversationId, api),
+          trigger: await scope.triggerOf(api.conversationId, api),
           capsule: scope.capsule,
         }))();
       const result = await raceWithAbort(work, signal, `${tool.name} aborted`);
@@ -1043,7 +1084,7 @@ async function prepareConversation(
   model: { provider: string; modelId: string },
   metadata: TurnRecord,
 ): Promise<void> {
-  const { senderId, requestId } = metadata;
+  const { senderId, requestId, trigger } = metadata;
   const agent = await conversation.agent(CONTEXT);
   await conversation.commit(async (tx) => {
     const turn = await tx.doc(TurnDoc, conversation.id);
@@ -1051,6 +1092,11 @@ async function prepareConversation(
       delete turn.senderId;
     } else {
       turn.senderId = senderId;
+    }
+    if (trigger === undefined) {
+      delete turn.trigger;
+    } else {
+      turn.trigger = trigger;
     }
     turn.turns ??= [];
     const index = turn.turns.findIndex((record) => record.requestId === requestId);
@@ -1069,13 +1115,56 @@ async function importMessages(tx: Tx, id: ConversationId, messages: readonly Mes
     if (message.role === "system") {
       await tx.appendEntry(SystemEntry, id, { model: [message] });
     } else if (message.role === "user") {
-      await tx.appendEntry(UserEntry, id, { model: [message] });
+      const entry = await tx.appendEntry(UserEntry, id, { model: [message] });
+      const trigger = triggerOf(message);
+      if (trigger) await rememberTrigger(tx, id, entry.id, trigger);
     } else if (message.role === "assistant") {
       await tx.appendEntry(AssistantEntry, id, { model: [message] });
     } else {
       await tx.appendEntry(ToolResultEntry, id, { model: [message], data: { diagnostics: [] } });
     }
   }
+}
+
+async function rememberTrigger(tx: Tx, id: ConversationId, entry: EntryId, trigger: TriggerInfo): Promise<void> {
+  const doc = await tx.doc(TriggerDoc, id);
+  doc.entries ??= {};
+  doc.entries[String(entry)] = trigger;
+}
+
+/** Drop triggers whose entries a reset, handoff, or compaction moved out of the active context. */
+async function pruneTriggers(tx: Tx, id: ConversationId): Promise<void> {
+  const doc = await tx.doc(TriggerDoc, id);
+  if (!doc.entries) return;
+  const head = (await tx.latestHeadMarker(id))?.head;
+  for (const key of Object.keys(doc.entries)) {
+    const entry = Number(key);
+    if (!Number.isSafeInteger(entry) || (head !== undefined && entry < head)) delete doc.entries[key];
+  }
+}
+
+/** Every automated trigger entry: those observed turns recorded, and those of turns still waiting for observers. */
+async function triggerEntries(harness: Harness, id: ConversationId): Promise<Map<number, TriggerInfo>> {
+  const known = new Map<number, TriggerInfo>();
+  for (const [key, trigger] of Object.entries((await harness.snapshot(TriggerDoc, id, CONTEXT))?.entries ?? {})) {
+    known.set(Number(key), trigger);
+  }
+  for (const turn of (await harness.snapshot(TurnDoc, id, CONTEXT))?.turns ?? []) {
+    if (turn.observed || !turn.trigger) continue;
+    const entry = (await requestRecord(harness, id, turn.requestId))?.entry;
+    if (entry !== undefined) known.set(entry, turn.trigger);
+  }
+  return known;
+}
+
+/** A user message an automated trigger submitted, given the raw text and kind the legacy transcript stores. */
+function labelTrigger(message: Message, trigger: TriggerInfo): Message {
+  if (message.role !== "user") return message;
+  const framed =
+    typeof message.content === "string"
+      ? message.content
+      : message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+  return createTriggerMessage(trigger, framed.slice(framed.indexOf("\n") + 1), message.timestamp);
 }
 
 function findTurn<T extends TurnRecord>(
@@ -1108,10 +1197,6 @@ function requestRecord(harness: Harness, id: ConversationId, requestId: string):
  * The entries one settled input added: its user entry through its answer, or, when unanswered, up to the next user
  * entry. Zing submits one input at a time per thread, so the next user entry starts the next turn.
  */
-async function readTurnEntries(conversation: Conversation, record: SubmissionRecord): Promise<ThreadEntry[]> {
-  return toThreadEntries(await readTurnRecords(conversation, record));
-}
-
 async function readTurnRecords(conversation: Conversation, record: SubmissionRecord): Promise<EntryRecord[]> {
   if (record.entry === undefined) return [];
   const last = record.status === "done" && record.type === "input" ? record.answer : undefined;
@@ -1151,10 +1236,14 @@ function spentBudget(records: readonly EntryRecord[]): { modelTurns: number; too
   return { modelTurns, toolCalls };
 }
 
-function toThreadEntries(records: readonly EntryRecord[]): ThreadEntry[] {
+/** `triggers` labels the user entries automated triggers submitted, by entry ID. */
+function toThreadEntries(records: readonly EntryRecord[], triggers?: ReadonlyMap<number, TriggerInfo>): ThreadEntry[] {
   const messages = records
     .filter((record) => UserEntry.is(record) || AssistantEntry.is(record) || ToolResultEntry.is(record))
-    .flatMap((record) => record.model ?? []);
+    .flatMap((record) => {
+      const trigger = UserEntry.is(record) ? triggers?.get(record.id) : undefined;
+      return trigger ? (record.model ?? []).map((message) => labelTrigger(message, trigger)) : (record.model ?? []);
+    });
   return encodeMessages(messages).map(toThreadEntry);
 }
 

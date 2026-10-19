@@ -22,6 +22,7 @@ import type { ConversationEvent, ConversationListener } from "../src/plugin/inde
 const fixtures = fileURLToPath(new URL("./fixtures/plugins", import.meta.url));
 
 const host: ConversationHost = {
+  dispatch: async () => ({ text: "ok" }),
   handleMessage: async () => ({ text: "ok" }),
   resetConversation: () => {},
 };
@@ -204,6 +205,7 @@ export default function (zing) {
   const output = await tool.execute({}, {
     signal: new AbortController().signal,
     conversationId: "test:1",
+    trigger: { kind: "message" },
     capsule: { agentId: capsule.identity.agentId, state: capsule.state },
   });
   assert.equal(output.text, "outside:probe");

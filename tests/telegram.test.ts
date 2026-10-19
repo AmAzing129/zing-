@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { Bot, type Transformer } from "grammy";
+import { Api, Bot, type Transformer } from "grammy";
 
 import telegram, { parseAllowedUserIds, splitMessage } from "../plugins/channels/telegram/index";
 import type { ConversationHost } from "../src/agent";
 import { createPluginRegistry, loadPlugin } from "../src/plugin/index";
 
 const host: ConversationHost = {
+  dispatch: async () => ({ text: "ok" }),
   handleMessage: async () => ({ text: "ok" }),
   resetConversation: () => {},
 };
@@ -81,11 +82,16 @@ test("telegram drains in-flight replies and keys requests by bot, chat and messa
         env: { TELEGRAM_BOT_TOKEN: "123:test" },
         host: {
           resetConversation() {},
-          async handleMessage(message) {
-            requests.push(message.requestId!);
+          handleMessage: async () => ({ text: "unused" }),
+          // Stands in for the dispatcher: run the turn, then deliver through the trigger's route.
+          async dispatch(trigger) {
+            requests.push(trigger.requestId!);
             entered();
             await gate;
             if (fail) throw new Error("expected failure");
+            const route = trigger.deliver;
+            assert.ok(route && route !== "conversation");
+            await registry.getChannel(route.channel)!.send!({ conversationId: trigger.conversationId, to: route.to, text: "completed" });
             return { text: "completed" };
           },
         },
@@ -163,4 +169,22 @@ test("telegram channel waits for its asynchronous stop before resolving", async 
     methods.start = originalStart;
     methods.stop = originalStop;
   }
+});
+
+test("telegram send splits long replies and addresses numeric chats by number", async () => {
+  const methods = Api.prototype as unknown as { sendMessage: (chatId: number | string, text: string) => Promise<unknown> };
+  const original = methods.sendMessage;
+  const sent: Array<[number | string, number]> = [];
+  methods.sendMessage = async (chatId, text) => { sent.push([chatId, text.length]); return {}; };
+  try {
+    const registry = createPluginRegistry({ host, env: { TELEGRAM_BOT_TOKEN: "123:test" } });
+    telegram(registry.api);
+    const channel = registry.getChannel("telegram");
+    assert.ok(channel?.send);
+    await channel.send({ conversationId: "telegram:-100", to: "-100", text: "x".repeat(5000) });
+    await channel.send({ conversationId: "telegram:@news", to: "@news", text: "hi" });
+  } finally {
+    methods.sendMessage = original;
+  }
+  assert.deepEqual(sent, [[-100, 4096], [-100, 904], ["@news", 2]]);
 });

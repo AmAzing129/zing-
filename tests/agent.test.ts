@@ -233,6 +233,27 @@ test("a subagent's limits fail its task, not the main agent's turn", async () =>
   assert.deepEqual(failure, { isError: true, text: "Subagent researcher failed: Turn exceeded the 1 tool-call limit" });
 });
 
+test("a subagent's tools see the trigger of the turn that delegated", async () => {
+  const { faux, model, station } = createTestHarness();
+  const triggers: ToolContext["trigger"][] = [];
+  const search: Tool = { ...webSearch, execute: async (input, context) => (triggers.push(context.trigger), webSearch.execute(input, context)) };
+  const agent = createAgent(station, testBlueprint(model.id), undefined, {
+    tools: [search],
+    subagents: await loadSubagents([await researcherFile()], [WEB_SEARCH_TOOL_NAME]),
+  });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("subagent", { name: "researcher", task: "Check the news." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "news" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("Nothing new."),
+    fauxAssistantMessage("Done."),
+  ]);
+
+  const trigger = { kind: "schedule", source: "schedule:sch_1" };
+  await agent.startTurn({ threadId: "chat:scheduled", text: "morning brief", trigger }).completed;
+  // An automated turn stays automated inside the subagent, so its tools never treat it as the user's message.
+  assert.deepEqual(triggers, [trigger]);
+});
+
 test("canceling the main turn stops a running subagent", async () => {
   const { faux, model, station } = createTestHarness();
   let receivedSignal: AbortSignal | undefined;
@@ -851,6 +872,7 @@ test("conversation observers receive persisted completed turns and resets", asyn
     type: "turn",
     conversationId: "chat:observed",
     senderId: "alice",
+    trigger: { kind: "message" },
     capsule: { agentId: agent.agentId },
     status: "completed",
     entries: snapshot.entries,

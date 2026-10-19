@@ -2,15 +2,25 @@ import { SUBAGENT_TOOL_NAME } from "../blueprint";
 import { requireEnv } from "../env";
 import { SKILL_TOOL_NAME } from "../skills";
 import { conversationId } from "./ids";
-import type { Channel, ConversationHost, ConversationListener, ModelProvider, Tool, ZingPluginAPI } from "./types";
+import type {
+  CapsuleRef,
+  Channel,
+  ConversationHost,
+  ConversationListener,
+  ModelProvider,
+  Tool,
+  TriggerSource,
+  ZingPluginAPI,
+} from "./types";
 
 const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 
 export type PluginRegistry = {
   readonly api: ZingPluginAPI;
-  bindHost: (host: ConversationHost) => void;
+  bindHost: (host: ConversationHost, capsule?: CapsuleRef) => void;
   getChannel: (id: string) => Channel | undefined;
   listChannels: () => Channel[];
+  listTriggerSources: () => TriggerSource[];
   listListeners: () => readonly ConversationListener[];
   getProvider: (id: string) => ModelProvider | undefined;
   listProviders: () => ModelProvider[];
@@ -21,12 +31,15 @@ export type PluginRegistry = {
 export function createPluginRegistry(
   options: {
     host?: ConversationHost;
+    capsule?: CapsuleRef;
     env?: NodeJS.ProcessEnv;
   } = {},
 ): PluginRegistry {
   const env = options.env ?? process.env;
   let host = options.host;
+  let capsule = options.capsule;
   const channels = new Map<string, Channel>();
+  const sources = new Map<string, TriggerSource>();
   const providers = new Map<string, ModelProvider>();
   const tools = new Map<string, Tool>();
   const listeners: ConversationListener[] = [];
@@ -37,6 +50,12 @@ export function createPluginRegistry(
         throw new Error("Plugin host is not ready. Use zing.host inside channel.start(signal), not in the plugin factory.");
       }
       return host;
+    },
+    get capsule() {
+      if (!capsule) {
+        throw new Error("Plugin capsule is not ready. Use zing.capsule inside start(signal) or a tool, not in the plugin factory.");
+      }
+      return capsule;
     },
     env,
     requireEnv: (name) => requireEnv(env, name),
@@ -55,10 +74,20 @@ export function createPluginRegistry(
       if (!id) {
         throw new Error("Channel id is required");
       }
-      if (channels.has(id)) {
+      if (channels.has(id) || sources.has(id)) {
         throw new Error(`Channel already registered: ${id}`);
       }
       channels.set(id, { ...channel, id });
+    },
+    registerTriggerSource(source) {
+      const id = source.id.trim();
+      if (!id) {
+        throw new Error("Trigger source id is required");
+      }
+      if (channels.has(id) || sources.has(id)) {
+        throw new Error(`Trigger source already registered: ${id}`);
+      }
+      sources.set(id, { ...source, id });
     },
     registerProvider(entry) {
       const id = entry.pluginId.trim();
@@ -97,11 +126,13 @@ export function createPluginRegistry(
 
   return {
     api,
-    bindHost(next) {
+    bindHost(next, nextCapsule) {
       host = next;
+      capsule = nextCapsule ?? capsule;
     },
     getChannel: (id) => channels.get(id),
     listChannels: () => [...channels.values()],
+    listTriggerSources: () => [...sources.values()],
     listListeners: () => listeners,
     getProvider: (id) => findProvider([...providers.values()], id),
     listProviders: () => [...providers.values()],

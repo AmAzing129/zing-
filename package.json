@@ -12,7 +12,8 @@
   },
   "workspaces": [
     "plugins/channels/telegram",
-    "plugins/tools/mcp"
+    "plugins/tools/mcp",
+    "plugins/triggers/schedule"
   ],
   "scripts": {
     "start": "tsx src/index.ts",

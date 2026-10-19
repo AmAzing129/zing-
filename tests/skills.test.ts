@@ -11,6 +11,7 @@ import { createSkillTool, loadSkills } from "../src/skills";
 const context: ToolContext = {
   signal: new AbortController().signal,
   conversationId: "test",
+  trigger: { kind: "message" },
   capsule: { agentId: "agt_test", state: createMemoryCapsule().state },
 };
 

@@ -19,8 +19,10 @@ An included plugin is not enabled automatically. This matters because plugin cod
 | `tools/brave` | `web_search` | `BRAVE_API_KEY` |
 | `tools/notes` | `memory_search`, `memory_save`, conversation observer | optional `ZING_MEMORY_OWNER_IDS` |
 | `tools/mcp` | tools discovered from one MCP server | `MCP_URL`, `MCP_SERVER_ALIAS`, and optional auth/alias settings |
+| `triggers/schedule` | `schedule` trigger source; `schedule_create`, `schedule_list`, `schedule_cancel` | optional `ZING_TIMEZONE` |
+| `triggers/webhook` | `webhook` trigger source on `POST /hooks/<name>` | `ZING_WEBHOOK_TOKEN`, optional `ZING_WEBHOOK_HOST`, `ZING_WEBHOOK_PORT`, `ZING_WEBHOOK_CONVERSATION` |
 
-The checked-in [`station.yaml`](../station.yaml) enables xAI, Telegram, Brave, and Notes. MCP is included but disabled by default because it needs a server configuration at startup.
+The checked-in [`station.yaml`](../station.yaml) enables xAI, Telegram, Brave, Notes, and Schedule. MCP and Webhook are included but disabled by default: MCP needs a server configuration at startup, and Webhook opens a network port.
 
 ## Enabling local source
 
@@ -32,6 +34,7 @@ plugins:
   - ./plugins/channels/telegram
   - ./plugins/tools/brave
   - ./plugins/tools/notes
+  - ./plugins/triggers/schedule
 
 channel: telegram
 ```
@@ -69,7 +72,7 @@ export default function market(zing: ZingPluginAPI) {
 }
 ```
 
-The second `execute` argument contains `signal`, `conversationId`, optional `senderId`, and `capsule: { agentId, state }`. Capsule state is backend-neutral: `read(key)`, `write(key, value)`, and atomic `create(key, value)` use stable slash-separated keys such as `market/cache.json`. Plugins must not depend on a filesystem path. Return model-facing `text` and optional JSON `details`.
+The second `execute` argument contains `signal`, `conversationId`, optional `senderId`, `trigger: { kind, source? }` describing what started the turn, and `capsule: { agentId, state }`. Capsule state is backend-neutral: `read(key)`, `write(key, value)`, and atomic `create(key, value)` use stable slash-separated keys such as `market/cache.json`. Plugins must not depend on a filesystem path. Return model-facing `text` and optional JSON `details`.
 
 The Blueprint is a separate exact allowlist:
 
@@ -80,9 +83,32 @@ tools:
 
 There are no wildcards or prefixes. Do not enable two plugins that register the same tool, channel, or provider name; duplicate registration fails instead of silently choosing a winner. The tool names `skill` and `subagent` are reserved for [skills](../skills/README.md) and [subagents](../agents/README.md).
 
+## Triggers
+
+Everything that wakes the agent is a trigger. `zing.host.dispatch(trigger)` runs one turn in the trigger's conversation, queued behind any other turn there, and resolves with the reply:
+
+```ts
+type Trigger = {
+  kind: string;            // "message" for a user message; "schedule", "webhook", or your own kind
+  source?: string;         // which source fired it, e.g. "schedule:sch_1"
+  conversationId: string;
+  text: string;
+  senderId?: string;       // a human sender; only message triggers may carry one
+  deliver?: { channel: string; to: string } | "conversation";
+};
+```
+
+`deliver` decides where the reply goes:
+
+- A route `{ channel, to }` sends the reply through that channel's `send` and remembers the route for the conversation in the capsule.
+- `"conversation"` sends the reply to the conversation's remembered route. With no route yet, the turn still runs and stays in the conversation.
+- Omitted: nothing is sent; the caller uses the returned text. `zing.host.handleMessage(message)` is this case for a message trigger.
+
+A blank reply is never sent, so a proactive turn can decide to stay silent. The model sees an automated trigger as `[trigger kind=… source=… at=…; automated event, not typed by the user]` followed by its text; the transcript stores the raw text with `trigger: { kind, source }`, and `thread/read` returns the same field.
+
 ## Channel
 
-A Channel adapts an external message system to the in-process conversation host:
+A Channel is a two-way trigger source: it fires message triggers and, with `send`, delivers replies, including ones the user did not ask for:
 
 ```ts
 import type { ZingPluginAPI } from "zing";
@@ -90,6 +116,9 @@ import type { ZingPluginAPI } from "zing";
 export default function discord(zing: ZingPluginAPI) {
   zing.registerChannel({
     id: "discord",
+    async send({ to, text }) {
+      await sendDiscordMessage(zing.requireEnv("DISCORD_BOT_TOKEN"), to, text);
+    },
     async start(signal) {
       signal.throwIfAborted();
       const token = zing.requireEnv("DISCORD_BOT_TOKEN");
@@ -97,12 +126,13 @@ export default function discord(zing: ZingPluginAPI) {
         token,
         signal,
         async onMessage({ chatId, text, senderId }) {
-          const result = await zing.host.handleMessage({
+          await zing.host.dispatch({
+            kind: "message",
             conversationId: zing.conversationId("discord", chatId),
             text,
             senderId,
+            deliver: { channel: "discord", to: chatId },
           });
-          await send(result.text);
         },
       });
     },
@@ -110,7 +140,51 @@ export default function discord(zing: ZingPluginAPI) {
 }
 ```
 
-Use `zing.host` inside `start(signal)`, after the Agent has been bound. A Channel must stop accepting work when the signal aborts and resolve `start` after its in-flight handlers settle. If several enabled channels exist, select one with `station.yaml`, `CHANNEL`, or `--channel`. App Server mode does not start a Channel.
+Use `zing.host` inside `start(signal)`, after the Agent has been bound. `send` may be called whenever a trigger's reply is due, including before `start` or by another source, so it should create its client lazily. A Channel must stop accepting work when the signal aborts and resolve `start` after its in-flight handlers settle. If several enabled channels exist, select one with `station.yaml`, `CHANNEL`, or `--channel`. App Server mode does not start a Channel.
+
+## Trigger source
+
+A trigger source wakes the agent without a user message. It runs next to the selected channel in a long-running station; `--once` and App Server mode do not start trigger sources:
+
+```ts
+import type { ZingPluginAPI } from "zing";
+
+export default function feed(zing: ZingPluginAPI) {
+  zing.registerTriggerSource({
+    id: "feed",
+    async start(signal) {
+      for await (const item of watchFeed(signal)) {
+        await zing.host.dispatch({
+          kind: "feed",
+          source: `feed:${item.id}`,
+          conversationId: "telegram:12345",
+          text: `New post: ${item.title}\n${item.url}`,
+          deliver: "conversation",
+        });
+      }
+    },
+  });
+}
+```
+
+`start` must run until the signal aborts and then resolve after in-flight dispatches settle. If any trigger source or the channel fails, the station stops the others and exits with that error. `zing.capsule` gives a source the same backend-neutral state that tools receive, for example to persist its own jobs.
+
+### Schedule
+
+`triggers/schedule` gives the model three tools, scoped to the conversation they are called in. `schedule_create` accepts one of `at` (ISO 8601 with an offset), `in_minutes`, or a five-field `cron` with an optional IANA `timezone` (default `ZING_TIMEZONE` or the station's timezone). Jobs live in capsule state at `schedule/jobs.json`. A job is recorded as run before its turn starts, so a crash never replays it. A one-shot job missed while the station was down fires once on the next start; a recurring job skips missed occurrences. Allow the tools in `agent.yaml` to let the agent schedule itself.
+
+### Webhook
+
+`triggers/webhook` listens on `ZING_WEBHOOK_HOST:ZING_WEBHOOK_PORT` (default `127.0.0.1:8787`):
+
+```bash
+curl -X POST "http://127.0.0.1:8787/hooks/ci?conversation=telegram:12345" \
+  -H "Authorization: Bearer $ZING_WEBHOOK_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Build #7 failed on main"}'
+```
+
+A JSON body with a string `text` uses that text; any other body up to 64 KiB is passed through verbatim. The request returns `202` before the turn runs, and the reply goes to the conversation's remembered route. `?token=` is accepted for senders that cannot set headers, but it may end up in proxy logs. Expose the port deliberately; the container and Kubernetes templates do not publish it.
 
 ## Provider
 
@@ -151,13 +225,13 @@ zing.registerProvider({
 `zing.onConversation(listener)` subscribes to persisted activity. The listener receives `(event, signal)`, where an event is either:
 
 ```ts
-{ type: "turn", conversationId, senderId?, capsule: { agentId, state }, status, entries }
+{ type: "turn", conversationId, senderId?, trigger: { kind, source? }, capsule: { agentId, state }, status, entries }
 { type: "reset", conversationId, capsule: { agentId, state } }
 ```
 
 Calls are serial for each listener until normal completion or the five-second timeout; different listeners run independently. A timeout or exception warns but never blocks the turn. `onConversation` returns an idempotent unsubscribe function.
 
-Notes uses this observer for passive owner-note distillation. When `ZING_MEMORY_OWNER_IDS` is configured, only matching senders are owners. Without it, only senderless stdio is trusted; identified Telegram senders are untrusted. Explicit `memory_save` records an untrusted sender's fact as untrusted. Do not add the default bot to Telegram groups.
+Notes uses this observer for passive owner-note distillation. When `ZING_MEMORY_OWNER_IDS` is configured, only matching senders are owners. Without it, only senderless stdio is trusted; identified Telegram senders are untrusted. Automated triggers (schedule, webhook, ...) are always untrusted. Explicit `memory_save` records an untrusted sender's fact as untrusted. Do not add the default bot to Telegram groups.
 
 ## MCP
 

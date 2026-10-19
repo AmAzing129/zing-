@@ -194,7 +194,7 @@ Pi 的 `tool_execution_update` 暂不进入 v1，避免把结构不稳定的底�
 
 ### 历史模型
 
-`thread/read` 返回公共 `ThreadSnapshot`，包含最后一次 reset 之后的 user、assistant 和 tool-result 历史。它与当前 `TranscriptEvent` 语义对应，但公共协议类型不能直接 alias 存储类型：
+`thread/read` 返回公共 `ThreadSnapshot`，包含最后一次 reset 之后的 user、assistant 和 tool-result 历史。由定时任务、webhook 等自动 trigger 发起的 turn，其 user 条目带可选字段 `trigger: { kind, source? }`，`content` 是 trigger 的原始文本；用户消息没有该字段。它与当前 `TranscriptEvent` 语义对应，但公共协议类型不能直接 alias 存储类型：
 
 - transcript 的 `v`、路径和 reset marker 是存储细节。
 - 公共历史 DTO 只表达消息、工具结果、时间和必要模型信息。

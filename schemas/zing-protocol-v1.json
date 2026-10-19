@@ -486,6 +486,15 @@
                 { "type": "string" },
                 { "type": "array", "items": { "$ref": "#/$defs/threadContent" } }
               ]
+            },
+            "trigger": {
+              "description": "Present when an automated trigger (schedule, webhook, ...) rather than a user message started the turn. content is then the raw trigger text.",
+              "type": "object",
+              "required": ["kind"],
+              "properties": {
+                "kind": { "type": "string" },
+                "source": { "type": "string" }
+              }
             }
           }
         },
