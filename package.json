@@ -17,7 +17,8 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts",
+    "test:e2e": "tsx --test tests/e2e/*.test.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.2.0",
