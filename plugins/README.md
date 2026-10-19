@@ -78,7 +78,7 @@ tools:
   - market__quote
 ```
 
-There are no wildcards or prefixes. Do not enable two plugins that register the same tool, channel, or provider name; duplicate registration fails instead of silently choosing a winner. The tool name `skill` is reserved for [skills](../skills/README.md).
+There are no wildcards or prefixes. Do not enable two plugins that register the same tool, channel, or provider name; duplicate registration fails instead of silently choosing a winner. The tool names `skill` and `subagent` are reserved for [skills](../skills/README.md) and [subagents](../agents/README.md).
 
 ## Channel
 

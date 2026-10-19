@@ -79,17 +79,6 @@ export function renderSkillCatalog(skills: readonly Skill[]): string | undefined
   ].join("\n");
 }
 
-/** A section as pi-durable renders a tagged one, so both runtimes send the same prompt. */
-export function tagSection(key: string, text: string): string {
-  return `<${key}>\n${text}\n</${key}>`;
-}
-
-/** The full system prompt: the blueprint's instructions, then the skills section. */
-export function composeSystemPrompt(system: string, skills: readonly Skill[]): string {
-  const catalog = renderSkillCatalog(skills);
-  return catalog === undefined ? system : `${system}\n\n${tagSection(SKILLS_SECTION, catalog)}`;
-}
-
 /** Loads a skill's instructions, or a file inside its directory. It reads; it never executes. */
 export function createSkillTool(skills: readonly Skill[]): Tool {
   const byName = new Map(skills.map((skill) => [skill.name, skill]));
@@ -203,7 +192,8 @@ function pageLines(text: string, offset: number): { text: string; from: number; 
   return { text: notes.length === 0 ? body : `${body}\n\n${notes.join("\n")}`, from: offset, to: next, total };
 }
 
-function splitFrontmatter(contents: string, file: string): { frontmatter: Record<string, unknown>; body: string } {
+/** A Markdown file's YAML frontmatter, between --- lines, and the body after it. */
+export function splitFrontmatter(contents: string, file: string): { frontmatter: Record<string, unknown>; body: string } {
   const lines = contents.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").split("\n");
   const end = lines[0]?.trim() === "---" ? lines.findIndex((line, index) => index > 0 && line.trim() === "---") : -1;
   if (end < 0) {

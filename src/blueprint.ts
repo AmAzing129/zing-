@@ -10,6 +10,9 @@ const BLUEPRINT_NAMES = ["agent.yaml", "agent.yml", "blueprint.yaml", "blueprint
 const TOOL_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const TOOLS_ERROR = "tools must be a list of exact tool names, for example [market__quote]";
 const SKILLS_ERROR = "skills must be a list of skill directory paths, for example [./skills/weekly-report]";
+const AGENTS_ERROR = "agents must be a list of subagent file paths, for example [./agents/researcher.md]";
+/** The one tool that delegates to subagents. Reserved: plugins cannot register it and blueprints do not list it. */
+export const SUBAGENT_TOOL_NAME = "subagent";
 
 export type AgentLimits = { turnTimeoutMs: number; maxModelTurns: number; maxToolCalls: number };
 
@@ -25,11 +28,13 @@ export type Blueprint = {
   tools: string[];
   /** Absolute paths of the skill directories the model may load, in order. */
   skills?: string[];
+  /** Absolute paths of the subagent files the model may delegate to, in order. */
+  agents?: string[];
 };
 
 export type FindBlueprintOptions = { cwd?: string; home?: string; explicit?: string; env?: NodeJS.ProcessEnv };
 
-/** Skill paths resolve against baseDir, normally the blueprint file's directory. */
+/** Skill and agent paths resolve against baseDir, normally the blueprint file's directory. */
 export function parseBlueprint(raw: unknown, source = "<blueprint>", baseDir = process.cwd()): Blueprint {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error(`${source}: blueprint must be a mapping`);
   const record = raw as Record<string, unknown>;
@@ -42,6 +47,7 @@ export function parseBlueprint(raw: unknown, source = "<blueprint>", baseDir = p
     limits: parseLimits(record.limits, source),
     tools: parseTools(record.tools, source),
     skills: parseSkills(record.skills, source, baseDir),
+    agents: parseAgents(record.agents, source, baseDir),
   };
 }
 
@@ -94,6 +100,7 @@ function parseTools(raw: unknown, source: string): string[] {
     const name = value.trim();
     if (!TOOL_NAME.test(name)) throw new Error(`${source}: invalid tool name "${value}"`);
     if (name === SKILL_TOOL_NAME) throw new Error(`${source}: tool "${name}" is reserved; Zing provides it when skills are listed`);
+    if (name === SUBAGENT_TOOL_NAME) throw new Error(`${source}: tool "${name}" is reserved; Zing provides it when agents are listed`);
     if (names.includes(name)) throw new Error(`${source}: duplicate tool name "${name}"`);
     names.push(name);
   }
@@ -111,6 +118,23 @@ function parseSkills(raw: unknown, source: string, baseDir: string): string[] {
     if (!/^(\.{1,2})?\//.test(path)) throw new Error(`${source}: skill "${value}" must be a path starting with ./, ../, or /`);
     const resolved = resolve(baseDir, path);
     if (paths.includes(resolved)) throw new Error(`${source}: duplicate skill path "${path}"`);
+    paths.push(resolved);
+  }
+  return paths;
+}
+
+function parseAgents(raw: unknown, source: string, baseDir: string): string[] {
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) throw new Error(`${source}: ${AGENTS_ERROR}`);
+  const paths: string[] = [];
+  for (const value of raw) {
+    if (typeof value !== "string") throw new Error(`${source}: ${AGENTS_ERROR}`);
+    const path = value.trim();
+    // As with skills, a bare name is reserved for agents that plugins may provide later.
+    if (!/^(\.{1,2})?\//.test(path)) throw new Error(`${source}: agent "${value}" must be a path starting with ./, ../, or /`);
+    if (!path.endsWith(".md")) throw new Error(`${source}: agent "${value}" must be a .md file`);
+    const resolved = resolve(baseDir, path);
+    if (paths.includes(resolved)) throw new Error(`${source}: duplicate agent path "${path}"`);
     paths.push(resolved);
   }
   return paths;
