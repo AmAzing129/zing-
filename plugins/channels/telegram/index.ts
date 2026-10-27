@@ -3,7 +3,7 @@ import type { ZingPluginAPI } from "zing";
 
 export const TELEGRAM_LIMIT = 4096;
 export const START_TEXT =
-  "直接发消息就行。需要时效或核实的信息时我会去网上查。\n/reset 开启新对话。";
+  "Just send a message. I'll search the web when you need current or verified information.\nUse /reset to start a new conversation.";
 
 export default function telegram(zing: ZingPluginAPI) {
   zing.registerChannel({
@@ -29,7 +29,7 @@ export default function telegram(zing: ZingPluginAPI) {
         if (ctx.chat) {
           await zing.host.resetConversation(zing.conversationId("telegram", String(ctx.chat.id)));
         }
-        await ctx.reply("已开始新对话。");
+        await ctx.reply("Started a new conversation.");
       });
 
       bot.on("message:text", async (ctx) => {
@@ -49,7 +49,7 @@ export default function telegram(zing: ZingPluginAPI) {
           }
         } catch (error) {
           console.error("agent run failed", { conversationId: conversation, error });
-          await ctx.reply("调用失败，请稍后再试。");
+          await ctx.reply("The request failed. Please try again later.");
         } finally {
           stopTyping();
         }

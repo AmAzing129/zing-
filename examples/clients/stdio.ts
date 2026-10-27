@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 
-const prompt = process.argv.slice(2).join(" ").trim() || "你好，请介绍一下自己";
+const prompt = process.argv.slice(2).join(" ").trim() || "Hello, please introduce yourself.";
 const server = spawn(
   "./node_modules/.bin/tsx",
   ["src/index.ts", "app-server"],

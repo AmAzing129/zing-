@@ -106,7 +106,7 @@ test("telegram drains in-flight replies and keys requests by bot, chat and messa
       "telegram:123:9:1", "telegram:123:9:1", "telegram:123:9:2", "telegram:123:10:1",
       "telegram:456:9:1", "telegram:456:9:1", "telegram:456:9:2", "telegram:456:10:1",
     ]);
-    assert.deepEqual(replies, [...Array(4).fill("completed"), ...Array(4).fill("调用失败，请稍后再试。")]);
+    assert.deepEqual(replies, [...Array(4).fill("completed"), ...Array(4).fill("The request failed. Please try again later.")]);
   } finally {
     Bot.prototype.start = originalStart;
     Bot.prototype.stop = originalStop;

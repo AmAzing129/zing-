@@ -1,64 +1,64 @@
-# Zing App Server v1 实现设计
+# Zing App Server v1 Implementation Design
 
-> 状态：v1 已实现。本文同时记录实现前基线、最终架构、协议与演进边界。
+> Status: v1 is implemented. This document records the pre-implementation baseline, final architecture, protocol, and boundaries for future evolution.
 
-## 目标
+## Goals
 
-Zing 负责 agent 的身份、会话、记忆、工具和运行；客户端只负责交互方式。任何人都可以实现 Web、桌面、CLI、Telegram、Slack 等客户端，而不需要修改 Zing，也不需要采用 Zing 指定的 UI 框架。
+Zing owns the agent's identity, conversations, memory, tools, and execution; clients own only the interaction experience. Anyone can build a web, desktop, CLI, Telegram, Slack, or other client without modifying Zing or adopting a UI framework prescribed by Zing.
 
-v1 必须做到：
+v1 must provide:
 
-- 没有 UI 依赖，也不传输组件、布局或样式。
-- 进程内 Channel 和进程外客户端共用同一个 runtime 行为。
-- 客户端能收到文本增量、工具状态和 turn 最终状态。
-- 会话持久化、同会话串行执行、取消和 reset 有确定语义。
-- Zing 不依赖 AG-UI、ACP 或其他 agent-to-UI 协议；以后可以在核心之外提供适配器。
-- 不直接暴露 `@earendil-works/pi-agent-core` 的类型或事件。
+- No UI dependencies and no transmission of components, layouts, or styles.
+- The same runtime behavior for in-process Channels and out-of-process clients.
+- Text deltas, tool status, and final turn status for clients.
+- Well-defined semantics for conversation persistence, serial execution within a conversation, cancellation, and reset.
+- No dependency on AG-UI, ACP, or other agent-to-UI protocols; adapters may be provided outside the core later.
+- No direct exposure of types or events from `@earendil-works/pi-agent-core`.
 
-## 实现前基线
+## Pre-implementation Baseline
 
-当前调用链如下：
+The call chain at the baseline was:
 
 ```text
 Channel.start(signal)
     -> ConversationHost.handleMessage
-        -> createAgent 中按 conversationId 排队
+        -> queue by conversationId in createAgent
             -> Conversation.prompt
                 -> PiAgent.prompt
-                -> Capsule 追加 JSONL transcript
+                -> Capsule appends the JSONL transcript
         <- Promise<AgentResult>
-    <- Channel 发送最终文本
+    <- Channel sends the final text
 ```
 
-主要边界：
+Key boundaries:
 
-- `src/plugin/types.ts`：`ConversationHost` 只有 `handleMessage` 和 `resetConversation`。
-- `src/agent.ts`：按 `conversationId` 缓存 `Conversation`，同一会话通过 `pending` 串行执行，并将 Pi message/tool 事件映射到 runtime 事件。
-- `src/capsule.ts`：保存 agent identity，并负责加载、追加和 reset 会话。
-- `src/transcript.ts`：会话以 JSONL 保存，当前路径由 `channel:localId` 映射而来。
-- `src/index.ts`：每个进程选择并启动一个 Channel。
-- `plugins/channels/telegram/index.ts`：Channel 直接调用进程内 `ConversationHost`，等待完整结果后回复。
+- `src/plugin/types.ts`: `ConversationHost` exposes only `handleMessage` and `resetConversation`.
+- `src/agent.ts`: caches `Conversation` by `conversationId`, serializes execution within each conversation through `pending`, and maps Pi message/tool events to runtime events.
+- `src/capsule.ts`: stores agent identity and handles loading, appending to, and resetting conversations.
+- `src/transcript.ts`: stores conversations as JSONL, with paths mapped from `channel:localId`.
+- `src/index.ts`: selects and starts one Channel per process.
+- `plugins/channels/telegram/index.ts`: the Channel calls the in-process `ConversationHost` directly and replies after receiving the complete result.
 
-已有能力：
+Existing capabilities:
 
-- agent identity 和会话历史可跨进程恢复。
-- 不同 conversation 相互隔离。
-- 同一 conversation 的消息按到达顺序执行。
-- 单个失败不会阻塞后续消息。
-- Channel、provider、tools 和 conversation observers 都由插件提供。
+- Agent identity and conversation history survive process restarts.
+- Conversations are isolated from one another.
+- Messages in the same conversation execute in arrival order.
+- A single failure does not block subsequent messages.
+- Channels, providers, tools, and conversation observers are all supplied by plugins.
 
-v1 需要补齐的缺口：
+Gaps for v1 to address:
 
-- 没有稳定的流式 runtime API。
-- 客户端看不到文本增量、通用工具生命周期和 turn 状态。
-- 没有取消、thread read/list 或断线后的状态对账接口。
-- conversation ID 同时承担领域 ID 和存储路径约定。
-- `resetConversation` 没有进入同一会话的执行队列。若它与活动 turn 重叠，活动 turn 可能在 reset 标记之后追加消息。
-- 进程在写最后一行 JSONL 时崩溃，可能留下截断行；当前解析会使整个会话无法加载。
+- No stable streaming runtime API.
+- Clients cannot observe text deltas, generic tool lifecycles, or turn status.
+- No interfaces for cancellation, thread read/list, or state reconciliation after disconnection.
+- Conversation IDs serve both as domain IDs and as storage path conventions.
+- `resetConversation` does not enter the conversation's execution queue. If it overlaps an active turn, that turn may append messages after the reset marker.
+- A crash while writing the last JSONL line may leave a truncated line; baseline parsing then prevents the entire conversation from loading.
 
-## 评审结论
+## Review Decision
 
-不采用“协议就是核心”的设计。核心先定义与 transport 无关的 Zing Runtime，JSON-RPC 只是它的一个薄适配器。
+Do not adopt a design in which the protocol is the core. Define a transport-independent Zing Runtime first, with JSON-RPC as a thin adapter around it.
 
 ```text
                          +-------------------+
@@ -73,22 +73,22 @@ future WebSocket ------> |                   |
                      optional AG-UI / ACP adapter
 ```
 
-选择这个边界的原因：
+Reasons for this boundary:
 
-1. 当前 `ConversationHost` 已经是进程内领域接口的雏形，可以渐进扩展。
-2. Channel 和测试不需要经过序列化再调用同一进程。
-3. Runtime 事件同时隔离 Pi，实现未来替换底层 agent core 时不影响客户端。
-4. JSON-RPC、stdio、WebSocket、AG-UI、ACP 都只是 transport 或兼容层，可以独立替换。
+1. `ConversationHost` already provides the beginnings of an in-process domain interface and can be extended incrementally.
+2. Channels and tests should not need serialization to make calls within the same process.
+3. Runtime events also isolate Pi, allowing the underlying agent core to be replaced without affecting clients.
+4. JSON-RPC, stdio, WebSocket, AG-UI, and ACP are transports or compatibility layers that can be replaced independently.
 
-v1 引入 **Thread** 和 **Turn**，但不复制 Codex 的通用 Item 体系：
+v1 introduces **Thread** and **Turn**, but does not copy Codex's generic Item system:
 
-- Thread：持久会话，对应当前 conversation。
-- Turn：一次用户输入及其引发的完整 agent 工作。取消、排队和事件关联都依赖稳定的 `turnId`。
-- Message 和 Tool：v1 的两类具体事件。以后需要新的工作单元时，以新增事件扩展，不预先设计通用 Item 联合类型。
+- Thread: a persistent conversation, corresponding to the existing conversation concept.
+- Turn: one user input and all agent work it triggers. Cancellation, queuing, and event correlation rely on a stable `turnId`.
+- Message and Tool: the two concrete event categories in v1. Add new events when new units of work are needed, rather than designing a generic Item union in advance.
 
-## Runtime 领域接口
+## Runtime Domain Interface
 
-以下是目标形状，不要求逐字采用这些类型名：
+The following is the target shape; these exact type names are not required:
 
 ```ts
 type ThreadId = string;
@@ -158,64 +158,64 @@ type AgentRuntime = {
 };
 ```
 
-实现约束：
+Implementation constraints:
 
-- `TurnHandle` 是热运行句柄：是否订阅事件不能决定 turn 是否执行。
-- 事件监听器不能阻塞 agent loop；transport 写入必须与 Pi 的同步事件回调解耦。
-- `turn/completed` 只在本 turn 产生的 transcript 已持久化后发出。
-- `message/completed` 和 `turn/completed` 中的最终内容是权威状态；delta 只是实时体验。
-- `AgentResult = { text: string }`；现有 Channel 可以不消费任何流式事件。
+- `TurnHandle` is a hot execution handle: whether anyone subscribes to events must not determine whether the turn runs.
+- Event listeners must not block the agent loop; transport writes must be decoupled from Pi's synchronous event callbacks.
+- Emit `turn/completed` only after the transcript produced by that turn has been persisted.
+- Final content in `message/completed` and `turn/completed` is authoritative; deltas serve only the live interaction experience.
+- `AgentResult = { text: string }`; existing Channels need not consume any streaming events.
 
-### Pi 事件映射
+### Pi Event Mapping
 
-Runtime 是 Pi 的防腐层，只在 `src/agent.ts` 内进行以下映射：
+The Runtime is an anti-corruption layer around Pi. The following mappings occur only within `src/agent.ts`:
 
-| Pi 事件 | Runtime 事件 |
+| Pi event | Runtime event |
 | --- | --- |
-| 外层 `PiAgent.prompt` 真正开始执行 | `turn/started` |
-| `message_update` 中的 `text_delta` | `message/delta` |
+| The outer `PiAgent.prompt` actually begins execution | `turn/started` |
+| `text_delta` within `message_update` | `message/delta` |
 | assistant `message_end` | `message/completed` |
 | `tool_execution_start` | `tool/started` |
 | `tool_execution_end` | `tool/completed` |
-| prompt 成功、报错或 abort，并完成持久化 | `turn/completed` |
+| The prompt succeeds, fails, or aborts, and persistence finishes | `turn/completed` |
 
-Pi 的 `turn_start` / `turn_end` 是一次模型循环；一个 Zing Turn 内可能因为工具调用发生多次模型循环，因此不能直接映射为 Zing Turn。
-Pi 的 `tool_execution_update` 暂不进入 v1，避免把结构不稳定的底层 partial result 变成公共协议承诺。
+Pi's `turn_start` / `turn_end` describe one model round. A Zing Turn may contain multiple model rounds because of tool calls, so these events cannot map directly to a Zing Turn.
+Pi's `tool_execution_update` is excluded from v1 to avoid turning unstable underlying partial-result structures into a public protocol commitment.
 
-## Thread 和历史
+## Threads and History
 
 ### Thread ID
 
-- Runtime 将 `threadId` 当作不透明字符串，不解析其中的 channel 含义。
-- `thread/open` 未提供 ID 时，由服务端生成，例如 `thr_<uuid>`。
-- 消息系统可以提供稳定且带命名空间的 ID，例如 `telegram:12345`，从而不必维护额外映射表。
-- 客户端提供的 ID 最多 80 UTF-8 bytes、禁止控制字符，并由 Capsule 安全编码为路径。
-- 当前 `channel:localId` 文件布局继续兼容；它降级为 Capsule 的存储细节，不再是公共领域规则。
+- The Runtime treats `threadId` as an opaque string and does not interpret any channel meaning within it.
+- If `thread/open` receives no ID, the server generates one, such as `thr_<uuid>`.
+- Messaging systems may supply stable, namespaced IDs such as `telegram:12345`, avoiding an extra mapping table.
+- Client-supplied IDs are limited to 80 UTF-8 bytes, cannot contain control characters, and are safely encoded as paths by the Capsule.
+- The existing `channel:localId` file layout remains compatible; it becomes a Capsule storage detail rather than a public domain rule.
 
-### 历史模型
+### History Model
 
-`thread/read` 返回公共 `ThreadSnapshot`，包含最后一次 reset 之后的 user、assistant 和 tool-result 历史。它与当前 `TranscriptEvent` 语义对应，但公共协议类型不能直接 alias 存储类型：
+`thread/read` returns a public `ThreadSnapshot` containing user, assistant, and tool-result history since the last reset. Its semantics correspond to the existing `TranscriptEvent`, but public protocol types must not directly alias storage types:
 
-- transcript 的 `v`、路径和 reset marker 是存储细节。
-- 公共历史 DTO 只表达消息、工具结果、时间和必要模型信息。
-- 存储格式升级不能被迫成为协议破坏性升级。
-- 协议字段升级也不能要求重写已有 transcript。
+- The transcript's `v`, paths, and reset markers are storage details.
+- Public history DTOs represent only messages, tool results, timestamps, and necessary model information.
+- A storage format upgrade must not force a breaking protocol change.
+- A protocol field upgrade must not require rewriting existing transcripts.
 
-Capsule 已增加 ensure/read/list 能力；Pi 恢复仍使用现有 `loadConversation`，客户端读取则经过公共 DTO 转换。
+The Capsule now provides ensure/read/list capabilities. Pi restoration still uses the existing `loadConversation`, while client reads go through public DTO conversion.
 
 ## Zing Protocol v1
 
-### Envelope 和 transport
+### Envelope and Transport
 
-- 使用标准 JSON-RPC 2.0，保留 `"jsonrpc": "2.0"` 字段。
-- 首发 transport 是 stdio，每行一个完整 JSON 对象（JSONL）。
-- stdout 只能写协议消息；日志和诊断必须写 stderr。
-- WebSocket 后续复用同一个 dispatcher，每个 text frame 一个 JSON-RPC 消息。
-- v1 不依赖任何 JSON-RPC framework；dispatcher 只需要请求校验、方法路由、response 和 notification。
+- Use standard JSON-RPC 2.0, retaining the `"jsonrpc": "2.0"` field.
+- The initial transport is stdio, with one complete JSON object per line (JSONL).
+- stdout must contain only protocol messages; logs and diagnostics must go to stderr.
+- A future WebSocket transport will reuse the same dispatcher, with one JSON-RPC message per text frame.
+- v1 does not depend on a JSON-RPC framework; the dispatcher needs only request validation, method routing, responses, and notifications.
 
-### 初始化
+### Initialization
 
-每条连接必须先调用 `initialize`：
+Each connection must call `initialize` first:
 
 ```json
 {
@@ -232,21 +232,21 @@ Capsule 已增加 ensure/read/list 能力；Pi 恢复仍使用现有 `loadConver
 }
 ```
 
-响应返回协商后的版本、agent identity 和 capabilities。初始化之前的其他方法必须失败；同一连接不能重复初始化。
+The response returns the negotiated version, agent identity, and capabilities. Other methods must fail before initialization, and a connection cannot initialize twice.
 
-### 方法
+### Methods
 
-| 方法 | 作用 |
+| Method | Purpose |
 | --- | --- |
-| `initialize` | 协商协议版本和能力 |
-| `thread/open` | 使用客户端 ID 或生成 ID，幂等打开持久 thread |
-| `thread/read` | 读取权威历史和 thread 状态 |
-| `thread/list` | 分页列出 thread 摘要 |
-| `thread/reset` | 按同 thread 操作顺序追加 reset marker |
-| `turn/start` | 创建 turn，立即返回 `turnId` 和排队状态 |
-| `turn/cancel` | 取消指定 thread 当前正在执行的 turn |
+| `initialize` | Negotiate the protocol version and capabilities |
+| `thread/open` | Idempotently open a persistent thread using a client-supplied or generated ID |
+| `thread/read` | Read authoritative history and thread state |
+| `thread/list` | List paginated thread summaries |
+| `thread/reset` | Append a reset marker in the thread's operation order |
+| `turn/start` | Create a turn and immediately return its `turnId` and queued status |
+| `turn/cancel` | Cancel the currently executing turn in the specified thread |
 
-`turn/start` 不能等待模型完成后才响应，否则客户端无法可靠建立 turn 状态。响应示例：
+`turn/start` must not wait for the model to finish before responding; otherwise clients cannot reliably establish turn state. Example response:
 
 ```json
 {
@@ -261,11 +261,11 @@ Capsule 已增加 ensure/read/list 能力；Pi 恢复仍使用现有 `loadConver
 }
 ```
 
-当它真正获得同 thread 执行权时发送 `turn/started`，运行期间发送 message/tool notification，最后恰好发送一次 `turn/completed`。
+Emit `turn/started` when the turn actually gains execution within its thread, message/tool notifications while it runs, and exactly one `turn/completed` at the end.
 
-### Notification
+### Notifications
 
-Runtime event 直接映射为同名 JSON-RPC notification：
+Runtime events map directly to JSON-RPC notifications with the same names:
 
 ```json
 {
@@ -275,73 +275,73 @@ Runtime event 直接映射为同名 JSON-RPC notification：
     "threadId": "thr_123",
     "turnId": "turn_abc",
     "messageId": "msg_xyz",
-    "delta": "你"
+    "delta": "Hello"
   }
 }
 ```
 
-v1 的事件只发送给发起该 turn 的连接。断线后不重放 delta，客户端通过 `thread/read` 获取最终权威状态。
+v1 events are sent only to the connection that started the turn. Deltas are not replayed after disconnection; clients use `thread/read` to retrieve the final authoritative state.
 
-### 版本策略
+### Versioning Policy
 
-- `protocolVersion: 1` 表示 wire compatibility，不使用 npm package version 推断协议兼容性。
-- 同一协议版本只能增加可选字段、方法、notification 或 capability。
-- 客户端必须忽略未知字段和未知 notification。
-- 删除字段、改变字段语义或改变已有枚举值需要新的协议版本。
-- 发布稳定 v1 前提供 checked-in JSON Schema 和协议 fixtures，使其他语言不依赖 Zing 的 TypeScript 源码。
+- `protocolVersion: 1` denotes wire compatibility; do not infer protocol compatibility from the npm package version.
+- Within one protocol version, changes may only add optional fields, methods, notifications, or capabilities.
+- Clients must ignore unknown fields and unknown notifications.
+- Removing fields, changing field semantics, or changing existing enum values requires a new protocol version.
+- Provide a checked-in JSON Schema and protocol fixtures before releasing stable v1 so other languages do not depend on Zing's TypeScript source.
 
-## 执行不变量
+## Execution Invariants
 
-### 排队
+### Queuing
 
-1. 同一 `threadId` 的 turn 和 reset 共用一个 FIFO 队列。
-2. 同一 thread 最多只有一个活动 Pi run。
-3. 不同 thread 可以并行执行。
-4. 一个失败或取消的 turn 不能阻塞队列后续操作。
-5. reset 默认排在已接收操作之后；需要立即停止当前 turn 的客户端应先调用 `turn/cancel`，再调用 `thread/reset`。
+1. Turns and resets for the same `threadId` share one FIFO queue.
+2. Each thread has at most one active Pi run.
+3. Different threads may execute concurrently.
+4. A failed or canceled turn must not block subsequent queued operations.
+5. By default, reset follows already accepted operations. Clients that need to stop the current turn immediately should call `turn/cancel` before `thread/reset`.
 
-### 取消
+### Cancellation
 
-- `turn/cancel` 只接受当前活动 turn 的 `threadId + turnId`。
-- 它调用对应 `PiAgent.abort()`，而不是删除整个 Conversation。
-- 已产生的 user/assistant/tool 消息仍在 turn 结束路径中持久化。
-- terminal event 的状态为 `canceled`，且只发送一次。
-- v1 的 `turn/cancel` 不取消尚未开始的排队 turn；请求取消非活动 turn 返回明确错误。transport 整体关闭时会取消该 session 持有的所有 handle，包括排队 turn。
+- `turn/cancel` accepts only the `threadId + turnId` of the currently active turn.
+- It calls the corresponding `PiAgent.abort()` rather than deleting the entire Conversation.
+- User, assistant, and tool messages already produced are still persisted through the turn's completion path.
+- The terminal event has status `canceled` and is emitted only once.
+- v1's `turn/cancel` does not cancel queued turns that have not started; canceling an inactive turn returns an explicit error. Closing the entire transport cancels all handles owned by that session, including queued turns.
 
-### 持久化
+### Persistence
 
-- Capsule transcript 是历史事实来源，实时事件流不是数据库。
-- transcript 必须始终是内存 Agent messages 的已提交前缀，不能重复 append。
-- 成功、失败和取消都经过同一 finally 持久化路径。
-- 只有持久化成功后才能发成功的 terminal event；持久化失败必须使 turn 为 `failed`。
-- reset 与 turn append 使用同一 per-thread 队列，修复当前竞态。
-- JSONL 解析只可以容忍“文件不以换行结尾且最后一行不是完整 JSON”这一种崩溃残留；其他坏行仍应报错，避免静默丢历史。
+- The Capsule transcript is the source of historical truth; the live event stream is not a database.
+- The transcript must always be a committed prefix of the in-memory Agent messages, without duplicate appends.
+- Success, failure, and cancellation all use the same `finally` persistence path.
+- A successful terminal event may be emitted only after persistence succeeds; a persistence failure must mark the turn as `failed`.
+- Reset and turn append use the same per-thread queue, fixing the baseline race condition.
+- JSONL parsing may tolerate only one kind of crash residue: a file without a trailing newline whose final line is incomplete JSON. Other malformed lines must still raise errors to avoid silently losing history.
 
-### 上下文和运行预算
+### Context and Execution Budgets
 
-- Capsule 保留完整 transcript；`transformContext` 只裁剪发给模型的请求视图，不改写持久历史。
-- 裁剪只从最旧的完整 user turn 开始，assistant tool call 和对应 tool result 不会被拆开。
-- 固定的 omission marker 明确告诉模型存在更早历史；近期 turn 连同 system、tools、输出预留和安全余量必须适配模型声明的 context window。
-- 单条 user 输入如果不能适配上下文预算，在调用模型前失败。
-- 每个 turn 默认限制为 5 分钟、16 个模型轮次和 32 次工具调用；blueprint 的 `limits` 可以收紧或放宽。
-- 预算触发产生 `failed` terminal event；已经产生的消息和工具结果仍按正常 finally 路径持久化。
+- The Capsule retains the full transcript; `transformContext` trims only the request view sent to the model, without rewriting persistent history.
+- Trimming starts with the oldest complete user turns; assistant tool calls and their corresponding tool results are never split apart.
+- A fixed omission marker explicitly tells the model that earlier history exists. Recent turns, together with the system prompt, tools, output reserve, and safety margin, must fit within the model's declared context window.
+- A single user input that cannot fit within the context budget fails before the model is called.
+- Each turn defaults to limits of 5 minutes, 16 model rounds, and 32 tool calls; the blueprint's `limits` may tighten or relax them.
+- Exceeding a budget produces a `failed` terminal event; messages and tool results already produced are still persisted through the normal `finally` path.
 
-### 断线
+### Disconnection
 
-- Runtime 的 turn 生命周期独立于观察者生命周期。
-- WebSocket 客户端断线不自动取消 turn；服务端继续运行并持久化。
-- 重连客户端通过 `thread/read` 对账；v1 不提供 event replay、offset 或 resume token。
-- stdio 收到 EOF 后停止接收新请求，取消该 session 已接受的活动和排队 turn，等待取消结果持久化后退出；强制杀进程不保证当前 turn 完成。
+- The Runtime's turn lifecycle is independent of the observer lifecycle.
+- A WebSocket client disconnect does not automatically cancel a turn; the server continues execution and persistence.
+- Reconnecting clients reconcile state through `thread/read`; v1 provides no event replay, offsets, or resume tokens.
+- On EOF, stdio stops accepting new requests, cancels active and queued turns accepted by that session, and waits for cancellation results to be persisted before exiting. Force-killing the process does not guarantee completion of the current turn.
 
-### 多客户端
+### Multiple Clients
 
-- 多个客户端可以向同一 thread 提交 turn，它们仍进入同一个 FIFO 队列。
-- 每个 turn 的实时事件只回到发起连接。
-- v1 不提供 thread 订阅或多客户端事件广播。
+- Multiple clients may submit turns to the same thread; those turns still enter the same FIFO queue.
+- Live events for each turn return only to the originating connection.
+- v1 provides neither thread subscriptions nor multi-client event broadcasting.
 
-## 与现有 Channel 的兼容
+## Compatibility with Existing Channels
 
-现有插件 API 在 v1 保持兼容：
+The existing plugin API remains compatible in v1:
 
 ```ts
 handleMessage(message)
@@ -353,113 +353,113 @@ resetConversation(conversationId)
   -> runtime.resetThread(conversationId)
 ```
 
-Telegram 和 stdio Channel 不需要立即改造。它们以后可以选择订阅 Runtime 事件，但这不是 App Server v1 的前置条件。
+Telegram and stdio Channels do not require immediate changes. They may choose to subscribe to Runtime events later, but that is not a prerequisite for App Server v1.
 
-App Server 是新的顶层运行模式，不伪装成 Channel：
+App Server is a new top-level operating mode, not a disguised Channel:
 
 ```text
-zing --once "hello"       # 当前一次性 Channel 模式
-zing --channel telegram   # 当前进程内 Channel 模式
-zing app-server           # 新增 JSON-RPC stdio 模式
+zing --once "hello"       # Existing one-shot Channel mode
+zing --channel telegram   # Existing in-process Channel mode
+zing app-server           # New JSON-RPC stdio mode
 ```
 
-公共 bootstrap 应拆出“加载 config/plugins、创建 station/capsule/runtime”的共享部分；Channel mode 和 App Server mode 在 runtime 创建之后分流。这样不会把协议生命周期塞进 `registerChannel`。
+The shared bootstrap should extract configuration/plugin loading and station/capsule/runtime creation. Channel mode and App Server mode diverge after runtime creation, keeping protocol lifecycle management out of `registerChannel`.
 
-## 实现顺序（已完成）
+## Implementation Sequence (Completed)
 
-### 1. 先修复既有一致性问题
+### 1. Fix Existing Consistency Issues First
 
-- 将 reset 放进 per-thread 队列。
-- 对截断的最后一行 JSONL 做严格限定的恢复。
-- 增加 turn/reset 重叠和截断日志测试。
+- Put reset into the per-thread queue.
+- Add narrowly scoped recovery for a truncated final JSONL line.
+- Add tests for overlapping turns/resets and truncated logs.
 
-这一步不改变公共 API。
+This step does not change the public API.
 
-### 2. 引入 Runtime 事件与 TurnHandle
+### 2. Introduce Runtime Events and TurnHandle
 
-- 新增与 Pi 无关的 runtime 类型。
-- 在 `Conversation.prompt` 周围生成 `turnId`，映射 Pi message/tool 事件。
-- 记录活动 `turnId -> Conversation`，连接 `cancel` 与 `PiAgent.abort()`。
-- 保留 `ConversationHost`，改为 Runtime 上的兼容 shim。
-- 验证现有 Channel、observer 通知和持久化行为不变。
+- Add runtime types independent of Pi.
+- Generate `turnId` around `Conversation.prompt` and map Pi message/tool events.
+- Track active `turnId -> Conversation` mappings and connect `cancel` to `PiAgent.abort()`.
+- Retain `ConversationHost` as a compatibility shim over the Runtime.
+- Verify that existing Channel behavior, observer notifications, and persistence remain unchanged.
 
-### 3. 扩展 Capsule thread 查询
+### 3. Extend Capsule Thread Queries
 
-- 增加 ensure/read/list API。
-- 将 transcript 转换为公共 `ThreadSnapshot`。
-- 保持当前目录布局和现有 JSONL 文件可直接加载。
-- 为 `thread/list` 返回稳定 envelope：`{ data, nextCursor }`，即使首版数据量很小也不直接返回裸数组。
+- Add ensure/read/list APIs.
+- Convert transcripts to public `ThreadSnapshot` objects.
+- Preserve the current directory layout and direct loading of existing JSONL files.
+- Return a stable `{ data, nextCursor }` envelope from `thread/list`, not a bare array, even if the initial dataset is small.
 
-### 4. 实现 transport-neutral dispatcher
+### 4. Implement a Transport-neutral Dispatcher
 
-- JSON-RPC envelope 解析和基础校验。
-- initialize 状态机。
-- method -> Runtime 路由。
-- Runtime event -> notification 路由。
-- 标准 JSON-RPC 错误与少量稳定的 Zing 错误码。
-- dispatcher 测试不启动 stdio 或真实模型。
+- Parse and validate JSON-RPC envelopes.
+- Implement the initialization state machine.
+- Route methods to the Runtime.
+- Route Runtime events to notifications.
+- Use standard JSON-RPC errors and a small set of stable Zing error codes.
+- Test the dispatcher without starting stdio or a real model.
 
-### 5. 增加 stdio App Server
+### 5. Add the stdio App Server
 
-- JSONL reader/writer。
-- 并发处理请求，使 `turn/cancel` 不会被活动 `turn/start` 阻塞。
-- stdout 协议纯净性和 stderr 日志测试。
-- CLI 增加 `app-server` 模式，共用现有 bootstrap。
-- 加入最小客户端 fixture，覆盖 initialize、open、start、delta、complete、read。
+- Implement a JSONL reader/writer.
+- Handle requests concurrently so an active `turn/start` does not block `turn/cancel`.
+- Test that stdout contains only protocol messages and logs go to stderr.
+- Add the CLI's `app-server` mode using the existing bootstrap.
+- Add a minimal client fixture covering initialize, open, start, delta, complete, and read.
 
-### 6. 发布协议 artifact
+### 6. Publish Protocol Artifacts
 
-- 固定 v1 TypeScript 类型。
-- 生成并提交 JSON Schema。
-- 提供最小 Node 客户端示例，但不提供 UI。
-- 文档说明未知事件处理、取消和断线恢复。
+- Finalize the v1 TypeScript types.
+- Generate and commit the JSON Schema.
+- Provide a minimal Node client example, but no UI.
+- Document handling of unknown events, cancellation, and recovery after disconnection.
 
-### 7. 后续 transport
+### 7. Future Transports
 
-- WebSocket binding 复用 dispatcher，不修改 Runtime。
-- 默认只监听 loopback；监听非 loopback 时必须配置 bearer token 和 TLS 终止层。
-- AG-UI、ACP、HTTP/SSE 只能作为独立 adapter，不进入 core package。
+- Reuse the dispatcher for a WebSocket binding without changing the Runtime.
+- Listen only on loopback by default; non-loopback listeners must have a bearer token and a TLS termination layer.
+- Keep AG-UI, ACP, and HTTP/SSE in independent adapters, outside the core package.
 
-## 验证计划
+## Validation Plan
 
-至少覆盖：
+Cover at least:
 
-- 同 thread 的两个 turn 保持 FIFO，并获得不同 turnId。
-- 不同 thread 可以并发。
-- turn 失败和取消后，后续 turn 仍可执行。
-- cancel 只作用于匹配的活动 turn。
-- reset 与活动/排队 turn 的顺序确定，重启后结果一致。
-- 每个 turn 恰好一个 terminal event，且发生在持久化之后。
-- 文本 delta 顺序正确，拼接结果与 `message/completed` 一致。
-- 工具 started/completed 使用同一 callId。
-- 旧 transcript、reset transcript、截断最后一行都按约定加载。
-- 连接断开不改变 runtime turn 结果，`thread/read` 可以恢复最终状态。
-- initialize 前调用、重复 initialize、未知方法、非法 params 返回稳定错误。
-- stdio stdout 中没有日志或非 JSON 内容。
-- 现有 agent、capsule、transcript、Telegram 和 plugin 测试继续通过。
+- Two turns in the same thread preserve FIFO order and receive distinct turn IDs.
+- Different threads can run concurrently.
+- Subsequent turns still execute after a turn fails or is canceled.
+- Cancellation affects only the matching active turn.
+- Reset ordering relative to active/queued turns is deterministic and remains consistent after restart.
+- Each turn emits exactly one terminal event, after persistence.
+- Text deltas arrive in the correct order and concatenate to the content of `message/completed`.
+- Tool started/completed events use the same `callId`.
+- Legacy transcripts, reset transcripts, and truncated final lines load according to the contract.
+- Disconnection does not alter runtime turn results, and `thread/read` can retrieve the final state.
+- Calls before initialization, repeated initialization, unknown methods, and invalid parameters return stable errors.
+- stdio stdout contains no logs or non-JSON content.
+- Existing agent, capsule, transcript, Telegram, and plugin tests continue to pass.
 
-## v1 明确不做
+## Explicit v1 Non-goals
 
-- UI 组件、布局、主题或 generative UI 描述。
-- AG-UI、ACP、MCP UI 等协议兼容层。
-- event replay、offset、resume token 和 exactly-once delivery。
-- thread 实时订阅和多客户端广播。
-- turn steering、排队 turn 取消和 turn 重试。
-- 工具审批、用户表单和 server-to-client request；JSON-RPC 保留未来增加它们的能力。
-- thread fork、archive、pin、title、tag、全文搜索。
-- 图片和附件作为协议输入；现有 transcript 的图片存储能力保持不变。
-- 多 agent / 多 capsule 的单进程托管。
-- WebSocket、远程账号系统和复杂鉴权。
-- 将当前 transcript 文件格式直接承诺为公共 wire format。
+- UI components, layouts, themes, or generative UI descriptions.
+- Compatibility layers for AG-UI, ACP, MCP UI, or similar protocols.
+- Event replay, offsets, resume tokens, or exactly-once delivery.
+- Live thread subscriptions or multi-client broadcasting.
+- Turn steering, queued-turn cancellation, or turn retries.
+- Tool approvals, user forms, or server-to-client requests; JSON-RPC leaves room to add them later.
+- Thread forks, archives, pins, titles, tags, or full-text search.
+- Images and attachments as protocol inputs; existing transcript support for storing images remains unchanged.
+- Hosting multiple agents or Capsules in one process.
+- WebSocket, remote account systems, or complex authentication.
+- Committing to the current transcript file format as the public wire format.
 
-## v1 完成标准
+## v1 Completion Criteria
 
-当以下条件同时成立时，App Server v1 才算完成：
+App Server v1 is complete only when all of the following hold:
 
-1. 一个独立 Node 客户端可以启动 `zing app-server`，完成握手并创建或打开 thread。
-2. 客户端能开始 turn，立即获得 turnId，并持续收到文本和工具事件。
-3. 客户端能取消活动 turn，并收到唯一 terminal event。
-4. 客户端退出并重新连接后，能通过 `thread/read` 取得已持久化历史。
-5. Telegram 和 `--once` 不经过 JSON-RPC 仍保持现有行为。
-6. 公共协议中不存在 Pi、AG-UI、ACP 或任何 UI framework 类型。
-7. JSON Schema、协议 fixtures、实现和文档对 v1 消息保持一致。
+1. An independent Node client can start `zing app-server`, complete the handshake, and create or open a thread.
+2. The client can start a turn, receive its turn ID immediately, and continuously receive text and tool events.
+3. The client can cancel an active turn and receive exactly one terminal event.
+4. After exiting and reconnecting, the client can retrieve persisted history through `thread/read`.
+5. Telegram and `--once` retain their existing behavior without going through JSON-RPC.
+6. The public protocol contains no Pi, AG-UI, ACP, or UI framework types.
+7. The JSON Schema, protocol fixtures, implementation, and documentation agree on v1 messages.
