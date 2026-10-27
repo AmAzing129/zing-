@@ -102,6 +102,7 @@ const ThreadsDoc = defineDoc<ThreadsState>({
   version: 1,
   scope: "session",
   initial: () => ({ threads: {} }),
+  checkpointWhen: () => false,
 });
 
 const THREAD_KEY_PREFIX = "t:";
@@ -122,6 +123,7 @@ const TurnDoc = defineDoc<TurnState>({
   history: "latest",
   fork: "initial",
   initial: () => ({}),
+  checkpointWhen: () => false,
 });
 
 export type CreateDurableAgentOptions = CreateAgentOptions & {
