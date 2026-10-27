@@ -1,7 +1,7 @@
 # Station: the local code and credentials this agent can dock to.
 # A plugin being present under plugins/ does not execute it; only paths listed here are enabled.
 plugins:
-  - ./plugins/providers/xai
+  - ./plugins/providers/deepseek
   - ./plugins/channels/telegram
   - ./plugins/tools/brave
   - ./plugins/tools/notes

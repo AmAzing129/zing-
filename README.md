@@ -45,7 +45,7 @@ The blueprint is an exact capability allowlist: an enabled tool is invisible to 
 
 ```yaml
 name: research-friend
-model: grok-4.6
+model: deepseek-v4-pro
 tools:
   - web_search
   - market__quote
@@ -142,7 +142,7 @@ Read the full [deployment contract](docs/deployment-contract.md) before operatin
 
 ## Run it with Docker
 
-The checked-in [`station.yaml`](station.yaml) enables xAI, Telegram, Brave Search, and Notes. Telegram is the default everyday door; the `zing-data` volume preserves the agent behind it.
+The checked-in [`station.yaml`](station.yaml) enables DeepSeek, Telegram, Brave Search, and Notes. Telegram is the default everyday door; the `zing-data` volume preserves the agent behind it.
 
 1. Create a bot with [BotFather](https://t.me/BotFather) and copy its token. Find your numeric Telegram ID with [@userinfobot](https://t.me/userinfobot).
 2. Create your local secrets file:
@@ -151,7 +151,7 @@ The checked-in [`station.yaml`](station.yaml) enables xAI, Telegram, Brave Searc
    cp .env.example .env
    ```
 
-   Set `XAI_API_KEY`, `BRAVE_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_ALLOWED_USER_IDS`. The Notes plugin loads by default. Set `ZING_MEMORY_OWNER_IDS` to the trusted Telegram owner IDs to passively distill their facts. Without it, identified Telegram senders are untrusted and do not receive passive owner-note distillation; the model can still explicitly call `memory_save`, which stores those facts as untrusted.
+   Set `DEEPSEEK_API_KEY`, `BRAVE_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_ALLOWED_USER_IDS`. The Notes plugin loads by default. Set `ZING_MEMORY_OWNER_IDS` to the trusted Telegram owner IDs to passively distill their facts. Without it, identified Telegram senders are untrusted and do not receive passive owner-note distillation; the model can still explicitly call `memory_save`, which stores those facts as untrusted.
 
 3. Start the station:
 

@@ -75,7 +75,7 @@ test("the checked-in station enables the default local plugin set", async () => 
   const close = await loadPlugins(registry, station.plugins);
 
   assert.equal(station.channel, "telegram");
-  assert.equal(registry.getProvider("xai")?.pluginId, "xai");
+  assert.equal(registry.getProvider("deepseek")?.pluginId, "deepseek");
   assert.equal(registry.getChannel("telegram")?.id, "telegram");
   assert.deepEqual(registry.listTools().map((tool) => tool.name), ["web_search", "memory_search", "memory_save"]);
   assert.equal(registry.listListeners().length, 1);

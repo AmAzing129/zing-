@@ -14,13 +14,13 @@ An included plugin is not enabled automatically. This matters because plugin cod
 
 | Path | Capability | Configuration |
 |---|---|---|
-| `providers/xai` | xAI model provider | `XAI_API_KEY` |
+| `providers/deepseek` | DeepSeek model provider | `DEEPSEEK_API_KEY` |
 | `channels/telegram` | Telegram channel | `TELEGRAM_BOT_TOKEN`, optional `TELEGRAM_ALLOWED_USER_IDS` |
 | `tools/brave` | `web_search` | `BRAVE_API_KEY` |
 | `tools/notes` | `memory_search`, `memory_save`, conversation observer | optional `ZING_MEMORY_OWNER_IDS` |
 | `tools/mcp` | tools discovered from one MCP server | `MCP_URL`, `MCP_SERVER_ALIAS`, and optional auth/alias settings |
 
-The checked-in [`station.yaml`](../station.yaml) enables xAI, Telegram, Brave, and Notes. MCP is included but disabled by default because it needs a server configuration at startup.
+The checked-in [`station.yaml`](../station.yaml) enables DeepSeek, Telegram, Brave, and Notes. MCP is included but disabled by default because it needs a server configuration at startup.
 
 ## Enabling local source
 
@@ -28,7 +28,7 @@ The checked-in [`station.yaml`](../station.yaml) enables xAI, Telegram, Brave, a
 
 ```yaml
 plugins:
-  - ./plugins/providers/xai
+  - ./plugins/providers/deepseek
   - ./plugins/channels/telegram
   - ./plugins/tools/brave
   - ./plugins/tools/notes
@@ -117,14 +117,14 @@ Use `zing.host` inside `start(signal)`, after the Agent has been bound. A Channe
 The Blueprint names a model ID; an enabled provider supplies its model catalog and key. The ID is required and Zing has no built-in default model. Set `model` in `agent.yaml`; a `MODEL` environment variable overrides it for one station:
 
 ```ts
-import { xaiProvider } from "@earendil-works/pi-ai/providers/xai";
+import { deepseekProvider } from "@earendil-works/pi-ai/providers/deepseek";
 import type { ZingPluginAPI } from "zing";
 
-export default function xai(zing: ZingPluginAPI) {
+export default function deepseek(zing: ZingPluginAPI) {
   zing.registerProvider({
-    pluginId: "xai",
-    provider: xaiProvider(),
-    getApiKey: () => zing.env.XAI_API_KEY?.trim() || undefined,
+    pluginId: "deepseek",
+    provider: deepseekProvider(),
+    getApiKey: () => zing.env.DEEPSEEK_API_KEY?.trim() || undefined,
   });
 }
 ```
@@ -134,15 +134,15 @@ When several providers can serve the same model ID, select one with `station.yam
 The model ID must be in an enabled provider's catalog; otherwise startup fails and lists the available IDs. Zing does not guess metadata for an unlisted ID, because the context window and output limit drive history trimming. To use a model the catalog does not list yet, add it in the provider plugin with its real limits:
 
 ```ts
-const base = xaiProvider();
-const template = base.getModels().find((model) => model.id === "grok-4.5");
-if (!template) throw new Error("grok-4.5 template missing");
-const grok5 = { ...template, id: "grok-5", name: "Grok 5", contextWindow: 1_000_000, maxTokens: 128_000 };
+const base = deepseekProvider();
+const template = base.getModels().find((model) => model.id === "deepseek-v4-pro");
+if (!template) throw new Error("deepseek-v4-pro template missing");
+const v5 = { ...template, id: "deepseek-v5", name: "DeepSeek V5", contextWindow: 1_000_000, maxTokens: 128_000 };
 
 zing.registerProvider({
-  pluginId: "xai",
-  provider: { ...base, getModels: () => [...base.getModels(), grok5] },
-  getApiKey: () => zing.env.XAI_API_KEY?.trim() || undefined,
+  pluginId: "deepseek",
+  provider: { ...base, getModels: () => [...base.getModels(), v5] },
+  getApiKey: () => zing.env.DEEPSEEK_API_KEY?.trim() || undefined,
 });
 ```
 
