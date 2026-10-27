@@ -52,6 +52,7 @@ import {
   resolveAgentLimits,
   toError,
   toThreadEntry,
+  withBuiltinTools,
   type Agent,
   type CreateAgentOptions,
 } from "./agent";
@@ -70,14 +71,8 @@ import {
   type TurnHandle,
   type TurnInput,
 } from "./runtime";
-import {
-  composeSystemPrompt,
-  renderSkillCatalog,
-  SKILL_TOOL_NAME,
-  SKILLS_SECTION,
-  tagSection,
-  withSkillTool,
-} from "./skills";
+import { composeSystemPrompt, promptSections, tagSection } from "./prompt";
+import { SKILL_TOOL_NAME } from "./skills";
 import type { Station } from "./station";
 import { encodeMessages } from "./transcript";
 
@@ -107,6 +102,7 @@ const ThreadsDoc = defineDoc<ThreadsState>({
   version: 1,
   scope: "session",
   initial: () => ({ threads: {} }),
+  checkpointWhen: () => false,
 });
 
 const THREAD_KEY_PREFIX = "t:";
@@ -127,6 +123,7 @@ const TurnDoc = defineDoc<TurnState>({
   history: "latest",
   fork: "initial",
   initial: () => ({}),
+  checkpointWhen: () => false,
 });
 
 export type CreateDurableAgentOptions = CreateAgentOptions & {
@@ -176,12 +173,13 @@ export async function createDurableAgent(
   const modelRef = { provider: model.provider, modelId: model.id };
   const system = blueprint.system ?? DEFAULT_SYSTEM;
   const skills = options.skills ?? [];
-  const catalog = renderSkillCatalog(skills);
+  const subagents = options.subagents ?? [];
+  const sections = promptSections(skills, subagents);
   const limits = resolveAgentLimits(blueprint.limits, options.limits);
-  const tools = withSkillTool(options.tools ?? [], skills);
+  const tools = withBuiltinTools(station, model.id, options.tools ?? [], skills, subagents);
   const capsuleRef: CapsuleRef = { agentId: resolved.identity.agentId, state: resolved.state };
   const observers = createObserverQueue(options.listeners ?? [], options.observerTimeoutMs ?? OBSERVER_TIMEOUT_MS);
-  const policy = createContextWindowPolicy(model, composeSystemPrompt(system, skills), tools);
+  const policy = createContextWindowPolicy(model, composeSystemPrompt(system, skills, subagents), tools);
 
   const threads = new Map<string, ConversationId>();
   const threadOf = new Map<number, string>();
@@ -349,7 +347,7 @@ export async function createDurableAgent(
     name: EXTENSION_NAME,
     sections: [
       section(SYSTEM_SECTION, () => system, { tag: false }),
-      ...(catalog === undefined ? [] : [section(SKILLS_SECTION, () => catalog)]),
+      ...sections.map(([key, text]) => section(key, () => text)),
     ],
     tools: tools.map((tool) => {
       const registration = createDurableTool(tool, {
@@ -449,7 +447,7 @@ export async function createDurableAgent(
     content: "",
     sections: {
       [SYSTEM_SECTION]: system,
-      ...(catalog === undefined ? {} : { [SKILLS_SECTION]: tagSection(SKILLS_SECTION, catalog) }),
+      ...Object.fromEntries(sections.map(([key, text]) => [key, tagSection(key, text)])),
     },
     ...(tools.length === 0 ? {} : { toolsAdded: tools.map((tool) => toToolDeclaration(tool)) }),
     timestamp: Date.now(),

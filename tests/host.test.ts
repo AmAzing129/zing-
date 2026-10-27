@@ -137,6 +137,42 @@ test("createZingHost loads the blueprint's skills before it opens the capsule", 
   await host.close();
 });
 
+test("createZingHost checks the blueprint's subagents before it opens the capsule", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zing-host-subagents-"));
+  await writeFile(join(root, "researcher.md"), "---\nname: researcher\ndescription: Research.\ntools: [web_search]\n---\nSearch.\n");
+  await writeFile(join(root, "elsewhere.md"), "---\nname: elsewhere\ndescription: Research.\nmodel: missing-model\n---\nSearch.\n");
+  const faux = fauxProvider({ models: [{ id: "host-model" }] });
+  let opened = 0;
+  const create = (tools: string[], agents: string[]) =>
+    createZingHost({
+      blueprint: { name: "lead", model: "host-model", tools, agents: agents.map((file) => join(root, file)) },
+      capsuleFactory: async () => (opened++, createMemoryCapsule({ blueprintName: "lead" })),
+      configureRegistry(registry) {
+        registry.api.registerProvider({ pluginId: "fake", provider: faux.provider });
+        registry.api.registerTool({
+          name: "web_search",
+          description: "Search",
+          parameters: Type.Object({ query: Type.String() }),
+          execute: async () => ({ text: "MIT" }),
+        });
+      },
+    });
+
+  await assert.rejects(create([], ["researcher.md"]), /researcher\.md: tools web_search are not in the main agent's tools/);
+  assert.equal(opened, 0);
+  await assert.rejects(create([], ["elsewhere.md"]), /Unknown model: missing-model/);
+
+  const host = await create(["web_search"], ["researcher.md"]);
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("subagent", { name: "researcher", task: "Find the license." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall("web_search", { query: "license" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("It is MIT."),
+    (context) => fauxAssistantMessage(context.messages.at(-1)?.role === "toolResult" ? "delegated" : "missing"),
+  ]);
+  assert.equal((await host.agent.handleMessage({ conversationId: "chat:lead", text: "license?" })).text, "delegated");
+  await host.close();
+});
+
 test("createZingHost disposes loaded plugins when construction fails", async () => {
   const root = await mkdtemp(join(tmpdir(), "zing-host-cleanup-"));
   const key = `zingHostCleanup${Date.now()}${Math.random()}`;

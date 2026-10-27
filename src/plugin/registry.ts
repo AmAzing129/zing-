@@ -1,3 +1,4 @@
+import { SUBAGENT_TOOL_NAME } from "../blueprint";
 import type { Bundle } from "../bundle";
 import { requireEnv } from "../env";
 import { SKILL_TOOL_NAME } from "../skills";
@@ -100,6 +101,9 @@ export function createPluginRegistry(
       }
       if (name === SKILL_TOOL_NAME) {
         throw new Error(`Tool name ${name} is reserved: Zing provides it for the skills listed in agent.yaml`);
+      }
+      if (name === SUBAGENT_TOOL_NAME) {
+        throw new Error(`Tool name ${name} is reserved: Zing provides it for the agents listed in agent.yaml`);
       }
       if (tools.has(name)) {
         throw new Error(`Tool already registered: ${name}`);

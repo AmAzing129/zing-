@@ -12,7 +12,7 @@ const fixtures = fileURLToPath(new URL("./fixtures/agents", import.meta.url));
 
 test("parseBlueprint reads identity, model, system, and tools", () => {
   assert.deepEqual(parseBlueprint({ name: "alice", description: "A researcher", model: "grok", system: "Brief.", tools: ["web_search"] }, "memory"), {
-    name: "alice", description: "A researcher", model: "grok", system: "Brief.", source: "memory", limits: undefined, tools: ["web_search"], skills: [],
+    name: "alice", description: "A researcher", model: "grok", system: "Brief.", source: "memory", limits: undefined, tools: ["web_search"], skills: [], agents: [],
   });
 });
 
@@ -52,8 +52,25 @@ test("skills are local paths resolved from the blueprint file's directory", asyn
   assert.throws(() => parseBlueprint({ name: "a", skills: ["./skills/x", "./skills/../skills/x/"] }, "agent.yaml", "/base"), /duplicate skill path/);
 });
 
-test("the skill tool is reserved and cannot be listed", () => {
+test("agents are local .md paths resolved from the blueprint file's directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zing-blueprint-agents-"));
+  const path = join(root, "home", "agent.yaml");
+  await mkdir(join(root, "home"));
+  await writeFile(path, "name: lead\nagents:\n  - ./agents/researcher.md\n  - ../shared/reviewer.md\n");
+  assert.deepEqual((await loadBlueprint(path, "/elsewhere")).agents, [
+    join(root, "home", "agents", "researcher.md"),
+    join(root, "shared", "reviewer.md"),
+  ]);
+  assert.deepEqual(parseBlueprint({ name: "plain" }).agents, []);
+  assert.throws(() => parseBlueprint({ name: "a", agents: "./agents/x.md" }), /agents must be a list of subagent file paths/);
+  assert.throws(() => parseBlueprint({ name: "a", agents: ["researcher"] }), /must be a path starting with \.\/, \.\.\/, or \//);
+  assert.throws(() => parseBlueprint({ name: "a", agents: ["./agents/researcher"] }), /must be a \.md file/);
+  assert.throws(() => parseBlueprint({ name: "a", agents: ["./agents/x.md", "./agents/../agents/x.md"] }), /duplicate agent path/);
+});
+
+test("the skill and subagent tools are reserved and cannot be listed", () => {
   assert.throws(() => parseBlueprint({ name: "a", tools: ["skill"] }), /tool "skill" is reserved/);
+  assert.throws(() => parseBlueprint({ name: "a", tools: ["subagent"] }), /tool "subagent" is reserved; Zing provides it when agents are listed/);
 });
 
 test("name is required", () => assert.throws(() => parseBlueprint({ tools: [] }, "x.yaml"), /name is required/));

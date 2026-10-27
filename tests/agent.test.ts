@@ -13,10 +13,12 @@ import {
   getCurrentSystemPrompt,
   Type,
   type Context,
+  type Model,
 } from "@earendil-works/pi-ai";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 
 import { createAgent } from "../src/agent";
+import { withApproval } from "../src/approval";
 import type { Blueprint } from "../src/blueprint";
 import { createMemoryCapsule, openCapsule } from "../src/capsule";
 import { CONTEXT_OMISSION_TEXT } from "../src/context";
@@ -24,6 +26,7 @@ import { createPluginRegistry } from "../src/plugin/index";
 import type { ConversationEvent, ConversationListener, Tool, ToolContext } from "../src/plugin/index";
 import { loadSkills } from "../src/skills";
 import type { Station } from "../src/station";
+import { loadSubagents } from "../src/subagents";
 
 const WEB_SEARCH_TOOL_NAME = "web_search";
 const webSearch: Tool = {
@@ -123,6 +126,170 @@ test("listed skills reach the system prompt and load through the skill tool", as
   assert.match(systems[0] ?? "", /^be brief\n\n<skills>\n[^]*\n- weekly-report: Write my weekly report\.\n<\/skills>$/);
   assert.deepEqual(offered, [["web_search", "skill"]]);
   assert.deepEqual(results, ["List three highlights first."]);
+});
+
+async function researcherFile(frontmatter = "tools: [web_search]"): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "zing-agent-subagents-"));
+  const file = join(root, "researcher.md");
+  await writeFile(file, `---\nname: researcher\ndescription: Answer questions that need searches.\n${frontmatter}\n---\nSearch, then answer.\n`);
+  return file;
+}
+
+test("a subagent runs a delegated task with its own prompt, model, and tools, and only its answer returns", async () => {
+  const { faux, model, station } = createTestHarness();
+  const contexts: ToolContext[] = [];
+  const search: Tool = { ...webSearch, execute: async (input, context) => (contexts.push(context), webSearch.execute(input, context)) };
+  const memory: Tool = { name: "memory_search", description: "Search memory", parameters: Type.Object({}), execute: async () => ({ text: "[]" }) };
+  const allowed = [WEB_SEARCH_TOOL_NAME, memory.name];
+  const events: ConversationEvent[] = [];
+  const agent = createAgent(station, { ...testBlueprint(model.id), tools: allowed }, undefined, {
+    tools: [search, memory],
+    subagents: await loadSubagents([await researcherFile("model: child-model\ntools: [web_search]")], allowed),
+    listeners: [(event) => { events.push(event); }],
+  });
+  const requests: Array<{ model: string; system: string; tools: string[]; users: string[] }> = [];
+  const record = (context: Context, served: Model<string>) => {
+    requests.push({
+      model: served.id,
+      system: getCurrentSystemPrompt(context.messages),
+      tools: getCurrentTools(context.messages).map((tool) => tool.name),
+      users: context.messages.flatMap((message) => (message.role === "user" ? [contentText(message.content, "")] : [])),
+    });
+  };
+  let delegated = "";
+  faux.setResponses([
+    (context, _options, _state, served) => {
+      record(context, served);
+      return fauxAssistantMessage([fauxToolCall("subagent", { name: "researcher", task: "Find zing's license." })], { stopReason: "toolUse" });
+    },
+    (context, _options, _state, served) => {
+      record(context, served);
+      return fauxAssistantMessage([fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "zing license" })], { stopReason: "toolUse" });
+    },
+    (context, _options, _state, served) => (record(context, served), fauxAssistantMessage("MIT, per the README.")),
+    (context, _options, _state, served) => {
+      record(context, served);
+      const last = context.messages.at(-1);
+      delegated = last?.role === "toolResult" ? contentText(last.content, "") : "";
+      return fauxAssistantMessage("Zing is MIT licensed.");
+    },
+  ]);
+
+  const answer = await agent.handleMessage({ conversationId: "chat:lead", text: "what license?", senderId: "alice" });
+  assert.equal(answer.text, "Zing is MIT licensed.");
+  assert.equal(delegated, "MIT, per the README.");
+  assert.deepEqual(requests.map((request) => request.model), [model.id, "child-model", "child-model", model.id]);
+  assert.deepEqual(requests.map((request) => request.tools), [
+    ["web_search", "memory_search", "subagent"],
+    ["web_search"],
+    ["web_search"],
+    ["web_search", "memory_search", "subagent"],
+  ]);
+  assert.match(requests[0]?.system ?? "", /^be brief\n\n<subagents>\n[^]*\n- researcher: Answer questions that need searches\.\n<\/subagents>$/);
+  // A fresh context: the subagent sees its own instructions and the task, never the main conversation.
+  assert.equal(requests[1]?.system, "Search, then answer.");
+  assert.deepEqual(requests[1]?.users, ["Find zing's license."]);
+  // Its tools act for the turn that delegated.
+  assert.deepEqual(contexts.map(({ conversationId, senderId, capsule }) => ({ conversationId, senderId, agentId: capsule.agentId })), [
+    { conversationId: "chat:lead", senderId: "alice", agentId: agent.agentId },
+  ]);
+
+  // The subagent is not a thread, and observers see the main turn only: the task never appears as the sender's words.
+  await agent.drainObservers();
+  assert.deepEqual((await agent.listThreads()).data.map((thread) => thread.threadId), ["chat:lead"]);
+  assert.equal(events.length, 1);
+  const entries = events[0]?.type === "turn" ? events[0].entries : [];
+  assert.deepEqual(entries.flatMap((entry) => (entry.type === "user" ? [entry.content] : [])), [[{ type: "text", text: "what license?" }]]);
+  const result = entries.find((entry) => entry.type === "toolResult" && entry.toolName === "subagent");
+  const details = result?.type === "toolResult" ? (result.details as { subagent: string; entries: Array<{ type: string }> }) : undefined;
+  assert.equal(details?.subagent, "researcher");
+  assert.deepEqual(details?.entries.map((entry) => entry.type), ["user", "assistant", "toolResult", "assistant"]);
+});
+
+test("a subagent's limits fail its task, not the main agent's turn", async () => {
+  const { faux, model, station } = createTestHarness();
+  let executions = 0;
+  const search: Tool = { ...webSearch, execute: async (input, context) => ((executions += 1), webSearch.execute(input, context)) };
+  const agent = createAgent(station, testBlueprint(model.id), undefined, {
+    tools: [search],
+    subagents: await loadSubagents([await researcherFile("tools: [web_search]\nlimits: { maxToolCalls: 1 }")], [WEB_SEARCH_TOOL_NAME]),
+  });
+  let failure: { isError: boolean; text: string } | undefined;
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("subagent", { name: "researcher", task: "Search twice." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage(
+      [fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "one" }), fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "two" })],
+      { stopReason: "toolUse" },
+    ),
+    (context) => {
+      const last = context.messages.at(-1);
+      if (last?.role === "toolResult") failure = { isError: last.isError, text: contentText(last.content, "") };
+      return fauxAssistantMessage("The research did not finish.");
+    },
+  ]);
+
+  const answer = await agent.handleMessage({ conversationId: "chat:limited", text: "research" });
+  assert.equal(answer.text, "The research did not finish.");
+  assert.equal(executions, 1);
+  assert.deepEqual(failure, { isError: true, text: "Subagent researcher failed: Turn exceeded the 1 tool-call limit" });
+});
+
+test("a subagent's tool calls that need approval ask the sender of the main turn", async () => {
+  const { faux, model, station } = createTestHarness();
+  let executions = 0;
+  const search: Tool = { ...webSearch, execute: async (input, context) => ((executions += 1), webSearch.execute(input, context)) };
+  const agent = createAgent(station, testBlueprint(model.id), undefined, {
+    tools: withApproval([search], "writes"),
+    subagents: await loadSubagents([await researcherFile()], [WEB_SEARCH_TOOL_NAME]),
+  });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("subagent", { name: "researcher", task: "Search." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "zing" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("found it"),
+    fauxAssistantMessage("done"),
+  ]);
+  const asked: string[] = [];
+
+  const answer = await agent.handleMessage({
+    conversationId: "chat:approving-subagent",
+    text: "research",
+    approve: async (request) => (asked.push(request.tool), true),
+  });
+  assert.equal(answer.text, "done");
+  assert.deepEqual(asked, [WEB_SEARCH_TOOL_NAME]);
+  assert.equal(executions, 1);
+});
+
+test("canceling the main turn stops a running subagent", async () => {
+  const { faux, model, station } = createTestHarness();
+  let receivedSignal: AbortSignal | undefined;
+  let markStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const wait: Tool = {
+    ...webSearch,
+    execute: async (_input, { signal }) => {
+      receivedSignal = signal;
+      markStarted();
+      return new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+    },
+  };
+  const agent = createAgent(station, testBlueprint(model.id), undefined, {
+    tools: [wait],
+    subagents: await loadSubagents([await researcherFile()], [WEB_SEARCH_TOOL_NAME]),
+  });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("subagent", { name: "researcher", task: "Wait." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "wait" })], { stopReason: "toolUse" }),
+  ]);
+
+  const turn = agent.startTurn({ threadId: "chat:cancel-subagent", text: "go" });
+  await started;
+  await agent.cancelTurn("chat:cancel-subagent", turn.turnId);
+  await assert.rejects(turn.completed, /canceled/i);
+  assert.equal(receivedSignal?.aborted, true);
+  assert.equal(faux.state.callCount, 2);
 });
 
 test("an agent requires an explicit model id", () => {

@@ -29,6 +29,7 @@ import { createDurableAgent, type CreateDurableAgentOptions } from "../src/durab
 import type { ConversationEvent, IncomingMessage, Tool, ToolContext } from "../src/plugin/index";
 import { loadSkills } from "../src/skills";
 import type { Station } from "../src/station";
+import { loadSubagents } from "../src/subagents";
 
 const WEB_SEARCH = "web_search";
 const webSearch: Tool = {
@@ -1392,6 +1393,57 @@ test("durable: skills listed after a thread started reach it on the next start",
   assert.deepEqual(seen.tools, [["web_search", "skill"]]);
   assert.deepEqual(seen.results, ["List three highlights first."]);
   await after.close();
+});
+
+test("durable: subagents give the same prompt and tools as the legacy runtime and act for the delegating thread", async () => {
+  const root = await mkdtemp(join(tmpdir(), "zing-durable-subagents-"));
+  const file = join(root, "researcher.md");
+  await writeFile(file, "---\nname: researcher\ndescription: Answer questions that need searches.\ntools: [web_search]\n---\nSearch, then answer.\n");
+  const skills = await weeklyReportSkill();
+  const subagents = await loadSubagents([file], [WEB_SEARCH]);
+  const { faux, model, station } = createTestStation();
+  const blueprint = blueprintFor(model.id);
+
+  const delegate = async (create: (tools: Tool[]) => Agent | Promise<Agent>) => {
+    const seen = { systems: [] as string[], tools: [] as string[][], results: [] as string[], threads: [] as string[] };
+    const search: Tool = { ...webSearch, execute: async (_input, context) => (seen.threads.push(context.conversationId), { text: "MIT" }) };
+    const agent = await create([search]);
+    const offered = (context: Context) => {
+      seen.systems.push(getCurrentSystemPrompt(context.messages));
+      seen.tools.push(getCurrentTools(context.messages).map((tool) => tool.name));
+    };
+    faux.setResponses([
+      (context: Context) => (offered(context), fauxAssistantMessage([fauxToolCall("subagent", { name: "researcher", task: "Find the license." })], { stopReason: "toolUse" })),
+      (context: Context) => (offered(context), fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "license" })], { stopReason: "toolUse" })),
+      () => fauxAssistantMessage("It is MIT."),
+      (context: Context) => {
+        const last = context.messages.at(-1);
+        seen.results.push(last?.role === "toolResult" ? contentText(last.content, "") : "");
+        return fauxAssistantMessage("done");
+      },
+    ]);
+    assert.equal((await agent.handleMessage({ conversationId: "telegram:1", text: "license?" })).text, "done");
+    const result = (await agent.readThread("telegram:1")).entries.find((entry) => entry.type === "toolResult");
+    await agent.close();
+    return { seen, details: result?.type === "toolResult" ? result.details : undefined };
+  };
+
+  const legacy = await delegate((tools) => createAgent(station, blueprint, undefined, { tools, skills, subagents }));
+  const durable = await delegate((tools) =>
+    createDurableAgent(station, blueprint, undefined, { storage: new MemoryStorage(), tools, skills, subagents }),
+  );
+  assert.match(durable.seen.systems[0] ?? "", /^be brief\n\n<skills>\n[^]*\n<\/skills>\n\n<subagents>\n[^]*\n- researcher: Answer questions that need searches\.\n<\/subagents>$/);
+  assert.deepEqual(durable.seen, legacy.seen);
+  assert.deepEqual(durable.seen.tools, [["web_search", "skill", "subagent"], ["web_search"]]);
+  assert.equal(durable.seen.systems[1], "Search, then answer.");
+  assert.deepEqual(durable.seen.results, ["It is MIT."]);
+  assert.deepEqual(durable.seen.threads, ["telegram:1"]);
+  const shape = (details: unknown) => {
+    const { subagent, entries } = details as { subagent: string; entries: Array<{ type: string }> };
+    return { subagent, entries: entries.map((entry) => entry.type) };
+  };
+  assert.deepEqual(shape(durable.details), { subagent: "researcher", entries: ["user", "assistant", "toolResult", "assistant"] });
+  assert.deepEqual(shape(durable.details), shape(legacy.details));
 });
 
 test("durable: close ends waiting turns, cancels queued ones, and rejects new work", async () => {
