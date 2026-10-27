@@ -30,9 +30,9 @@ test("SIGTERM drains the channel before closing durable storage, even with an un
   );
   await writeFile(
     stationPath,
-    `plugins:\n  - ${JSON.stringify(resolve("plugins/providers/xai"))}\nchannel: sticky\nprovider: xai\nruntime: durable\n`,
+    `plugins:\n  - ${JSON.stringify(resolve("plugins/providers/deepseek"))}\nchannel: sticky\nprovider: deepseek\nruntime: durable\n`,
   );
-  await writeFile(blueprintPath, "name: lifecycle\nmodel: grok-4.6\ntools: []\n");
+  await writeFile(blueprintPath, "name: lifecycle\nmodel: deepseek-v4-pro\ntools: []\n");
 
   const child = spawn(
     process.execPath,
