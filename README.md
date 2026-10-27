@@ -110,7 +110,7 @@ A turn that exceeds a limit ends as `failed`, but its completed transcript remai
 
 ### Durable runtime (experimental)
 
-By default the capsule keeps each thread as a JSONL transcript, written when a turn ends. A crash mid-turn loses that turn. Set `runtime: durable` in `station.yaml` (or `ZING_RUNTIME=durable`) to run the capsule on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable) instead:
+By default the capsule runs on [`@earendil-works/pi-durable`](https://www.npmjs.com/package/@earendil-works/pi-durable), which is still experimental upstream. No runtime setting is required; the checked-in `station.yaml` explicitly selects `runtime: durable`. To opt into the older JSONL runtime, set `runtime: legacy` in `station.yaml` (or `ZING_RUNTIME=legacy`). Legacy writes each thread when a turn ends, so a crash mid-turn loses that turn. The default durable runtime provides:
 
 - Every user message, model response, and tool result is committed to `durable.sqlite` in the capsule before it is shown.
 - A restarted station resumes the turns it left unfinished. An interrupted tool call is not run again; the model receives an `interrupted` result and continues.

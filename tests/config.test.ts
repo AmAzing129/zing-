@@ -49,10 +49,17 @@ test("loadConfig does not require a channel, provider, or secrets", () => {
   assert.equal(config.provider, undefined);
   assert.equal(config.capsulePath, undefined);
   assert.deepEqual(config.pluginPaths, []);
-  assert.equal(config.runtime, "legacy");
+  assert.equal(config.runtime, "durable");
+});
+
+test("durable is the default even with a station or blank environment override", () => {
+  assert.equal(loadConfig({}, { station: { plugins: [] } }).runtime, "durable");
+  assert.equal(loadConfig({ ZING_RUNTIME: "  " }).runtime, "durable");
 });
 
 test("ZING_RUNTIME overrides the station runtime", () => {
+  assert.equal(loadConfig({}, { station: { plugins: [], runtime: "legacy" } }).runtime, "legacy");
+  assert.equal(loadConfig({ ZING_RUNTIME: "durable" }, { station: { plugins: [], runtime: "legacy" } }).runtime, "durable");
   assert.equal(loadConfig({}, { station: { plugins: [], runtime: "durable" } }).runtime, "durable");
   assert.equal(loadConfig({ ZING_RUNTIME: "legacy" }, { station: { plugins: [], runtime: "durable" } }).runtime, "legacy");
   assert.equal(loadConfig({ ZING_RUNTIME: " durable " }).runtime, "durable");
