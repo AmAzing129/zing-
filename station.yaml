@@ -7,5 +7,6 @@ plugins:
   - ./plugins/tools/notes
 
 channel: telegram
-# Optional. durable resumes interrupted turns after a restart; see README.
-# runtime: durable
+# Default: durable resumes interrupted turns after a restart; see README.
+# Set legacy to opt into JSONL-only persistence instead.
+runtime: durable

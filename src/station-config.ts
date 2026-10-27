@@ -13,7 +13,7 @@ export type StationConfig = {
   plugins: string[];
   channel?: string;
   provider?: string;
-  /** Which agent runtime runs the capsule. Default: legacy. */
+  /** Which agent runtime runs the capsule. Default: durable. */
   runtime?: RuntimeKind;
 };
 
