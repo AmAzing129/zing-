@@ -19,6 +19,7 @@ export default function brave(zing: ZingPluginAPI) {
     name: WEB_SEARCH_TOOL_NAME,
     description: WEB_SEARCH_DESCRIPTION,
     parameters: webSearchParameters,
+    readOnly: true,
     execute: async (input, { signal }) => {
       search ??= createBraveWebSearch({ apiKey: zing.requireEnv("BRAVE_API_KEY") });
       const result = await search.execute({ query: String(input.query).trim(), maxResults: typeof input.maxResults === "number" ? input.maxResults : undefined }, signal);

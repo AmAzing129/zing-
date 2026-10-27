@@ -1,9 +1,10 @@
-import { readFile, realpath, stat } from "node:fs/promises";
-import { basename, isAbsolute, join, resolve, sep } from "node:path";
+import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 import { Type } from "@earendil-works/pi-ai";
 import { parse as parseYaml } from "yaml";
 
+import { findBundleManifest, loadBundle, type Bundle } from "./bundle";
 import type { Tool } from "./plugin/types";
 
 const SKILL_FILE = "SKILL.md";
@@ -22,6 +23,7 @@ const MAX_FILE_BYTES = 1024 * 1024;
 
 /** Instructions for one kind of task, in the Agent Skills format: a directory with a SKILL.md. */
 export type Skill = {
+  /** A bundle's skills are named <bundle>:<skill>, so two bundles cannot collide. */
   name: string;
   /** When to use the skill. The model sees it in every request. */
   description: string;
@@ -31,23 +33,82 @@ export type Skill = {
   instructions: string;
 };
 
-/** Read the skill directories a blueprint lists, in order. Any invalid skill fails the whole set. */
+/**
+ * Read the paths a blueprint lists, in order: a skill directory, or a bundle root for all of its skills.
+ * Any invalid skill fails the whole set.
+ */
 export async function loadSkills(paths: readonly string[]): Promise<Skill[]> {
   const skills: Skill[] = [];
   const seen = new Map<string, string>();
   for (const path of paths) {
-    const skill = await loadSkill(path);
-    const previous = seen.get(skill.name);
-    if (previous !== undefined) {
-      throw new Error(`Duplicate skill name ${skill.name}: ${previous} and ${path}`);
+    for (const skill of await loadSkillPath(path)) {
+      const previous = seen.get(skill.name);
+      if (previous !== undefined) {
+        throw new Error(`Duplicate skill name ${skill.name}: ${previous} and ${path}`);
+      }
+      seen.set(skill.name, path);
+      skills.push(skill);
     }
-    seen.set(skill.name, path);
-    skills.push(skill);
   }
   return skills;
 }
 
-async function loadSkill(path: string): Promise<Skill> {
+async function loadSkillPath(path: string): Promise<Skill[]> {
+  if (!(await isFile(join(path, SKILL_FILE))) && (await findBundleManifest(path))) {
+    const bundle = await loadBundle(path);
+    const dirs = bundle.skillsDir ? await skillDirectories(bundle.skillsDir) : [];
+    if (dirs.length === 0) {
+      throw new Error(`Bundle ${bundle.name} has no skills: ${path}`);
+    }
+    const skills: Skill[] = [];
+    const withScripts: string[] = [];
+    for (const dir of dirs) skills.push(await loadSkill(dir, bundle, withScripts));
+    if (withScripts.length > 0) {
+      console.warn(
+        `Bundle ${bundle.name}: ${withScripts.length} skills have scripts/, which Zing does not run (${withScripts.join(", ")}).`,
+      );
+    }
+    return skills;
+  }
+  return [await loadSkill(path, await enclosingBundle(path))];
+}
+
+/**
+ * The subdirectories of a bundle's skills directory that hold a SKILL.md, by name. A SKILL.md deeper down belongs
+ * to its skill, and a link does not count, so a bundle's skills stay inside it.
+ */
+async function skillDirectories(skillsDir: string): Promise<string[]> {
+  const entries = await readdir(skillsDir, { withFileTypes: true });
+  const dirs: string[] = [];
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    const dir = join(skillsDir, entry.name);
+    if (entry.isDirectory() && (await isFile(join(dir, SKILL_FILE)))) dirs.push(dir);
+  }
+  return dirs;
+}
+
+/**
+ * The bundle whose skills directory holds this skill directory, if any. A Codex manifest may put that directory at
+ * any depth, so the nearest manifest above the skill decides; one whose skills live elsewhere leaves it standalone.
+ */
+async function enclosingBundle(path: string): Promise<Bundle | undefined> {
+  const parent = await realpath(dirname(resolve(path))).catch(() => undefined);
+  if (!parent) return undefined;
+  for (let dir = parent; ; dir = dirname(dir)) {
+    if (await findBundleManifest(dir)) {
+      const bundle = await loadBundle(dir).catch(() => undefined);
+      return bundle && parent === bundle.skillsDir ? bundle : undefined;
+    }
+    if (dirname(dir) === dir) return undefined;
+  }
+}
+
+/**
+ * A skill from a bundle is named <bundle>:<name>. Its name need not match its directory: ChatGPT and Codex take
+ * the name from the frontmatter, and their published plugins rely on that. withScripts collects the names of skills
+ * with scripts/ for the caller to report together, instead of a warning for each.
+ */
+async function loadSkill(path: string, bundle?: Bundle, withScripts?: string[]): Promise<Skill> {
   const file = join(path, SKILL_FILE);
   let contents: string;
   let dir: string;
@@ -58,14 +119,16 @@ async function loadSkill(path: string): Promise<Skill> {
     throw new Error(`Skill not found: ${file}`, { cause: error });
   }
   const { frontmatter, body } = splitFrontmatter(contents, file);
-  const name = parseName(frontmatter.name, basename(path), file);
+  const local = parseName(frontmatter.name, bundle ? undefined : basename(path), file);
+  const name = bundle ? `${bundle.name}:${local}` : local;
   const description = parseDescription(frontmatter.description, file);
   const instructions = body.trim();
   if (!instructions) {
     throw new Error(`${file}: instructions after the frontmatter are empty`);
   }
   if (await isDirectory(join(dir, "scripts"))) {
-    console.warn(`Skill ${name} has scripts/, which Zing does not run. Give the agent a plugin tool for that work.`);
+    if (withScripts) withScripts.push(name);
+    else console.warn(`Skill ${name} has scripts/, which Zing does not run. Give the agent a plugin tool for that work.`);
   }
   return { name, description, dir, instructions };
 }
@@ -211,7 +274,7 @@ export function splitFrontmatter(contents: string, file: string): { frontmatter:
   return { frontmatter: raw as Record<string, unknown>, body: lines.slice(end + 1).join("\n") };
 }
 
-function parseName(value: unknown, directory: string, file: string): string {
+function parseName(value: unknown, directory: string | undefined, file: string): string {
   if (typeof value !== "string" || !value.trim()) {
     throw new Error(`${file}: name is required`);
   }
@@ -221,7 +284,7 @@ function parseName(value: unknown, directory: string, file: string): string {
       `${file}: invalid name "${name}". Use up to ${MAX_NAME_LENGTH} lowercase letters, digits, and single hyphens.`,
     );
   }
-  if (name !== directory) {
+  if (directory !== undefined && name !== directory) {
     throw new Error(`${file}: name "${name}" must match its directory "${directory}"`);
   }
   return name;
@@ -237,6 +300,14 @@ function parseDescription(value: unknown, file: string): string {
     throw new Error(`${file}: description is longer than ${MAX_DESCRIPTION_LENGTH} characters`);
   }
   return description;
+}
+
+async function isFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
 }
 
 async function isDirectory(path: string): Promise<boolean> {

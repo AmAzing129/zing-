@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { Bot, type Transformer } from "grammy";
 
 import telegram, { parseAllowedUserIds, splitMessage } from "../plugins/channels/telegram/index";
+import { createApprovals } from "../plugins/channels/telegram/approvals";
 import type { ConversationHost } from "../src/agent";
 import { createPluginRegistry, loadPlugin } from "../src/plugin/index";
 
@@ -162,5 +163,100 @@ test("telegram channel waits for its asynchronous stop before resolving", async 
     finishStop();
     methods.start = originalStart;
     methods.stop = originalStop;
+  }
+});
+
+test("telegram approvals wait for the asker's tap in their chat, and expire with the turn", async () => {
+  const sent: Array<{ chatId: number; text: string; data: string[] }> = [];
+  const edits: string[] = [];
+  const approvals = createApprovals({
+    send: async (chatId, text, buttons) => (sent.push({ chatId, text, data: buttons.map((b) => b.data) }), sent.length),
+    edit: async (_chatId, _messageId, text) => void edits.push(text.split("\n\n").at(-1) ?? ""),
+  });
+  const request = { tool: "notion__create", description: "Create", input: { title: "Plan" } };
+
+  const idle = approvals.untilAsking();
+  let woke = false;
+  void idle.asking.then(() => (woke = true));
+  const first = approvals.ask(7, 1, request, new AbortController().signal);
+  await Promise.resolve();
+  assert.equal(woke, true, "a waiting update handler lets go once a question is open");
+  await new Promise((resolve) => setImmediate(resolve));
+  const [approve, decline] = sent[0]?.data ?? [];
+  assert.match(sent[0]?.text ?? "", /notion__create[\s\S]*"title": "Plan"/);
+  assert.equal(approvals.answer(approve ?? "", 8, 1), "expired", "another chat cannot answer");
+  // In a group, everyone sees the buttons; another member's tap leaves the question open.
+  assert.equal(approvals.answer(approve ?? "", 7, 2), "not-asker");
+  assert.equal(approvals.answer(decline ?? "", 7, 1), "answered");
+  assert.equal(await first, false);
+  assert.equal(approvals.answer(approve ?? "", 7, 1), "expired", "an answered question stays answered");
+
+  const turn = new AbortController();
+  const second = approvals.ask(7, 1, request, turn.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  turn.abort();
+  assert.equal(await second, false);
+  const third = approvals.ask(7, 1, request, new AbortController().signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(approvals.answer(sent[2]?.data[0] ?? "", 7, 1), "answered");
+  assert.equal(await third, true);
+  assert.deepEqual(edits, ["已拒绝。", "已失效：这轮对话已结束。", "已允许。"]);
+});
+
+test("telegram lets go of a message update while it waits, so the button tap can arrive", { timeout: 5_000 }, async () => {
+  const originalStart = Bot.prototype.start;
+  const calls: Array<{ method: string; payload: Record<string, unknown> }> = [];
+  const from = { id: 1, is_bot: false, first_name: "User" };
+  const chat = { id: 9, type: "private" as const, first_name: "User" };
+  try {
+    // Like grammY's polling: one update at a time, each awaited before the next.
+    Bot.prototype.start = async function () {
+      this.botInfo = {
+        id: 123, is_bot: true, first_name: "Test", username: "test_bot",
+        can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false,
+        can_connect_to_business: false, has_main_web_app: false, has_topics_enabled: false,
+        allows_users_to_create_topics: false, can_manage_bots: false, supports_join_request_queries: false,
+      };
+      const transform: Transformer = async (_previous, method, payload) => {
+        calls.push({ method, payload: payload as Record<string, unknown> });
+        const result = method === "sendMessage" ? { message_id: calls.length, date: 1, chat } : true;
+        return { ok: true, result } as never;
+      };
+      this.api.config.use(transform);
+      await this.handleUpdate({ update_id: 1, message: { message_id: 1, date: 1, from, chat, text: "create it" } });
+      const question = calls.find((call) => call.method === "sendMessage")?.payload;
+      const markup = question?.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> };
+      const tap = (id: string, by: typeof from) => ({
+        id, from: by, chat_instance: "c", data: markup.inline_keyboard[0]?.[0]?.callback_data ?? "",
+        message: { message_id: 2, date: 1, chat, text: "question" },
+      });
+      // Someone else in the chat taps first; only the asker's tap decides.
+      await this.handleUpdate({ update_id: 2, callback_query: tap("q0", { ...from, id: 2, first_name: "Other" }) });
+      await this.handleUpdate({ update_id: 3, callback_query: tap("q1", from) });
+    };
+    const registry = createPluginRegistry({
+      env: { TELEGRAM_BOT_TOKEN: "123:test" },
+      host: {
+        resetConversation() {},
+        async handleMessage(message) {
+          const request = { tool: "notion__create", description: "Create", input: { title: "Plan" } };
+          const approved = await message.approve?.(request, new AbortController().signal);
+          return { text: `approved: ${String(approved)}` };
+        },
+      },
+    });
+    telegram(registry.api);
+    await registry.getChannel("telegram")!.start(new AbortController().signal);
+
+    const texts = calls.filter((call) => call.method === "sendMessage").map((call) => call.payload.text);
+    assert.match(String(texts[0]), /需要你确认才会执行：notion__create/);
+    assert.equal(texts.at(-1), "approved: true");
+    assert.deepEqual(
+      calls.filter((call) => call.method === "answerCallbackQuery").map((call) => call.payload.text),
+      ["只有发起这次请求的人能确认。", undefined],
+    );
+    assert.match(String(calls.find((call) => call.method === "editMessageText")?.payload.text), /已允许。$/);
+  } finally {
+    Bot.prototype.start = originalStart;
   }
 });

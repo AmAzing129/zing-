@@ -13,6 +13,7 @@ import { createMemoryCapsule, type Capsule } from "./capsule";
 import { createContextWindowPolicy, type ContextWindowPolicy } from "./context";
 import type {
   AgentResult,
+  Approver,
   CapsuleRef,
   ConversationEvent,
   ConversationHost,
@@ -213,6 +214,7 @@ export function createAgent(
         const result = await conversation.prompt(
           input.text,
           input.senderId,
+          input.approve,
           createRuntimeEventCollector(threadId, turnId, controller.emit),
           (fresh) => { persisted = fresh; },
         );
@@ -298,6 +300,7 @@ export function createAgent(
         threadId: message.conversationId,
         text: message.text,
         senderId: message.senderId,
+        approve: message.approve,
       }).completed;
     },
     resetConversation: resetThread,
@@ -373,6 +376,7 @@ class Conversation {
   private readonly limits: AgentLimits;
   private readonly context: ContextWindowPolicy;
   private senderId?: string;
+  private approve?: Approver;
   private activeBudget?: ActiveBudget;
   private abortFailure?: TurnBudgetExceededError;
   private persisted: number;
@@ -385,6 +389,7 @@ class Conversation {
       createAgentTool(tool, {
         conversationId: options.conversationId,
         senderId: () => this.senderId,
+        approve: () => this.approve,
         capsule: options.capsule,
       }),
     ).map(createAbortableAgentTool);
@@ -456,10 +461,12 @@ class Conversation {
   async prompt(
     message: string,
     senderId?: string,
+    approve?: Approver,
     onEvent?: (event: AgentEvent) => void,
     onPersisted?: (fresh: AgentMessage[]) => void,
   ): Promise<AgentResult> {
     this.senderId = senderId;
+    this.approve = approve;
     const budget: ActiveBudget = { modelTurns: 0, toolCalls: 0 };
     this.activeBudget = budget;
     this.abortFailure = undefined;
@@ -578,7 +585,7 @@ function createSubagentRunner(
     deadline.unref();
     let entries: ThreadEntry[] = [];
     try {
-      const result = await conversation.prompt(task, context.senderId, undefined, (fresh) => {
+      const result = await conversation.prompt(task, context.senderId, context.approve, undefined, (fresh) => {
         entries = encodeMessages(fresh).map(toThreadEntry);
       });
       // Thread entries are JSON: the capsule stores them the same way.
@@ -596,6 +603,7 @@ function createSubagentRunner(
 type ToolScope = {
   conversationId: string;
   senderId: () => string | undefined;
+  approve: () => Approver | undefined;
   capsule: CapsuleRef;
 };
 
@@ -606,11 +614,13 @@ function createAgentTool(tool: Tool, scope: ToolScope): AgentTool {
     description: tool.description,
     parameters: tool.parameters,
     execute: async (_toolCallId, input, signal) => {
+      const approve = scope.approve();
       const result = await tool.execute(input as Record<string, unknown>, {
         signal: signal ?? new AbortController().signal,
         conversationId: scope.conversationId,
         senderId: scope.senderId(),
         capsule: scope.capsule,
+        ...(approve ? { approve } : {}),
       });
       return {
         content: [{ type: "text", text: result.text }],
@@ -742,6 +752,7 @@ function createRuntimeEventCollector(
       return;
     }
     if (event.type === "tool_execution_end") {
+      const details: unknown = event.isError ? undefined : event.result?.details;
       emit({
         type: "tool/completed",
         threadId,
@@ -749,6 +760,7 @@ function createRuntimeEventCollector(
         callId: event.toolCallId,
         name: event.toolName,
         isError: event.isError,
+        ...(details !== undefined && details !== null ? { details } : {}),
       });
     }
   };

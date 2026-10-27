@@ -127,7 +127,9 @@ test("durable: the thread keeps history and queues concurrent turns in order", a
 });
 
 test("durable: startTurn streams message and tool events", async () => {
-  const { agent, faux } = await createTestAgent();
+  const { agent, faux } = await createTestAgent({
+    tools: [{ ...webSearch, execute: async () => ({ text: "results", details: { results: [{ title: "One" }] } }) }],
+  });
   faux.setResponses([
     fauxAssistantMessage([fauxToolCall(WEB_SEARCH, { query: "zing" })], { stopReason: "toolUse" }),
     fauxAssistantMessage("streamed answer"),
@@ -146,6 +148,7 @@ test("durable: startTurn streams message and tool events", async () => {
   assert.equal(toolStart?.callId, toolEnd?.callId);
   assert.deepEqual(toolStart?.input, { query: "zing" });
   assert.equal(toolEnd?.isError, false);
+  assert.deepEqual(toolEnd?.details, { results: [{ title: "One" }] });
   assert.deepEqual(events.at(-1), {
     type: "turn/completed",
     threadId: "web:1",

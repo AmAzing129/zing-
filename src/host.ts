@@ -1,7 +1,9 @@
 import type { Storage } from "@earendil-works/pi-durable";
 
 import { createAgent, type Agent } from "./agent";
+import { withApproval } from "./approval";
 import { resolveBlueprintTools, type Blueprint } from "./blueprint";
+import { loadBundles } from "./bundle";
 import type { Capsule } from "./capsule";
 import {
   createPluginRegistry,
@@ -19,6 +21,8 @@ export type CreateZingHostOptions = {
   blueprint: Blueprint;
   capsuleFactory: CapsuleFactory;
   pluginPaths?: readonly string[];
+  /** Bundles the enabled plugins may use, read before any plugin runs. */
+  bundlePaths?: readonly string[];
   provider?: string;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
@@ -36,7 +40,8 @@ export type ZingHost = {
 };
 
 export async function createZingHost(options: CreateZingHostOptions): Promise<ZingHost> {
-  const registry = createPluginRegistry({ env: options.env });
+  const bundles = await loadBundles(resolvePluginPaths(options.bundlePaths ?? [], options.cwd));
+  const registry = createPluginRegistry({ env: options.env, bundles });
   await options.configureRegistry?.(registry);
   const closePlugins = await loadPlugins(
     registry,
@@ -51,7 +56,7 @@ export async function createZingHost(options: CreateZingHostOptions): Promise<Zi
     const skills = await loadSkills(options.blueprint.skills ?? []);
     const subagents = await loadSubagents(options.blueprint.agents ?? [], options.blueprint.tools);
     const capsule = await options.capsuleFactory(options.blueprint);
-    const tools = resolveBlueprintTools(options.blueprint, registry);
+    const tools = withApproval(resolveBlueprintTools(options.blueprint, registry), options.blueprint.approval);
     const agentOptions = { tools, skills, subagents, listeners: registry.listListeners() };
     // pi-durable loads TypeBox and Chord; a legacy station never imports it.
     let agent: Agent;

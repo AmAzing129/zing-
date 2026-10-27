@@ -1,7 +1,11 @@
 export type {
   AgentResult,
+  ApprovalRequest,
+  Approver,
   CapsuleRef,
   Channel,
+  ClientMethod,
+  ClientMethodContext,
   ConversationEvent,
   ConversationHost,
   ConversationListener,
@@ -16,6 +20,8 @@ export type {
 } from "./types";
 
 export { conversationId } from "./ids";
+export { loadBundle, type Bundle } from "../bundle";
+export { zingHome } from "../env";
 export type { CapsuleState } from "../capsule";
 export { PROTOCOL_VERSION, RuntimeError, TurnBudgetExceededError, TurnCanceledError } from "../runtime";
 export type {

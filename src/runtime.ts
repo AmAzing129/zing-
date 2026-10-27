@@ -1,4 +1,4 @@
-import type { AgentResult } from "./plugin/types";
+import type { AgentResult, Approver } from "./plugin/types";
 
 export const PROTOCOL_VERSION = 1;
 
@@ -69,6 +69,8 @@ export type TurnInput = {
    * turn's outcome instead of running it again; the legacy runtime ignores it.
    */
   requestId?: string;
+  /** Asks the turn's sender to approve tool calls; kept in memory only, so a turn resumed after a restart has none. */
+  approve?: Approver;
 };
 
 export type RuntimeEvent =
@@ -102,6 +104,8 @@ export type RuntimeEvent =
       callId: string;
       name: string;
       isError: boolean;
+      /** The tool's details, as thread/read returns them, when it succeeded and returned some. */
+      details?: unknown;
     }
   | {
       type: "turn/completed";

@@ -39,11 +39,23 @@ skills/weekly-report/
 
 A skill under `skills/` is not active until a blueprint lists it, just as a plugin under `plugins/` does not run until `station.yaml` lists it. Different blueprints in one fork can list different skills.
 
+## Skills from ChatGPT and Codex plugins
+
+A ChatGPT or Codex plugin carries its skills in its `skills/` directory; Zing calls the plugin a [bundle](../plugins/README.md#bundles-chatgpt-and-codex-plugins). List the bundle's path to load all of its skills, or one skill directory inside it:
+
+```yaml
+skills:
+  - ./plugins/bundles/notion
+  - ./plugins/bundles/canva/skills/canva-branded-presentation
+```
+
+A bundle's skill is named `<bundle>:<name>`, such as `notion:knowledge-capture`, so two bundles cannot collide. Its name comes from its frontmatter and need not match its directory, as in ChatGPT and Codex. Only the direct subdirectories of `skills/` are skills; a `SKILL.md` deeper inside one is a file of that skill.
+
 ## Format
 
 | Field | Rule |
 |---|---|
-| `name` | Required. Up to 64 lowercase letters, digits, and single hyphens. Must equal the directory name. |
+| `name` | Required. Up to 64 lowercase letters, digits, and single hyphens. Must equal the directory name, except in a bundle. |
 | `description` | Required, up to 1024 characters. Say what the skill does and when to use it: the model decides from this alone. |
 | Body | Required. The instructions, in Markdown. Keep it focused; move long material into files the instructions name. |
 
@@ -68,7 +80,7 @@ In a long conversation, the loaded instructions can drop out of the model's cont
 ## Limits
 
 - **No scripts.** Zing reads skill files; it never executes them, and it warns at startup when a skill has a `scripts/` directory. Work that needs code belongs in a [plugin](../plugins/README.md) tool, which the skill can then tell the model to call.
-- **No discovery.** Only the paths in the blueprint load. Nothing is picked up from a directory by itself.
+- **No discovery.** Only the paths in the blueprint load. Nothing is picked up from a directory by itself; a bundle's path loads the skills its manifest declares.
 - **Prompt text is trusted.** A skill's instructions steer the model, including how it uses every tool it is allowed. Read a skill you did not write before listing it, as you would a plugin.
 
 ## Docker

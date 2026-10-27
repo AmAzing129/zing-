@@ -18,6 +18,7 @@ import {
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 
 import { createAgent } from "../src/agent";
+import { withApproval } from "../src/approval";
 import type { Blueprint } from "../src/blueprint";
 import { createMemoryCapsule, openCapsule } from "../src/capsule";
 import { CONTEXT_OMISSION_TEXT } from "../src/context";
@@ -233,6 +234,32 @@ test("a subagent's limits fail its task, not the main agent's turn", async () =>
   assert.deepEqual(failure, { isError: true, text: "Subagent researcher failed: Turn exceeded the 1 tool-call limit" });
 });
 
+test("a subagent's tool calls that need approval ask the sender of the main turn", async () => {
+  const { faux, model, station } = createTestHarness();
+  let executions = 0;
+  const search: Tool = { ...webSearch, execute: async (input, context) => ((executions += 1), webSearch.execute(input, context)) };
+  const agent = createAgent(station, testBlueprint(model.id), undefined, {
+    tools: withApproval([search], "writes"),
+    subagents: await loadSubagents([await researcherFile()], [WEB_SEARCH_TOOL_NAME]),
+  });
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall("subagent", { name: "researcher", task: "Search." })], { stopReason: "toolUse" }),
+    fauxAssistantMessage([fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "zing" })], { stopReason: "toolUse" }),
+    fauxAssistantMessage("found it"),
+    fauxAssistantMessage("done"),
+  ]);
+  const asked: string[] = [];
+
+  const answer = await agent.handleMessage({
+    conversationId: "chat:approving-subagent",
+    text: "research",
+    approve: async (request) => (asked.push(request.tool), true),
+  });
+  assert.equal(answer.text, "done");
+  assert.deepEqual(asked, [WEB_SEARCH_TOOL_NAME]);
+  assert.equal(executions, 1);
+});
+
 test("canceling the main turn stops a running subagent", async () => {
   const { faux, model, station } = createTestHarness();
   let receivedSignal: AbortSignal | undefined;
@@ -413,7 +440,10 @@ test("concurrent messages in the same conversation run in arrival order", async 
 });
 
 test("startTurn streams stable message and tool events", async () => {
-  const { agent, faux } = createTestHarness();
+  const { agent, faux } = createTestHarness({
+    ...webSearch,
+    execute: async () => ({ text: "One", details: { results: [{ title: "One" }] } }),
+  });
   faux.setResponses([
     fauxAssistantMessage([fauxToolCall(WEB_SEARCH_TOOL_NAME, { query: "zing" })], { stopReason: "toolUse" }),
     fauxAssistantMessage("streamed answer"),
@@ -429,6 +459,8 @@ test("startTurn streams stable message and tool events", async () => {
   const toolStart = events.find((event) => event.type === "tool/started");
   const toolEnd = events.find((event) => event.type === "tool/completed");
   assert.equal(toolStart?.callId, toolEnd?.callId);
+  // A client renders from the details the tool returned, without reading the thread.
+  assert.deepEqual(toolEnd?.details, { results: [{ title: "One" }] });
   assert.deepEqual(events.at(-1), {
     type: "turn/completed",
     threadId: "web:1",

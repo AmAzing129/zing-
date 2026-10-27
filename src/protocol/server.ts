@@ -1,4 +1,7 @@
-import type { AgentRuntime, RuntimeEvent, TurnHandle } from "../runtime";
+import { randomUUID } from "node:crypto";
+
+import type { Approver, ClientMethod } from "../plugin/types";
+import type { AgentRuntime, TurnHandle } from "../runtime";
 import { PROTOCOL_VERSION, RuntimeError } from "../runtime";
 import type {
   AppServerInfo,
@@ -19,6 +22,8 @@ const ALREADY_INITIALIZED = -32002;
 const UNSUPPORTED_VERSION = -32003;
 const THREAD_NOT_FOUND = -32010;
 const TURN_NOT_ACTIVE = -32011;
+const APPROVAL_NOT_PENDING = -32012;
+const METHOD_FAILED = -32020;
 
 type DispatchResult = {
   result: unknown;
@@ -30,10 +35,14 @@ type TrackedTurn = {
   cancel: () => void;
 };
 
+type Notification = { method: string; params: unknown };
+
 export type ProtocolSessionOptions = {
   runtime: AgentRuntime;
   info: AppServerInfo;
   write: (message: JsonRpcMessage) => void | Promise<void>;
+  /** Methods plugins offer clients, routed by name. */
+  methods?: readonly ClientMethod[];
   onError?: (error: unknown) => void;
 };
 
@@ -42,14 +51,22 @@ export class ProtocolSession {
   private readonly info: AppServerInfo;
   private readonly write: ProtocolSessionOptions["write"];
   private readonly onError: (error: unknown) => void;
+  private readonly methods: ReadonlyMap<string, ClientMethod>;
+  /** Aborts plugin method calls when the connection closes. */
+  private readonly closing = new AbortController();
   private readonly turns = new Map<string, TrackedTurn>();
+  /** Approvals this connection's turns wait for, by approvalId. */
+  private readonly approvals = new Map<string, (approved: boolean) => void>();
   private initialized = false;
+  /** The client declared it answers approval/requested. */
+  private answersApprovals = false;
   private writeTail = Promise.resolve();
 
   constructor(options: ProtocolSessionOptions) {
     this.runtime = options.runtime;
     this.info = options.info;
     this.write = options.write;
+    this.methods = new Map((options.methods ?? []).map((method) => [method.name, method]));
     this.onError = options.onError ?? ((error) => console.error("app-server error", error));
   }
 
@@ -91,6 +108,8 @@ export class ProtocolSession {
   }
 
   async close(): Promise<void> {
+    this.closing.abort();
+    for (const answer of [...this.approvals.values()]) answer(false);
     const turns = [...this.turns.values()];
     for (const turn of turns) {
       turn.cancel();
@@ -115,6 +134,11 @@ export class ProtocolSession {
       const clientInfo = requiredRecord(record.clientInfo);
       requiredNonEmptyString(clientInfo.name, "clientInfo.name");
       requiredNonEmptyString(clientInfo.version, "clientInfo.version");
+      const clientCapabilities = optionalRecord(record.capabilities);
+      if (clientCapabilities.approvals !== undefined && typeof clientCapabilities.approvals !== "boolean") {
+        throw new ProtocolError(INVALID_PARAMS, "capabilities.approvals must be a boolean");
+      }
+      this.answersApprovals = clientCapabilities.approvals === true;
       this.initialized = true;
       return {
         result: {
@@ -125,6 +149,8 @@ export class ProtocolSession {
             cancel: true,
             threadRead: true,
             threadList: true,
+            approvals: true,
+            ...(this.methods.size > 0 ? { methods: [...this.methods.keys()] } : {}),
           },
         },
       };
@@ -165,8 +191,28 @@ export class ProtocolSession {
       }
       const text = requiredNonEmptyString(input.text, "input.text", false);
       const senderId = optionalString(record.senderId, "senderId");
-      const handle = this.runtime.startTurn({ threadId, text, senderId });
-      return this.trackTurn(handle);
+      const outbox = this.openOutbox();
+      let turnId: string | undefined;
+      // A client that does not answer approvals gets none: calls that need one are declined, not left waiting.
+      const approve: Approver | undefined = this.answersApprovals
+        ? (request, signal) => this.requestApproval(threadId, () => turnId ?? "", request, signal, outbox.notify)
+        : undefined;
+      const handle = this.runtime.startTurn({ threadId, text, senderId, ...(approve ? { approve } : {}) });
+      turnId = handle.turnId;
+      return this.trackTurn(handle, outbox);
+    }
+    if (method === "approval/respond") {
+      const record = requiredRecord(params);
+      const approvalId = requiredNonEmptyString(record.approvalId, "approvalId");
+      if (typeof record.approved !== "boolean") {
+        throw new ProtocolError(INVALID_PARAMS, "approved must be a boolean");
+      }
+      const answer = this.approvals.get(approvalId);
+      if (!answer) {
+        throw new ProtocolError(APPROVAL_NOT_PENDING, `Approval is not pending: ${approvalId}`);
+      }
+      answer(record.approved);
+      return { result: {} };
     }
     if (method === "turn/cancel") {
       const record = requiredRecord(params);
@@ -176,20 +222,64 @@ export class ProtocolSession {
       return { result: {} };
     }
 
+    const registered = this.methods.get(method);
+    if (registered) {
+      try {
+        return { result: await registered.handle(params, { signal: this.closing.signal }) };
+      } catch (error) {
+        // The plugin's message is the answer: its client called a method the plugin defines.
+        throw new ProtocolError(METHOD_FAILED, error instanceof Error ? error.message : String(error));
+      }
+    }
+
     throw new ProtocolError(METHOD_NOT_FOUND, `Method not found: ${method}`);
   }
 
-  private trackTurn(handle: TurnHandle): DispatchResult {
+  /** Ask the client, and wait for approval/respond or the end of the turn, which declines. */
+  private async requestApproval(
+    threadId: string,
+    turnIdOf: () => string,
+    request: Parameters<Approver>[0],
+    signal: AbortSignal,
+    notify: (notification: Notification) => void,
+  ): Promise<boolean> {
+    // A runtime may ask before startTurn has returned the turn's ID.
+    await Promise.resolve();
+    if (signal.aborted) return false;
+    const turnId = turnIdOf();
+    const approvalId = `apr_${randomUUID()}`;
+    return new Promise((resolve) => {
+      const answer = (approved: boolean): void => {
+        if (!this.approvals.delete(approvalId)) return;
+        signal.removeEventListener("abort", decline);
+        resolve(approved);
+      };
+      const decline = (): void => answer(false);
+      signal.addEventListener("abort", decline, { once: true });
+      this.approvals.set(approvalId, answer);
+      const params = { ...request, type: "approval/requested", threadId, turnId, approvalId };
+      notify({ method: "approval/requested", params });
+    });
+  }
+
+  /** Holds a turn's notifications until release: nothing about a turn precedes the turn/start response. */
+  private openOutbox(): { notify: (notification: Notification) => void; release: () => void } {
     let ready = false;
-    const buffered: RuntimeEvent[] = [];
-    const sendEvent = (event: RuntimeEvent) => {
-      if (!ready) {
-        buffered.push(event);
-        return;
-      }
-      void this.send({ jsonrpc: "2.0", method: event.type, params: event });
+    const buffered: Notification[] = [];
+    return {
+      notify: (notification) => {
+        if (ready) void this.send({ jsonrpc: "2.0", ...notification });
+        else buffered.push(notification);
+      },
+      release: () => {
+        ready = true;
+        for (const notification of buffered.splice(0)) void this.send({ jsonrpc: "2.0", ...notification });
+      },
     };
-    const unsubscribe = handle.subscribe(sendEvent);
+  }
+
+  private trackTurn(handle: TurnHandle, outbox: ReturnType<ProtocolSession["openOutbox"]>): DispatchResult {
+    const unsubscribe = handle.subscribe((event) => outbox.notify({ method: event.type, params: event }));
     const completed = handle.completed
       .catch(() => undefined)
       .finally(() => {
@@ -198,16 +288,7 @@ export class ProtocolSession {
       });
     this.turns.set(handle.turnId, { completed, cancel: handle.cancel });
 
-    return {
-      result: { turn: { id: handle.turnId, status: "queued" } },
-      afterResponse: () => {
-        ready = true;
-        for (const event of buffered) {
-          void this.send({ jsonrpc: "2.0", method: event.type, params: event });
-        }
-        buffered.length = 0;
-      },
-    };
+    return { result: { turn: { id: handle.turnId, status: "queued" } }, afterResponse: outbox.release };
   }
 
   private sendSuccess(id: JsonRpcId, result: unknown): Promise<void> {

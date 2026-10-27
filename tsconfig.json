@@ -17,5 +17,6 @@
       "zing": ["./src/plugin/api.ts"]
     }
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts", "plugins/**/*.ts", "examples/**/*.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts", "plugins/**/*.ts", "examples/**/*.ts"],
+  "exclude": ["examples/clients/web"]
 }

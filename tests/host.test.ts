@@ -8,6 +8,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall, Type } from "@earendi
 import { MemoryStorage } from "@earendil-works/pi-durable";
 
 import type { Blueprint } from "../src/blueprint";
+import type { ApprovalRequest } from "../src/plugin/index";
 import { createMemoryCapsule } from "../src/capsule";
 import { createZingHost } from "../src/host";
 
@@ -194,5 +195,61 @@ test("createZingHost disposes loaded plugins when construction fails", async () 
     assert.equal((globalThis as Record<string, unknown>)[key], 1);
   } finally {
     delete (globalThis as Record<string, unknown>)[key];
+  }
+});
+
+test("tools the approval policy names run only after the sender says yes, in both runtimes", async () => {
+  for (const durable of [false, true]) {
+    const faux = fauxProvider({ models: [{ id: "host-model" }] });
+    let ran: string[] = [];
+    const blueprint: Blueprint = { name: "approving", model: "host-model", tools: ["read", "write"], approval: "writes" };
+    const host = await createZingHost({
+      blueprint,
+      capsuleFactory: async () => createMemoryCapsule({ blueprintName: blueprint.name }),
+      ...(durable ? { durableStorage: async () => new MemoryStorage() } : {}),
+      configureRegistry(registry) {
+        registry.api.registerProvider({ pluginId: "fake", provider: faux.provider });
+        for (const [name, readOnly] of [["read", true], ["write", false]] as const) {
+          registry.api.registerTool({
+            name,
+            description: `${name} things`,
+            parameters: Type.Object({ value: Type.String() }),
+            readOnly,
+            execute: async (input) => {
+              ran.push(`${name}:${String(input.value)}`);
+              return { text: "done" };
+            },
+          });
+        }
+      },
+    });
+    // The model calls read and write, then repeats what the write call returned.
+    const turn = async (threadId: string, approve?: (request: ApprovalRequest) => Promise<boolean>) => {
+      ran = [];
+      faux.setResponses([
+        fauxAssistantMessage([fauxToolCall("read", { value: "a" }), fauxToolCall("write", { value: "b" })], {
+          stopReason: "toolUse",
+        }),
+        (context) => {
+          const result = [...context.messages].reverse().find((message) => message.role === "toolResult" && message.toolName === "write");
+          const text = result?.role === "toolResult" ? result.content.map((block) => (block.type === "text" ? block.text : "")).join("") : "";
+          return fauxAssistantMessage(text);
+        },
+      ]);
+      return (await host.agent.handleMessage({ conversationId: threadId, text: "go", ...(approve ? { approve } : {}) })).text;
+    };
+
+    const asked: ApprovalRequest[] = [];
+    const declined = await turn("chat:declined", async (request) => (asked.push(request), false));
+    assert.deepEqual(asked, [{ tool: "write", description: "write things", input: { value: "b" } }], `durable=${durable}`);
+    assert.match(declined, /The user declined write\. It did not run\./);
+    assert.deepEqual(ran, ["read:a"]);
+
+    assert.equal(await turn("chat:approved", async () => true), "done");
+    assert.deepEqual(ran.sort(), ["read:a", "write:b"]);
+
+    assert.match(await turn("chat:unattended"), /needs the user's approval, which this conversation cannot ask for/);
+    assert.deepEqual(ran, ["read:a"]);
+    await host.close();
   }
 });

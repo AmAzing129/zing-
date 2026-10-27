@@ -67,6 +67,19 @@ test("registry validates and de-duplicates generic tool names", () => {
   assert.equal(registry.getTool("web_search")?.name, "web_search");
 });
 
+test("client methods need a namespace of their own", () => {
+  const registry = createPluginRegistry({ host });
+  const handle = async () => null;
+  registry.api.registerMethod({ name: "mcp/tools/call", handle });
+  assert.deepEqual(registry.listMethods().map((method) => method.name), ["mcp/tools/call"]);
+  assert.throws(() => registry.api.registerMethod({ name: "mcp/tools/call", handle }), /already registered/);
+  assert.throws(() => registry.api.registerMethod({ name: "turn/start", handle }), /namespace turn\/ is reserved/);
+  assert.throws(() => registry.api.registerMethod({ name: "thread/fork", handle }), /reserved/);
+  for (const name of ["initialize", "mcp", "mcp/", "MCP/call", "mcp//call", "mcp/tools.call"]) {
+    assert.throws(() => registry.api.registerMethod({ name, handle }), /Invalid method name/, name);
+  }
+});
+
 test("loadPlugin registers a file, a directory, and a packaged plugin", async () => {
   const registry = createPluginRegistry({ host });
   await loadPlugin(registry, join(fixtures, "echo.ts"));

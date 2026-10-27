@@ -1,6 +1,7 @@
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 
+import type { ClientMethod } from "../plugin/types";
 import type { AgentRuntime } from "../runtime";
 import { ProtocolSession } from "./server";
 import type { AppServerInfo, JsonRpcMessage } from "./types";
@@ -9,6 +10,8 @@ export type StdioAppServerOptions = {
   input?: Readable;
   output?: Writable;
   signal?: AbortSignal;
+  /** Methods plugins offer clients. */
+  methods?: readonly ClientMethod[];
   onError?: (error: unknown) => void;
 };
 
@@ -24,6 +27,7 @@ export async function runStdioAppServer(
     runtime,
     info,
     write: (message) => writeMessage(output, message),
+    methods: options.methods,
     onError,
   });
   const pending = new Set<Promise<void>>();

@@ -1,7 +1,11 @@
 export type {
   AgentResult,
+  ApprovalRequest,
+  Approver,
   CapsuleRef,
   Channel,
+  ClientMethod,
+  ClientMethodContext,
   ConversationEvent,
   ConversationHost,
   ConversationListener,

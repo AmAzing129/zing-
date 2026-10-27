@@ -51,7 +51,29 @@ tools:
   - market__quote
 ```
 
+Some calls should not happen on the model's word alone. `approval` makes the listed tools ask the person who sent the message first, as ChatGPT does before a write action: `writes` asks before every tool not declared read-only (MCP tools declare it with `readOnlyHint`), or name exact tools:
+
+```yaml
+approval: writes        # or: [notion__notion_create_pages]
+```
+
+Telegram asks with 允许/拒绝 buttons; an App Server client answers `approval/requested`. When nobody can be asked, such as `--once`, a client that did not declare approvals, or a durable turn resumed after a restart, the call is declined and the model is told. It never runs unasked.
+
 See [`plugins/README.md`](plugins/README.md) for the local plugin contract, activation rules, and included implementations.
+
+### ChatGPT and Codex plugins
+
+The plugins of ChatGPT and Codex are packages of Agent Skills and MCP servers in the [Agent Plugins](https://agent-plugins.org) format. Zing reads them as **bundles**: copy one into your fork, list it under `bundles` in `station.yaml`, and the MCP plugin connects to its servers, with OAuth where they ask for it. Its skills and tools then follow the same blueprint rules as your own:
+
+```yaml
+# station.yaml
+plugins:
+  - ./plugins/tools/mcp
+bundles:
+  - ./plugins/bundles/notion
+```
+
+A bundle is data: Zing never runs its scripts, hooks, or local servers. The interactive views its MCP servers attach to tools ([MCP Apps](plugins/README.md#mcp-apps)) render in an App Server client such as the [web example](examples/clients/web); Telegram gets the text the server returns for the model. The connectors ChatGPT hosts (`.app.json`) work only in ChatGPT. See [bundles](plugins/README.md#bundles-chatgpt-and-codex-plugins).
 
 ### Skills
 
@@ -90,6 +112,8 @@ Try it with the minimal client:
 ```bash
 ./node_modules/.bin/tsx examples/clients/stdio.ts "Hello"
 ```
+
+[`examples/clients/web`](examples/clients/web) is a browser chat that also renders MCP Apps views. A small Node bridge starts the App Server over stdio and relays it to the page over WebSocket, so Zing itself stays stdio-only.
 
 The process reads the same `station.yaml` as channel mode. [`docs/app-server.md`](docs/app-server.md) describes the protocol, streaming events, concurrency, and recovery semantics. The machine-readable schema is [`schemas/zing-protocol-v1.json`](schemas/zing-protocol-v1.json).
 
