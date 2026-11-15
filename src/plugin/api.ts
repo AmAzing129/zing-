@@ -11,6 +11,7 @@ export type {
   Provider,
   Tool,
   ToolContext,
+  TurnContext,
   ZingPlugin,
   ZingPluginAPI,
 } from "./types";
