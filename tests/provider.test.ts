@@ -76,3 +76,31 @@ test("openai-codex auth applies a new sign-in or a sign-out on the next request"
   await rm(path);
   await assert.rejects(resolve(), /Not signed in to OpenAI Codex/);
 });
+
+test("openai-codex auth keeps a sign-in or sign-out made while a refresh is in flight", async () => {
+  const path = join(await mkdtemp(join(tmpdir(), "zing-codex-")), "openai-codex.json");
+  let onRefresh: () => Promise<void> = async () => {};
+  const oauth: OAuthAuth = {
+    name: "fake",
+    login: async () => assert.fail("login is not used"),
+    refresh: async (credential) => {
+      await onRefresh();
+      return { ...credential, access: "account-a-refreshed", refresh: "refresh-a-1", expires: Date.now() + 3_600_000 };
+    },
+    toAuth: async (credential) => ({ apiKey: credential.access }),
+  };
+  const auth = fileOAuthAuth(oauth, path);
+  const resolve = () => auth.resolve({ ctx: { env: async () => undefined, fileExists: async () => false }, signal: new AbortController().signal });
+  const stale = { type: "oauth" as const, access: "account-a", refresh: "refresh-a", expires: Date.now() + 60_000 };
+  const accountB = { type: "oauth" as const, access: "account-b", refresh: "refresh-b", expires: Date.now() + 3_600_000 };
+
+  await saveCredential(path, stale);
+  onRefresh = () => saveCredential(path, accountB);
+  assert.equal((await resolve())?.auth.apiKey, "account-b");
+  assert.equal((await loadCredential(path))?.refresh, "refresh-b");
+
+  await saveCredential(path, stale);
+  onRefresh = () => rm(path);
+  await assert.rejects(resolve(), /Not signed in to OpenAI Codex/);
+  assert.equal(await loadCredential(path), undefined);
+});

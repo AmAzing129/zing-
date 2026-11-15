@@ -60,6 +60,10 @@ export function fileOAuthAuth(oauth: OAuthAuth, path: string): ApiKeyAuth {
     const next = await oauth.refresh(stored, AbortSignal.timeout(REFRESH_TIMEOUT_MS)).catch((error: unknown) => {
       throw new Error(`OpenAI Codex token refresh failed; sign in again with ${LOGIN_HINT}`, { cause: error });
     });
+    // Save only if the file still holds the credential just refreshed: a sign-in or sign-out during the refresh wins.
+    const current = await loadCredential(path);
+    if (!current) throw new Error(`Not signed in to OpenAI Codex. Run: ${LOGIN_HINT}`);
+    if (current.refresh !== stored.refresh) return fresh(current) ? current : refresh();
     await saveCredential(path, next);
     return next;
   };
