@@ -72,7 +72,8 @@ export function toSamples(records: Iterable<TrajectoryRecord>): { samples: ChatS
   const samples: ChatSample[] = [];
   const stats: ExportStats = { turns: 0, skipped: 0, duplicates: 0, samples: 0 };
   const open = new Map<string, { key: string; context: TurnContext; messages: ChatMessage[] }>();
-  const seen = new Set<string>();
+  /** Turn identities per conversation since its last reset: a reset starts a new stretch. */
+  const seen = new Map<string, Set<string>>();
 
   const flush = (conversation: string) => {
     const segment = open.get(conversation);
@@ -92,16 +93,19 @@ export function toSamples(records: Iterable<TrajectoryRecord>): { samples: ChatS
     const conversation = `${record.agentId}\u0000${record.conversationId}`;
     if (record.type === "reset") {
       flush(conversation);
+      seen.delete(conversation);
       continue;
     }
     // A durable station that stops between writing a turn and acknowledging it observes that turn again, at another
     // time and possibly under a changed context; its entries are what make it the same turn.
-    const identity = createHash("sha256").update(conversation).update("\u0000").update(JSON.stringify(record.entries)).digest("hex");
-    if (seen.has(identity)) {
+    const identity = createHash("sha256").update(JSON.stringify(record.entries)).digest("hex");
+    const stretch = seen.get(conversation) ?? new Set<string>();
+    seen.set(conversation, stretch);
+    if (stretch.has(identity)) {
       stats.duplicates++;
       continue;
     }
-    seen.add(identity);
+    stretch.add(identity);
     stats.turns++;
     if (record.status !== "completed") {
       stats.skipped++;

@@ -133,6 +133,10 @@ test("toSamples treats a turn observed again as a duplicate, but keeps distinct 
   ]);
   assert.deepEqual(samples[0]?.messages.map((message) => message.content), ["Be brief.", "q1", "a1", "q2", "a2"]);
   assert.deepEqual(stats, { turns: 2, skipped: 0, duplicates: 1, samples: 1 });
+
+  // A reset starts a new stretch: the same entries after it are a new turn, not a redelivery.
+  const again = toSamples([turn("a", 1, entries), reset("a", 5), turn("a", 6, entries)]);
+  assert.deepEqual(again.stats, { turns: 2, skipped: 0, duplicates: 0, samples: 2 });
 });
 
 test("export reads nothing, without failing, before the first turn is recorded", async () => {
