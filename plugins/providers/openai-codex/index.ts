@@ -17,4 +17,9 @@ export default function openaiCodex(zing: ZingPluginAPI) {
   }
   const provider: Provider = { ...base, auth: { apiKey: fileOAuthAuth(oauth, path) } };
   zing.registerProvider({ pluginId: OPENAI_CODEX_PLUGIN_ID, provider });
+  // Reused Codex WebSockets idle for minutes and would hold the process open after the station stops.
+  return async () => {
+    const { closeOpenAICodexWebSocketSessions } = await import("@earendil-works/pi-ai/api/openai-codex-responses");
+    closeOpenAICodexWebSocketSessions();
+  };
 }
