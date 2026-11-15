@@ -10,11 +10,13 @@ import { appendBullet, entryText, extractNote, rankNotes, tokenize } from "../pl
 import { defaultBlueprint } from "../src/blueprint";
 import { createMemoryCapsule, openFileCapsule, type Capsule } from "../src/capsule";
 import { createPluginRegistry, loadPlugin, type CapsuleRef } from "../src/plugin/index";
+import type { TurnContext } from "../src/plugin/types";
 
 const reference = (capsule: Capsule, agentId = capsule.identity.agentId): CapsuleRef => ({
   agentId,
   state: capsule.state,
 });
+const context: TurnContext = { provider: "test", model: "test-1", system: "Be brief.", tools: [] };
 const ram = (agentId: string): CapsuleRef => reference(createMemoryCapsule({ blueprintName: "notes", agentId }));
 const disk = async (path: string, agentId: string): Promise<CapsuleRef> =>
   reference(await openFileCapsule({ blueprint: defaultBlueprint(), path }), agentId);
@@ -71,18 +73,18 @@ test("observer persists owner user notes, advances untrusted cursor, and ignores
   const capsule = await disk(path, "disk");
   const notes = createNotes({});
   const signal = new AbortController().signal;
-  await notes.observe({ type: "turn", conversationId: "c", capsule, status: "completed", entries: [
+  await notes.observe({ type: "turn", context, conversationId: "c", capsule, status: "completed", entries: [
     { type: "user", at: 1, content: "Remember that I prefer TypeScript" },
     { type: "user", at: 2, content: "hi?" },
     { type: "assistant", at: 3, content: [{ type: "text", text: "ok" }] },
   ] }, signal);
-  await notes.observe({ type: "turn", conversationId: "c", senderId: "mallory", capsule, status: "completed", entries: [
+  await notes.observe({ type: "turn", context, conversationId: "c", senderId: "mallory", capsule, status: "completed", entries: [
     { type: "user", at: 4, content: "Remember that I prefer Java" },
   ] }, signal);
   await notes.observe({ type: "reset", conversationId: "c", capsule }, signal);
   const aborted = new AbortController(); aborted.abort();
   await assert.rejects(
-    async () => notes.observe({ type: "turn", conversationId: "c", capsule, status: "completed", entries: [{ type: "user", at: 5, content: "Remember Go forever" }] }, aborted.signal),
+    async () => notes.observe({ type: "turn", context, conversationId: "c", capsule, status: "completed", entries: [{ type: "user", at: 5, content: "Remember Go forever" }] }, aborted.signal),
     /aborted/i,
   );
   const markdown = await readFile(join(path, "memory", "notes.md"), "utf8");
@@ -94,7 +96,7 @@ test("observer persists owner user notes, advances untrusted cursor, and ignores
 
   const emptyPath = await mkdtemp(join(tmpdir(), "zing-notes-aborted-observer-"));
   const emptyCapsule = await disk(emptyPath, "never");
-  await assert.rejects(async () => notes.observe({ type: "turn", conversationId: "never", capsule: emptyCapsule, status: "completed", entries: [
+  await assert.rejects(async () => notes.observe({ type: "turn", context, conversationId: "never", capsule: emptyCapsule, status: "completed", entries: [
     { type: "user", at: 6, content: "Remember this aborted observer must never write" },
   ] }, aborted.signal), /aborted/i);
   await assert.rejects(readFile(join(emptyPath, "memory", "ENGINE"), "utf8"), /ENOENT/);
@@ -184,6 +186,7 @@ test("concurrent disk saves retain both notes and ENGINE mismatch rejects", asyn
   );
   await notes.observe({
     type: "turn",
+    context,
     conversationId: "c",
     capsule: blocked,
     status: "completed",
