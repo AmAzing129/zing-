@@ -47,7 +47,7 @@ export default function telegram(zing: ZingPluginAPI) {
             try {
               images = [await readImage()];
             } catch (error) {
-              console.error("Telegram image download failed", { conversationId: conversation, error });
+              console.error(`Telegram image download failed in ${conversation}: ${describeError(error, token)}`);
               await ctx.reply(IMAGE_FAILED_TEXT);
               return;
             }
@@ -64,7 +64,7 @@ export default function telegram(zing: ZingPluginAPI) {
             await ctx.reply(chunk);
           }
         } catch (error) {
-          console.error("agent run failed", { conversationId: conversation, error });
+          console.error(`agent run failed in ${conversation}: ${describeError(error, token)}`);
           await ctx.reply("The request failed. Please try again later.");
         } finally {
           stopTyping();
@@ -88,7 +88,7 @@ export default function telegram(zing: ZingPluginAPI) {
 
       let stopping: Promise<void> | undefined;
       const stop = () => {
-        stopping ??= bot.stop().catch((error) => console.error("Telegram channel cleanup failed", error));
+        stopping ??= bot.stop().catch((error) => console.error(`Telegram channel cleanup failed: ${describeError(error, token)}`));
       };
       signal.addEventListener("abort", stop, { once: true });
       try {
@@ -125,6 +125,11 @@ async function downloadImage(
   const bytes = Buffer.from(await response.arrayBuffer());
   if (bytes.length > MAX_IMAGE_BYTES) throw new Error(`Image is ${bytes.length} bytes; the limit is ${MAX_IMAGE_BYTES}`);
   return { type: "image", data: bytes.toString("base64"), mimeType };
+}
+
+/** grammy's network errors nest the request URL, which carries the bot token: log the message only, redacted. */
+export function describeError(error: unknown, token: string): string {
+  return (error instanceof Error ? error.message : String(error)).replaceAll(token, "<redacted>");
 }
 
 export function splitMessage(text: string, limit = TELEGRAM_LIMIT): string[] {

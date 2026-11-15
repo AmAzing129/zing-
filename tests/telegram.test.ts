@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { Bot, type Transformer } from "grammy";
 
-import telegram, { IMAGE_FAILED_TEXT, MAX_IMAGE_BYTES, parseAllowedUserIds, splitMessage } from "../plugins/channels/telegram/index";
+import telegram, { describeError, IMAGE_FAILED_TEXT, MAX_IMAGE_BYTES, parseAllowedUserIds, splitMessage } from "../plugins/channels/telegram/index";
 import type { ConversationHost } from "../src/agent";
 import { createPluginRegistry, loadPlugin, type IncomingMessage } from "../src/plugin/index";
 
@@ -235,4 +235,10 @@ test("telegram sends photos and image files with their caption, and skips other 
     Bot.prototype.stop = originalStop;
     globalThis.fetch = originalFetch;
   }
+});
+
+test("describeError keeps the bot token out of logs", () => {
+  const nested = Object.assign(new Error("request to https://api.telegram.org/bot123:secret/setMyCommands failed"), {});
+  assert.equal(describeError(nested, "123:secret"), "request to https://api.telegram.org/bot<redacted>/setMyCommands failed");
+  assert.equal(describeError("plain", "123:secret"), "plain");
 });
