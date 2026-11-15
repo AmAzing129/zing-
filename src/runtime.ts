@@ -63,6 +63,8 @@ export type ThreadPage = {
 export type TurnInput = {
   threadId: ThreadId;
   text: string;
+  /** Images sent with the text, such as a photo with a caption. A model without image input sees a placeholder. */
+  images?: ThreadImageContent[];
   senderId?: string;
   /**
    * Client deduplication key, scoped to the thread. The durable runtime answers a repeated key with the original

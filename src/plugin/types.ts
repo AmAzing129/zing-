@@ -1,7 +1,7 @@
 import type { JsonValue, Provider, TSchema } from "@earendil-works/pi-ai";
 
 import type { CapsuleState } from "../capsule";
-import type { ThreadEntry } from "../runtime";
+import type { ThreadEntry, ThreadImageContent } from "../runtime";
 export type { Provider } from "@earendil-works/pi-ai";
 
 export type ModelProvider = {
@@ -17,6 +17,8 @@ export type AgentResult = {
 export type IncomingMessage = {
   conversationId: string;
   text: string;
+  /** Images sent with the text. A model without image input sees a placeholder. */
+  images?: ThreadImageContent[];
   senderId?: string;
   /** Stable per-message key, such as a platform update ID, so a redelivered message is answered once. */
   requestId?: string;

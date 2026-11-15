@@ -6,7 +6,7 @@ import {
   type AgentMessage,
   type AgentTool,
 } from "@earendil-works/pi-agent-core";
-import { contentText, type JsonValue } from "@earendil-works/pi-ai";
+import { contentText, type JsonValue, type UserMessage } from "@earendil-works/pi-ai";
 
 import type { AgentLimits, Blueprint } from "./blueprint";
 import { createMemoryCapsule, type Capsule } from "./capsule";
@@ -214,7 +214,7 @@ export function createAgent(
         deadline.unref();
         controller.emit({ type: "turn/started", threadId, turnId });
         const result = await conversation.prompt(
-          input.text,
+          userContent(input),
           input.senderId,
           createRuntimeEventCollector(threadId, turnId, controller.emit),
           (fresh) => { persisted = fresh; },
@@ -300,6 +300,7 @@ export function createAgent(
       return startTurn({
         threadId: message.conversationId,
         text: message.text,
+        ...(message.images?.length ? { images: message.images } : {}),
         senderId: message.senderId,
       }).completed;
     },
@@ -457,7 +458,7 @@ class Conversation {
   }
 
   async prompt(
-    message: string,
+    message: UserContent,
     senderId?: string,
     onEvent?: (event: AgentEvent) => void,
     onPersisted?: (fresh: AgentMessage[]) => void,
@@ -476,7 +477,11 @@ class Conversation {
           `User input exceeded its ${this.context.messageBudget}-token context budget`,
         );
       }
-      await this.inner.prompt(message);
+      if (typeof message === "string") {
+        await this.inner.prompt(message);
+      } else {
+        await this.inner.prompt({ role: "user", content: message, timestamp: Date.now() });
+      }
     } catch (error) {
       runError = error;
     } finally {
@@ -513,6 +518,14 @@ class Conversation {
 
     return { text: last ? contentText(last.content).trim() : "" };
   }
+}
+
+/** What a user turn sends: its text alone, or its text then its images. */
+export type UserContent = UserMessage["content"];
+
+export function userContent(input: Pick<TurnInput, "text" | "images">): UserContent {
+  if (!input.images?.length) return input.text;
+  return [...(input.text ? [{ type: "text" as const, text: input.text }] : []), ...input.images];
 }
 
 /** The model, system prompt, and tool definitions a runtime sends, as plain JSON for conversation observers. */

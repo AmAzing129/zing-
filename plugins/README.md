@@ -16,7 +16,7 @@ An included plugin is not enabled automatically. This matters because plugin cod
 |---|---|---|
 | `providers/deepseek` | DeepSeek model provider | `DEEPSEEK_API_KEY` |
 | `providers/openai-codex` | OpenAI Codex via ChatGPT sign-in (`npx tsx plugins/providers/openai-codex/login.ts`) | optional `OPENAI_CODEX_AUTH_FILE` |
-| `channels/telegram` | Telegram channel | `TELEGRAM_BOT_TOKEN`, optional `TELEGRAM_ALLOWED_USER_IDS` |
+| `channels/telegram` | Telegram channel: text, photos, and image files (up to 10 MB) with captions | `TELEGRAM_BOT_TOKEN`, optional `TELEGRAM_ALLOWED_USER_IDS` |
 | `tools/brave` | `web_search` | `BRAVE_API_KEY` |
 | `tools/notes` | `memory_search`, `memory_save`, conversation observer | optional `ZING_MEMORY_OWNER_IDS` |
 | `observers/trajectory` | records every turn, with its model, system prompt, and tools, to `$ZING_HOME/trajectories/YYYY-MM.jsonl`; `export.ts` converts them to OpenAI chat fine-tuning JSONL | optional `ZING_TRAJECTORY_DIR` |

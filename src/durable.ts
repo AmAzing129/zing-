@@ -53,6 +53,7 @@ import {
   resolveAgentLimits,
   toError,
   toThreadEntry,
+  userContent,
   withBuiltinTools,
   type Agent,
   type CreateAgentOptions,
@@ -771,7 +772,7 @@ export async function createDurableAgent(
         const history = await conversation.entries({ order: "descending" }, 1, undefined, CONTEXT);
         if (
           !policy.userInputFits(
-            input.text,
+            userContent(input),
             history.items.some((entry) => entry.model?.some((message) => message.role !== "system")),
           )
         ) {
@@ -813,7 +814,7 @@ export async function createDurableAgent(
 
         controller.emit({ type: "turn/started", threadId, turnId });
         if (cancelRequested || canceling) throw new TurnCanceledError();
-        const submission = await conversation.submit({ type: "input", content: input.text, requestId }, CONTEXT);
+        const submission = await conversation.submit({ type: "input", content: userContent(input), requestId }, CONTEXT);
         submitted = submission;
         target = submission.id;
         if (canceling) {
@@ -937,6 +938,7 @@ export async function createDurableAgent(
       return startTurn({
         threadId: message.conversationId,
         text: message.text,
+        ...(message.images?.length ? { images: message.images } : {}),
         senderId: message.senderId,
         requestId: message.requestId,
       }).completed;

@@ -14,7 +14,7 @@ export type ContextWindowPolicy = {
   messageBudget: number;
   fit: <T extends AgentMessage>(messages: T[]) => T[];
   currentTurnFits: (messages: AgentMessage[]) => boolean;
-  userInputFits: (text: string, hasHistory: boolean) => boolean;
+  userInputFits: (content: UserMessage["content"], hasHistory: boolean) => boolean;
 };
 
 export function createContextWindowPolicy(
@@ -48,8 +48,8 @@ export function createContextWindowPolicy(
       const markerTokens = start > 0 ? omissionTokens : 0;
       return markerTokens + estimateMessageList(conversation.slice(start)) <= messageBudget;
     },
-    userInputFits(text, hasHistory) {
-      const message: UserMessage = { role: "user", content: text, timestamp: 0 };
+    userInputFits(content, hasHistory) {
+      const message: UserMessage = { role: "user", content, timestamp: 0 };
       return estimateMessageTokens(message) + (hasHistory ? omissionTokens : 0) <= messageBudget;
     },
   };

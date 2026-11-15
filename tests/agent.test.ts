@@ -1117,3 +1117,16 @@ test("close cancels active and queued turns, drains observers, and rejects new w
 function withoutCapsuleState(event: ConversationEvent) {
   return { ...event, capsule: { agentId: event.capsule.agentId } };
 }
+
+test("images sent with a message reach the model and the thread", async () => {
+  const { agent, faux } = createTestHarness();
+  const seen: unknown[] = [];
+  faux.setResponses([(context) => (seen.push(context.messages.at(-1)?.content), fauxAssistantMessage("a cat"))]);
+  const image = { type: "image" as const, data: "AAAA", mimeType: "image/png" };
+
+  await agent.handleMessage({ conversationId: "chat:images", text: "what is this?", images: [image] });
+
+  const users = (await agent.readThread("chat:images")).entries.filter((entry) => entry.type === "user");
+  assert.deepEqual(users.map((entry) => entry.content), [[{ type: "text", text: "what is this?" }, image]]);
+  assert.equal(seen.length, 1);
+});
