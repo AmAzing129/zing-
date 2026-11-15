@@ -15,6 +15,7 @@ An included plugin is not enabled automatically. This matters because plugin cod
 | Path | Capability | Configuration |
 |---|---|---|
 | `providers/deepseek` | DeepSeek model provider | `DEEPSEEK_API_KEY` |
+| `providers/openai-codex` | OpenAI Codex via ChatGPT sign-in (`npx tsx plugins/providers/openai-codex/login.ts`) | optional `OPENAI_CODEX_AUTH_FILE` |
 | `channels/telegram` | Telegram channel | `TELEGRAM_BOT_TOKEN`, optional `TELEGRAM_ALLOWED_USER_IDS` |
 | `tools/brave` | `web_search` | `BRAVE_API_KEY` |
 | `tools/notes` | `memory_search`, `memory_save`, conversation observer | optional `ZING_MEMORY_OWNER_IDS` |
