@@ -43,15 +43,17 @@ export async function saveCredential(path: string, credential: OAuthCredential):
   await rename(temp, path);
 }
 
-/** Request auth backed by a ChatGPT (Codex) sign-in stored in a file, refreshed in place. */
+/**
+ * Request auth backed by a ChatGPT (Codex) sign-in stored in a file, refreshed in place. The file is read on every
+ * request, so a new sign-in or a sign-out applies to the next one.
+ */
 export function fileOAuthAuth(oauth: OAuthAuth, path: string): ApiKeyAuth {
-  let cached: OAuthCredential | undefined;
   let refreshing: Promise<OAuthCredential> | undefined;
 
   const fresh = (credential: OAuthCredential) => Date.now() < credential.expires - MIN_VALIDITY_MS;
 
   const refresh = async (): Promise<OAuthCredential> => {
-    // Re-read first: a new sign-in may have replaced the file since it was cached.
+    // Re-read under the single flight: a concurrent refresh or a new sign-in may already have replaced the file.
     const stored = await loadCredential(path);
     if (!stored) throw new Error(`Not signed in to OpenAI Codex. Run: ${LOGIN_HINT}`);
     if (fresh(stored)) return stored;
@@ -66,13 +68,16 @@ export function fileOAuthAuth(oauth: OAuthAuth, path: string): ApiKeyAuth {
     name: "OpenAI Codex (ChatGPT sign-in)",
     resolve: async ({ signal }) => {
       signal.throwIfAborted();
-      if (!cached || !fresh(cached)) {
+      const stored = await loadCredential(path);
+      if (!stored) throw new Error(`Not signed in to OpenAI Codex. Run: ${LOGIN_HINT}`);
+      let credential = stored;
+      if (!fresh(credential)) {
         refreshing ??= refresh().finally(() => {
           refreshing = undefined;
         });
-        cached = await refreshing;
+        credential = await refreshing;
       }
-      const auth = await oauth.toAuth(cached);
+      const auth = await oauth.toAuth(credential);
       return { auth, source: path };
     },
   };

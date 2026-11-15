@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, stat } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,4 +55,24 @@ test("openai-codex auth reads the stored sign-in and refreshes it in place befor
 
   assert.equal((await resolve())?.auth.apiKey, "access-1");
   assert.equal(refreshes, 1);
+});
+
+test("openai-codex auth applies a new sign-in or a sign-out on the next request", async () => {
+  const path = join(await mkdtemp(join(tmpdir(), "zing-codex-")), "openai-codex.json");
+  const oauth: OAuthAuth = {
+    name: "fake",
+    login: async () => assert.fail("login is not used"),
+    refresh: async () => assert.fail("fresh credentials are not refreshed"),
+    toAuth: async (credential) => ({ apiKey: credential.access }),
+  };
+  const auth = fileOAuthAuth(oauth, path);
+  const resolve = () => auth.resolve({ ctx: { env: async () => undefined, fileExists: async () => false }, signal: new AbortController().signal });
+  const expires = Date.now() + 3_600_000;
+
+  await saveCredential(path, { type: "oauth", access: "account-a", refresh: "refresh-a", expires });
+  assert.equal((await resolve())?.auth.apiKey, "account-a");
+  await saveCredential(path, { type: "oauth", access: "account-b", refresh: "refresh-b", expires });
+  assert.equal((await resolve())?.auth.apiKey, "account-b");
+  await rm(path);
+  await assert.rejects(resolve(), /Not signed in to OpenAI Codex/);
 });
