@@ -1776,3 +1776,21 @@ test("durable: a storage failure stops the agent once and the restart finishes t
     });
   }
 });
+
+test("durable: images sent with a message reach the model and the thread", async () => {
+  const { agent, faux } = await createTestAgent();
+  const seen: unknown[] = [];
+  faux.setResponses([
+    (context) => (seen.push(context.messages.at(-1)?.content), fauxAssistantMessage("a cat")),
+    (context) => (seen.push(context.messages.at(-1)?.content), fauxAssistantMessage("a dog")),
+  ]);
+  const image = { type: "image" as const, data: "AAAA", mimeType: "image/png" };
+
+  await agent.handleMessage({ conversationId: "chat:images", text: "what is this?", images: [image] });
+  await agent.handleMessage({ conversationId: "chat:images", text: "", images: [image] });
+
+  const users = (await agent.readThread("chat:images")).entries.filter((entry) => entry.type === "user");
+  assert.deepEqual(users.map((entry) => entry.content), [[{ type: "text", text: "what is this?" }, image], [image]]);
+  assert.equal(seen.length, 2);
+  await agent.close();
+});

@@ -1,7 +1,10 @@
 import { Bot, type Context } from "grammy";
-import type { ZingPluginAPI } from "zing";
+import type { IncomingMessage, ZingPluginAPI } from "zing";
 
 export const TELEGRAM_LIMIT = 4096;
+/** Larger images are refused rather than sent to the model; the Bot API serves files up to 20 MB. */
+export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+export const IMAGE_FAILED_TEXT = "I couldn't read that image. Please try again, or send a smaller one.";
 export const START_TEXT =
   "Just send a message. I'll search the web when you need current or verified information.\nUse /reset to start a new conversation.";
 
@@ -32,17 +35,30 @@ export default function telegram(zing: ZingPluginAPI) {
         await ctx.reply("Started a new conversation.");
       });
 
-      bot.on("message:text", async (ctx) => {
-        const conversation = zing.conversationId("telegram", String(ctx.chat.id));
+      const answer = async (ctx: Context, text: string, readImage?: () => Promise<ImageInput>) => {
+        const chat = ctx.chat!;
+        const message = ctx.message!;
+        const conversation = zing.conversationId("telegram", String(chat.id));
         const stopTyping = keepTyping(ctx);
 
         try {
+          let images: IncomingMessage["images"];
+          if (readImage) {
+            try {
+              images = [await readImage()];
+            } catch (error) {
+              console.error("Telegram image download failed", { conversationId: conversation, error });
+              await ctx.reply(IMAGE_FAILED_TEXT);
+              return;
+            }
+          }
           const result = await zing.host.handleMessage({
             conversationId: conversation,
-            text: ctx.message.text,
+            text,
+            ...(images ? { images } : {}),
             senderId: ctx.from?.id !== undefined ? String(ctx.from.id) : undefined,
             // Message IDs are stable on redelivery; update IDs may be reused after inactivity.
-            requestId: `telegram:${ctx.me.id}:${ctx.chat.id}:${ctx.message.message_id}`,
+            requestId: `telegram:${ctx.me.id}:${chat.id}:${message.message_id}`,
           });
           for (const chunk of splitMessage(result.text || "(empty response)")) {
             await ctx.reply(chunk);
@@ -53,6 +69,21 @@ export default function telegram(zing: ZingPluginAPI) {
         } finally {
           stopTyping();
         }
+      };
+
+      bot.on("message:text", (ctx) => answer(ctx, ctx.message.text));
+
+      // Telegram sends a photo in several sizes, smallest first, and re-encodes it as JPEG.
+      bot.on("message:photo", (ctx) => {
+        const largest = ctx.message.photo.at(-1)!;
+        return answer(ctx, ctx.message.caption ?? "", () => downloadImage(ctx, token, largest.file_id, "image/jpeg", largest.file_size));
+      });
+
+      // An image sent as a file keeps its original encoding and resolution.
+      bot.on("message:document", (ctx) => {
+        const { file_id, mime_type, file_size } = ctx.message.document;
+        if (!mime_type?.startsWith("image/")) return;
+        return answer(ctx, ctx.message.caption ?? "", () => downloadImage(ctx, token, file_id, mime_type, file_size));
       });
 
       let stopping: Promise<void> | undefined;
@@ -74,6 +105,26 @@ export default function telegram(zing: ZingPluginAPI) {
       }
     },
   });
+}
+
+type ImageInput = NonNullable<IncomingMessage["images"]>[number];
+
+async function downloadImage(
+  ctx: Context,
+  token: string,
+  fileId: string,
+  mimeType: string,
+  size: number | undefined,
+): Promise<ImageInput> {
+  if (size !== undefined && size > MAX_IMAGE_BYTES) throw new Error(`Image is ${size} bytes; the limit is ${MAX_IMAGE_BYTES}`);
+  const file = await ctx.api.getFile(fileId);
+  if (!file.file_path) throw new Error("Telegram returned no file path");
+  // The URL carries the bot token: never log it.
+  const response = await fetch(`https://api.telegram.org/file/bot${token}/${file.file_path}`);
+  if (!response.ok) throw new Error(`Telegram file download failed with status ${response.status}`);
+  const bytes = Buffer.from(await response.arrayBuffer());
+  if (bytes.length > MAX_IMAGE_BYTES) throw new Error(`Image is ${bytes.length} bytes; the limit is ${MAX_IMAGE_BYTES}`);
+  return { type: "image", data: bytes.toString("base64"), mimeType };
 }
 
 export function splitMessage(text: string, limit = TELEGRAM_LIMIT): string[] {
