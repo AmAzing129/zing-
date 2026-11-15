@@ -57,7 +57,7 @@ export default function telegram(zing: ZingPluginAPI) {
             await ctx.reply(chunk);
           }
         } catch (error) {
-          console.error("agent run failed", { conversationId: conversation, error });
+          console.error(`agent run failed in ${conversation}: ${describeError(error, token)}`);
           await ctx.reply("The request failed. Please try again later.");
         } finally {
           stopTyping();
@@ -82,7 +82,7 @@ export default function telegram(zing: ZingPluginAPI) {
 
       let stopping: Promise<void> | undefined;
       const stop = () => {
-        stopping ??= bot.stop().catch((error) => console.error("Telegram channel cleanup failed", error));
+        stopping ??= bot.stop().catch((error) => console.error(`Telegram channel cleanup failed: ${describeError(error, token)}`));
       };
       signal.addEventListener("abort", stop, { once: true });
       void registerCommands();
