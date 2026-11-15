@@ -48,7 +48,8 @@ test("SIGTERM drains the channel before closing durable storage, even with an un
     ],
     {
       cwd: process.cwd(),
-      env: { ...process.env, ZING_HOME: join(root, "home") },
+      // Empty values shadow a developer's .env, which dotenv would otherwise load into the child.
+      env: { ...process.env, ZING_HOME: join(root, "home"), MODEL: "", PROVIDER: "", ZING_PLUGINS: "" },
     },
   );
   let stderr = "";
