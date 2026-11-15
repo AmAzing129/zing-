@@ -1,12 +1,24 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after, before } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { Bot, type Transformer } from "grammy";
+import { Api, Bot, type Transformer } from "grammy";
 
-import telegram, { describeError, IMAGE_FAILED_TEXT, MAX_IMAGE_BYTES, parseAllowedUserIds, splitMessage } from "../plugins/channels/telegram/index";
+import telegram, { COMMANDS, describeError, IMAGE_FAILED_TEXT, MAX_IMAGE_BYTES, parseAllowedUserIds, splitMessage } from "../plugins/channels/telegram/index";
 import type { ConversationHost } from "../src/agent";
 import { createPluginRegistry, loadPlugin, type IncomingMessage } from "../src/plugin/index";
+
+// Keep the suite off the network: the channel registers its command menu before polling.
+const originalSetMyCommands = Api.prototype.setMyCommands;
+let setMyCommands: (commands: readonly unknown[]) => Promise<true> = async () => true;
+before(() => {
+  Api.prototype.setMyCommands = function (commands) {
+    return setMyCommands(commands);
+  };
+});
+after(() => {
+  Api.prototype.setMyCommands = originalSetMyCommands;
+});
 
 const host: ConversationHost = {
   handleMessage: async () => ({ text: "ok" }),
@@ -234,6 +246,63 @@ test("telegram sends photos and image files with their caption, and skips other 
     Bot.prototype.start = originalStart;
     Bot.prototype.stop = originalStop;
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("telegram registers its command menu in the background and stops retrying when the channel stops", async () => {
+  const originalStart = Bot.prototype.start;
+  const originalStop = Bot.prototype.stop;
+  const calls: unknown[] = [];
+  let stopPolling!: () => void;
+  try {
+    Bot.prototype.start = () => new Promise<void>((resolve) => { stopPolling = resolve; });
+    Bot.prototype.stop = async () => { stopPolling(); };
+    const run = async () => {
+      const registry = createPluginRegistry({ host, env: { TELEGRAM_BOT_TOKEN: "123:test" } });
+      telegram(registry.api);
+      const controller = new AbortController();
+      const running = registry.getChannel("telegram")!.start(controller.signal);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      controller.abort();
+      await running;
+    };
+
+    setMyCommands = async (commands) => (calls.push(commands), true);
+    await run();
+    assert.deepEqual(calls, [COMMANDS]);
+    assert.deepEqual(COMMANDS.map(({ command }) => command), ["reset", "start"]);
+
+    // A failing first attempt waits for a retry, and the stop cancels it: the channel still started and stopped.
+    let attempts = 0;
+    setMyCommands = async () => { attempts++; throw new Error("network down"); };
+    await run();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(attempts, 1);
+  } finally {
+    Bot.prototype.start = originalStart;
+    Bot.prototype.stop = originalStop;
+    setMyCommands = async () => true;
+  }
+});
+
+test("telegram stops retrying its command menu when polling fails on its own", async () => {
+  const originalStart = Bot.prototype.start;
+  let attempts = 0;
+  try {
+    Bot.prototype.start = async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      throw new Error("polling failed");
+    };
+    setMyCommands = async () => { attempts++; throw new Error("network down"); };
+    const registry = createPluginRegistry({ host, env: { TELEGRAM_BOT_TOKEN: "123:test" } });
+    telegram(registry.api);
+    // The signal never aborts: only the channel's own exit can cancel the 2-second retry.
+    await assert.rejects(registry.getChannel("telegram")!.start(new AbortController().signal), /polling failed/);
+    await new Promise<void>((resolve) => setTimeout(resolve, 2_500));
+    assert.equal(attempts, 1);
+  } finally {
+    Bot.prototype.start = originalStart;
+    setMyCommands = async () => true;
   }
 });
 

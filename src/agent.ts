@@ -19,6 +19,7 @@ import type {
   ConversationListener,
   IncomingMessage,
   Tool,
+  TurnContext,
 } from "./plugin/types";
 import {
   RuntimeError,
@@ -100,6 +101,7 @@ export function createAgent(
   const subagents = options?.subagents ?? [];
   const system = composeSystemPrompt(blueprint.system ?? DEFAULT_SYSTEM, skills, subagents);
   const tools = withBuiltinTools(station, model.id, options?.tools ?? [], skills, subagents);
+  const turnContext = describeTurnContext(model, system, tools);
   const limits = resolveAgentLimits(blueprint.limits, options?.limits);
   const conversations = new Map<string, Conversation>();
   const pending = new Map<string, Promise<void>>();
@@ -188,6 +190,7 @@ export function createAgent(
           capsule: capsuleRef,
           status,
           entries: encodeMessages(persisted).map(toThreadEntry),
+          context: turnContext,
         });
       };
       try {
@@ -523,6 +526,25 @@ export type UserContent = UserMessage["content"];
 export function userContent(input: Pick<TurnInput, "text" | "images">): UserContent {
   if (!input.images?.length) return input.text;
   return [...(input.text ? [{ type: "text" as const, text: input.text }] : []), ...input.images];
+}
+
+/** The model, system prompt, and tool definitions a runtime sends, as plain JSON for conversation observers. */
+export function describeTurnContext(
+  model: { provider: string; id: string },
+  system: string,
+  tools: readonly Tool[],
+): TurnContext {
+  return {
+    provider: model.provider,
+    model: model.id,
+    system,
+    // TypeBox schemas carry symbol-keyed metadata; JSON keeps only the schema itself.
+    tools: tools.map(({ name, description, parameters }) => ({
+      name,
+      description,
+      parameters: JSON.parse(JSON.stringify(parameters)) as JsonValue,
+    })),
+  };
 }
 
 /**

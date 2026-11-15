@@ -1,3 +1,5 @@
+import { setTimeout as sleep } from "node:timers/promises";
+
 import { Bot, type Context } from "grammy";
 import type { IncomingMessage, ZingPluginAPI } from "zing";
 
@@ -5,6 +7,13 @@ export const TELEGRAM_LIMIT = 4096;
 /** Larger images are refused rather than sent to the model; the Bot API serves files up to 20 MB. */
 export const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 export const IMAGE_FAILED_TEXT = "I couldn't read that image. Please try again, or send a smaller one.";
+/** Registered with Telegram at startup, so typing "/" shows them; each has a handler below. */
+export const COMMANDS = [
+  { command: "reset", description: "Start a new conversation" },
+  { command: "start", description: "Show how to use this bot" },
+] as const;
+/** Waits before each attempt to register the command menu; a flaky network should not leave it missing. */
+export const COMMAND_RETRY_DELAYS_MS = [0, 2_000, 10_000, 60_000];
 export const START_TEXT =
   "Just send a message. I'll search the web when you need current or verified information.\nUse /reset to start a new conversation.";
 
@@ -86,11 +95,32 @@ export default function telegram(zing: ZingPluginAPI) {
         return answer(ctx, ctx.message.caption ?? "", () => downloadImage(ctx, token, file_id, mime_type, file_size));
       });
 
+      // The menu is a convenience: register it in the background, so a failure never keeps the bot from answering.
+      // Retries end with the channel, whether it was stopped or polling failed on its own.
+      const channelDone = new AbortController();
+      const menuSignal = AbortSignal.any([signal, channelDone.signal]);
+      const registerCommands = async () => {
+        let failure: unknown;
+        for (const delay of COMMAND_RETRY_DELAYS_MS) {
+          try {
+            if (delay > 0) await sleep(delay, undefined, { signal: menuSignal });
+            if (menuSignal.aborted) return;
+            await bot.api.setMyCommands(COMMANDS);
+            return;
+          } catch (error) {
+            if (menuSignal.aborted) return;
+            failure = error;
+          }
+        }
+        console.warn(`Telegram command menu registration failed: ${describeError(failure, token)}`);
+      };
+
       let stopping: Promise<void> | undefined;
       const stop = () => {
         stopping ??= bot.stop().catch((error) => console.error(`Telegram channel cleanup failed: ${describeError(error, token)}`));
       };
       signal.addEventListener("abort", stop, { once: true });
+      void registerCommands();
       try {
         // stop() cancels polling and confirms the offset, but start() drains middleware.
         // Keep replies alive during that drain; this is graceful delivery, not a durable outbox.
@@ -100,6 +130,7 @@ export default function telegram(zing: ZingPluginAPI) {
           },
         });
       } finally {
+        channelDone.abort();
         signal.removeEventListener("abort", stop);
         await stopping;
       }

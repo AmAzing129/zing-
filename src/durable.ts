@@ -44,6 +44,7 @@ import {
   createTurnController,
   decodeCursor,
   DEFAULT_SYSTEM,
+  describeTurnContext,
   encodeCursor,
   normalizeLimit,
   normalizeThreadId,
@@ -178,7 +179,9 @@ export async function createDurableAgent(
   const tools = withBuiltinTools(station, model.id, options.tools ?? [], skills, subagents);
   const capsuleRef: CapsuleRef = { agentId: resolved.identity.agentId, state: resolved.state };
   const observers = createObserverQueue(options.listeners ?? [], options.observerTimeoutMs ?? OBSERVER_TIMEOUT_MS);
-  const policy = createContextWindowPolicy(model, composeSystemPrompt(system, skills, subagents), tools);
+  const fullSystem = composeSystemPrompt(system, skills, subagents);
+  const policy = createContextWindowPolicy(model, fullSystem, tools);
+  const turnContext = describeTurnContext(model, fullSystem, tools);
 
   const threads = new Map<string, ConversationId>();
   const threadOf = new Map<number, string>();
@@ -563,6 +566,7 @@ export async function createDurableAgent(
             capsule: capsuleRef,
             status,
             entries,
+            context: turnContext,
           });
     void markObserved(conversation.id, turn.requestId, handled).finally(() => observing.delete(record.id));
   };

@@ -36,6 +36,14 @@ export type Channel = {
 
 export type CapsuleRef = { readonly agentId: string; readonly state: CapsuleState };
 
+/** What the model was given in a turn: the resolved model, the full system prompt, and the tool definitions. */
+export type TurnContext = {
+  provider: string;
+  model: string;
+  system: string;
+  tools: Array<{ name: string; description: string; parameters: JsonValue }>;
+};
+
 export type ConversationEvent =
   | {
       type: "turn";
@@ -45,6 +53,8 @@ export type ConversationEvent =
       status: "completed" | "failed" | "canceled";
       /** Entries appended and persisted by this turn, in thread/read shape. */
       entries: ThreadEntry[];
+      /** The station's model, system prompt, and tools when the turn was observed. */
+      context: TurnContext;
     }
   | { type: "reset"; conversationId: string; capsule: CapsuleRef };
 

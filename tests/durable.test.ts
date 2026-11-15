@@ -440,7 +440,7 @@ test("durable: observers receive completed, failed, and canceled turns and reset
     },
   };
   const events: ConversationEvent[] = [];
-  const { agent, faux } = await createTestAgent({ tools: [tool], listeners: [(event) => { events.push(event); }] });
+  const { agent, faux, model } = await createTestAgent({ tools: [tool], listeners: [(event) => { events.push(event); }] });
   faux.setResponses([
     fauxAssistantMessage("observed"),
     fauxAssistantMessage("", { stopReason: "error", errorMessage: "failed" }),
@@ -457,6 +457,12 @@ test("durable: observers receive completed, failed, and canceled turns and reset
     agentId: agent.agentId,
     status: "completed",
     entries: snapshot.entries,
+    context: {
+      provider: model.provider,
+      model: model.id,
+      system: "be brief",
+      tools: [{ name: tool.name, description: tool.description, parameters: JSON.parse(JSON.stringify(tool.parameters)) }],
+    },
   }]);
 
   await assert.rejects(agent.handleMessage({ conversationId: "chat:observed", text: "fail", senderId: "bob" }), /failed/);

@@ -19,6 +19,7 @@ An included plugin is not enabled automatically. This matters because plugin cod
 | `channels/telegram` | Telegram channel: text, photos, and image files (up to 10 MB) with captions | `TELEGRAM_BOT_TOKEN`, optional `TELEGRAM_ALLOWED_USER_IDS` |
 | `tools/brave` | `web_search` | `BRAVE_API_KEY` |
 | `tools/notes` | `memory_search`, `memory_save`, conversation observer | optional `ZING_MEMORY_OWNER_IDS` |
+| `observers/trajectory` | records every turn, with its model, system prompt, and tools, to `$ZING_HOME/trajectories/YYYY-MM.jsonl`; `export.ts` converts them to OpenAI chat fine-tuning JSONL | optional `ZING_TRAJECTORY_DIR` |
 | `tools/mcp` | tools discovered from one MCP server | `MCP_URL`, `MCP_SERVER_ALIAS`, and optional auth/alias settings |
 
 The checked-in [`station.yaml`](../station.yaml) enables DeepSeek, Telegram, Brave, and Notes. MCP is included but disabled by default because it needs a server configuration at startup.
@@ -152,13 +153,15 @@ zing.registerProvider({
 `zing.onConversation(listener)` subscribes to persisted activity. The listener receives `(event, signal)`, where an event is either:
 
 ```ts
-{ type: "turn", conversationId, senderId?, capsule: { agentId, state }, status, entries }
+{ type: "turn", conversationId, senderId?, capsule: { agentId, state }, status, entries, context: { provider, model, system, tools } }
 { type: "reset", conversationId, capsule: { agentId, state } }
 ```
 
 Calls are serial for each listener until normal completion or the five-second timeout; different listeners run independently. A timeout or exception warns but never blocks the turn. `onConversation` returns an idempotent unsubscribe function.
 
-Notes uses this observer for passive owner-note distillation. When `ZING_MEMORY_OWNER_IDS` is configured, only matching senders are owners. Without it, only senderless stdio is trusted; identified Telegram senders are untrusted. Explicit `memory_save` records an untrusted sender's fact as untrusted. Do not add the default bot to Telegram groups.
+`context` is what the model was given: the resolved model, the full system prompt including skill and subagent catalogs, and the JSON Schema of every offered tool.
+
+Notes uses this observer for passive owner-note distillation. Trajectory uses it to keep a training-ready record of every turn. When `ZING_MEMORY_OWNER_IDS` is configured, only matching senders are owners. Without it, only senderless stdio is trusted; identified Telegram senders are untrusted. Explicit `memory_save` records an untrusted sender's fact as untrusted. Do not add the default bot to Telegram groups.
 
 ## MCP
 

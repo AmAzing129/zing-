@@ -854,6 +854,7 @@ test("conversation observers receive persisted completed turns and resets", asyn
     capsule: { agentId: agent.agentId },
     status: "completed",
     entries: snapshot.entries,
+    context: { provider: model.provider, model: model.id, system: testBlueprint(model.id).system, tools: [] },
   }]);
 
   await agent.resetThread("chat:observed");
