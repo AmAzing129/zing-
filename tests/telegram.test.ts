@@ -213,6 +213,27 @@ test("telegram registers its command menu in the background and stops retrying w
   }
 });
 
+test("telegram stops retrying its command menu when polling fails on its own", async () => {
+  const originalStart = Bot.prototype.start;
+  let attempts = 0;
+  try {
+    Bot.prototype.start = async () => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      throw new Error("polling failed");
+    };
+    setMyCommands = async () => { attempts++; throw new Error("network down"); };
+    const registry = createPluginRegistry({ host, env: { TELEGRAM_BOT_TOKEN: "123:test" } });
+    telegram(registry.api);
+    // The signal never aborts: only the channel's own exit can cancel the 2-second retry.
+    await assert.rejects(registry.getChannel("telegram")!.start(new AbortController().signal), /polling failed/);
+    await new Promise<void>((resolve) => setTimeout(resolve, 2_500));
+    assert.equal(attempts, 1);
+  } finally {
+    Bot.prototype.start = originalStart;
+    setMyCommands = async () => true;
+  }
+});
+
 test("describeError keeps the bot token out of logs", () => {
   const nested = Object.assign(new Error("request to https://api.telegram.org/bot123:secret/setMyCommands failed"), {});
   assert.equal(describeError(nested, "123:secret"), "request to https://api.telegram.org/bot<redacted>/setMyCommands failed");

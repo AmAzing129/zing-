@@ -65,15 +65,19 @@ export default function telegram(zing: ZingPluginAPI) {
       });
 
       // The menu is a convenience: register it in the background, so a failure never keeps the bot from answering.
+      // Retries end with the channel, whether it was stopped or polling failed on its own.
+      const channelDone = new AbortController();
+      const menuSignal = AbortSignal.any([signal, channelDone.signal]);
       const registerCommands = async () => {
         let failure: unknown;
         for (const delay of COMMAND_RETRY_DELAYS_MS) {
           try {
-            if (delay > 0) await sleep(delay, undefined, { signal });
+            if (delay > 0) await sleep(delay, undefined, { signal: menuSignal });
+            if (menuSignal.aborted) return;
             await bot.api.setMyCommands(COMMANDS);
             return;
           } catch (error) {
-            if (signal.aborted) return;
+            if (menuSignal.aborted) return;
             failure = error;
           }
         }
@@ -95,6 +99,7 @@ export default function telegram(zing: ZingPluginAPI) {
           },
         });
       } finally {
+        channelDone.abort();
         signal.removeEventListener("abort", stop);
         await stopping;
       }
