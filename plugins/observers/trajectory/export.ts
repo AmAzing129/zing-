@@ -11,7 +11,12 @@ import { toSamples, trajectoryDir, type TrajectoryRecord } from "./trajectory";
 const { values } = parseArgs({ options: { dir: { type: "string" }, out: { type: "string" } } });
 const dir = values.dir ?? trajectoryDir(process.env);
 
-const files = (await readdir(dir)).filter((name) => /^\d{4}-\d{2}\.jsonl$/.test(name)).sort();
+// Nothing recorded yet is an empty export, not an error.
+const names = await readdir(dir).catch((error: NodeJS.ErrnoException) => {
+  if (error.code === "ENOENT") return [];
+  throw error;
+});
+const files = names.filter((name) => /^\d{4}-\d{2}\.jsonl$/.test(name)).sort();
 const records: TrajectoryRecord[] = [];
 let malformed = 0;
 for (const name of files) {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -93,8 +94,9 @@ export function toSamples(records: Iterable<TrajectoryRecord>): { samples: ChatS
       flush(conversation);
       continue;
     }
-    // A durable station that stops between writing a turn and acknowledging it observes that turn again.
-    const identity = `${conversation}\u0000${record.entries[0]?.at ?? record.recordedAt}`;
+    // A durable station that stops between writing a turn and acknowledging it observes that turn again, at another
+    // time and possibly under a changed context; its entries are what make it the same turn.
+    const identity = createHash("sha256").update(conversation).update("\u0000").update(JSON.stringify(record.entries)).digest("hex");
     if (seen.has(identity)) {
       stats.duplicates++;
       continue;

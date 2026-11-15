@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
 import { toSamples, type TrajectoryRecord } from "../plugins/observers/trajectory/trajectory";
 import { createMemoryCapsule } from "../src/capsule";
 import { createPluginRegistry, loadPlugin, type CapsuleRef } from "../src/plugin/index";
 import type { TurnContext } from "../src/plugin/types";
 import type { ThreadEntry } from "../src/runtime";
+
+const execFileAsync = promisify(execFile);
 
 const context: TurnContext = {
   provider: "test",
@@ -118,4 +122,27 @@ test("toSamples keeps tool calls, tool results, and images, and drops thinking",
     { role: "tool", tool_call_id: "call_1", content: "a cat" },
     { role: "assistant", content: "A cat." },
   ]);
+});
+
+test("toSamples treats a turn observed again as a duplicate, but keeps distinct turns that start in the same millisecond", () => {
+  const entries = [user(1, "q1"), reply(2, "a1")];
+  const { samples, stats } = toSamples([
+    turn("a", 1, entries),
+    turn("a", 1, entries, { recordedAt: 99, context: { ...context, system: "Changed after a restart." } }),
+    turn("a", 1, [user(1, "q2"), reply(3, "a2")]),
+  ]);
+  assert.deepEqual(samples[0]?.messages.map((message) => message.content), ["Be brief.", "q1", "a1", "q2", "a2"]);
+  assert.deepEqual(stats, { turns: 2, skipped: 0, duplicates: 1, samples: 1 });
+});
+
+test("export reads nothing, without failing, before the first turn is recorded", async () => {
+  const dir = join(await mkdtemp(join(tmpdir(), "zing-trajectory-")), "never-created");
+  const { stdout, stderr } = await execFileAsync(process.execPath, [
+    fileURLToPath(new URL("../node_modules/tsx/dist/cli.mjs", import.meta.url)),
+    fileURLToPath(new URL("../plugins/observers/trajectory/export.ts", import.meta.url)),
+    "--dir",
+    dir,
+  ]);
+  assert.equal(stdout, "");
+  assert.match(stderr, /0 file\(s\), 0 turn\(s\): 0 sample\(s\)/);
 });
